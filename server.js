@@ -27,6 +27,13 @@ const cookieParser = require('cookie-parser');
 app.set('trust proxy', 1); // ✨ ضروري لعمل express-rate-limit على Render
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true })); // ✨ السماح بالكوكيز
 app.use(cookieParser());
+
+const Sib = require('@getbrevo/brevo');
+const brevoClient = new Sib.default.ApiClient();
+brevoClient.authentications['api-key'].apiKey = process.env.BREVO_API_KEY;
+const transactionalEmailsApi = new Sib.default.TransactionalEmailsApi(brevoClient);
+
+const BREVO_SENDER = { email: 'brozac512@gmail.com', name: 'NEO Store' }; // ضع بريدك المعتمد في Brevo
 // ==========================================
 // 1. الاتصال بقاعدة البيانات PostgreSQL (يجب أن يكون أولاً)
 // ==========================================
@@ -712,15 +719,15 @@ app.post('/api/register', authLimiter, async (req, res) => {
         const verifyToken = jwt.sign({ id: newUser.rows[0].id }, JWT_SECRET, { expiresIn: '1d' });
         const verifyUrl = `${process.env.FRONTEND_URL}/auth/verify-email?token=${verifyToken}`;
 
-        // ✨ إرسال الإيميل في الخلفية (بدون await) لكي لا يعلق المستخدم في Loading
-        transporter.sendMail({
-            from: `"NEO Store Support" <${process.env.EMAIL_USER}>`,
-            to: email,
-            subject: 'Confirm your Email for NEO Store',
-            html: `<h2>Welcome to NEO Store, ${name}!</h2>
-                   <p>Please click the button below to activate your account:</p>
-                   <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
-        }).catch(emailErr => console.error("❌ Email Sending Error (Background):", emailErr));
+        // ✨ استخدام Brevo
+        transactionalEmailsApi.sendTransacEmail({
+          sender: BREVO_SENDER,
+          to: [{ email: email }],
+          subject: 'Confirm your Email for NEO Store',
+          htmlContent: `<h2>Welcome to NEO Store, ${name}!</h2>
+                 <p>Please click the button below to activate your account:</p>
+                 <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
+        }).catch(err => console.error("Brevo Error:", err));
 
         // الرد فوراً للمستخدم بأن العملية تمت بنجاح
         res.status(201).json({ message: 'User registered successfully! Please check your email to verify your account.' });
@@ -752,15 +759,15 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
             const resetToken = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '15m' });
             const resetUrl = `${process.env.FRONTEND_URL}/auth/reset-password?token=${resetToken}`;
 
-            // ✨ إرسال الإيميل في الخلفية (بدون await)
-            transporter.sendMail({
-                from: `"NEO Store Support" <${process.env.EMAIL_USER}>`,
-                to: email,
-                subject: 'Password Reset Request',
-                html: `<h2>Did you forget your password?</h2>
-                       <p>Click the button below to set a new password. This link will expire in 15 minutes.</p>
-                       <a href="${resetUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Reset My Password</a>`
-            }).catch(emailErr => console.error("❌ Email Sending Error (Background):", emailErr));
+            // ✨ استخدام Brevo
+            transactionalEmailsApi.sendTransacEmail({
+              sender: BREVO_SENDER,
+              to: [{ email: email }],
+              subject: 'Password Reset Request',
+              htmlContent: `<h2>Did you forget your password?</h2>
+                     <p>Click the button below to set a new password. This link will expire in 15 minutes.</p>
+                     <a href="${resetUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Reset My Password</a>`
+            }).catch(err => console.error("Brevo Error:", err));
         }
         
         // الرد فوراً للمستخدم
