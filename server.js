@@ -702,18 +702,28 @@ app.post('/api/register', authLimiter, async (req, res) => {
         const salt = await bcrypt.genSalt(10);
         const passwordHash = await bcrypt.hash(password, salt);
 
-        const newUser = await pool.query('INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email', [name, email, passwordHash]);
+        const newUser = await pool.query(
+            'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email',
+            [name, email, passwordHash]
+        );
+
         const verifyToken = jwt.sign({ id: newUser.rows[0].id }, JWT_SECRET, { expiresIn: '1d' });
-        const verifyUrl = `https://neo-store-backend.onrender.com/api/verify-email?token=${verifyToken}`;
+        const verifyUrl = `${process.env.FRONTEND_URL}/auth/verify-email?token=${verifyToken}`;
 
-        try {
-            await transporter.sendMail({ from: `"NEO Store Support" <${process.env.EMAIL_USER}>`, to: email, subject: 'Confirm your Email for NEO Store', html: `<h2>Welcome to NEO Store, ${name}!</h2><p>Please click the button below to activate your account:</p><a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>` });
-        } catch (emailErr) {
-            logger.logError('Register Email', emailErr);
-        }
+        // ✨ إرسال الإيميل في الخلفية (بدون await) لكي لا يعلق المستخدم في Loading
+        transporter.sendMail({
+            from: `"NEO Store Support" <${process.env.EMAIL_USER}>`,
+            to: email,
+            subject: 'Confirm your Email for NEO Store',
+            html: `<h2>Welcome to NEO Store, ${name}!</h2>
+                   <p>Please click the button below to activate your account:</p>
+                   <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
+        }).catch(emailErr => console.error("❌ Email Sending Error (Background):", emailErr));
 
+        // الرد فوراً للمستخدم بأن العملية تمت بنجاح
         res.status(201).json({ message: 'User registered successfully! Please check your email to verify your account.' });
     } catch (error) {
+        console.error("Register Error:", error);
         res.status(500).json({ message: 'Server error' });
     }
 });
