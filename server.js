@@ -151,7 +151,9 @@ const authenticateToken = (req, res, next) => {
   });
 };
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: 'smtp.gmail.com', // ✨ تحديد الخادم مباشرة
+  port: 587, // ✨ استخدام المنفذ 587 المعروف بتجاوزه لقيود الاستضافة
+  secure: false, // ✨ false للمنفذ 587
   auth: { 
     user: process.env.EMAIL_USER, 
     pass: process.env.EMAIL_PASS 
