@@ -744,14 +744,27 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
     try {
         const { email } = req.body;
         const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        
         if (userRes.rows.length > 0) {
             const user = userRes.rows[0];
             const resetToken = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '15m' });
-            const resetUrl = `http://localhost:3000/auth/reset-password?token=${resetToken}`;
-            await transporter.sendMail({ from: `"NEO Store Support" <${process.env.EMAIL_USER}>`, to: email, subject: 'Password Reset Request', html: `<h2>Did you forget your password?</h2><p>Click the button below to set a new password. This link will expire in 15 minutes.</p><a href="${resetUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Reset My Password</a>` });
+            const resetUrl = `${process.env.FRONTEND_URL}/auth/reset-password?token=${resetToken}`;
+
+            // ✨ إرسال الإيميل في الخلفية (بدون await)
+            transporter.sendMail({
+                from: `"NEO Store Support" <${process.env.EMAIL_USER}>`,
+                to: email,
+                subject: 'Password Reset Request',
+                html: `<h2>Did you forget your password?</h2>
+                       <p>Click the button below to set a new password. This link will expire in 15 minutes.</p>
+                       <a href="${resetUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Reset My Password</a>`
+            }).catch(emailErr => console.error("❌ Email Sending Error (Background):", emailErr));
         }
+        
+        // الرد فوراً للمستخدم
         res.json({ message: 'If that email exists in our system, a reset link has been sent.' });
     } catch (error) {
+        console.error("Forgot Password Error:", error);
         res.status(500).json({ message: 'Server error' });
     }
 });
