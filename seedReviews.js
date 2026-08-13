@@ -1,8 +1,10 @@
 require('dotenv').config();
 const { Pool } = require('pg');
 
+// ✨ إضافة ssl: { rejectUnauthorized: false } لإخفاء تحذير الـ SSL الخاص بـ Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
 const authors = [
@@ -23,7 +25,6 @@ const countries = [
   "France", "Spain", "Italy", "Netherlands", "Sweden"
 ];
 
-// ✨ مكتبة تعليقات ذكية مقسمة حسب نوع المنتج
 const reviewCategories = {
   default: [
     "Absolutely love this! Exactly as described and arrived quickly.",
@@ -69,7 +70,6 @@ const reviewCategories = {
   ]
 };
 
-// ✨ دالة ذكية لاختيار التعليقات المناسبة بناءً على اسم المنتج
 function getSmartReviews(productTitle) {
   const title = (productTitle || '').toLowerCase();
   let chosenCategory = 'default';
@@ -81,7 +81,6 @@ function getSmartReviews(productTitle) {
   else if (/(knife|pan|pot|cooker|blender|mixer|kettle|utensil|kitchen|baking|spatula|cutting board)/.test(title)) chosenCategory = 'kitchen';
   else if (/(drill|saw|wrench|hammer|screwdriver|tool|toolbox|plier)/.test(title)) chosenCategory = 'tool';
 
-  // دمج التعليقات المحددة مع التعليقات العامة لزيادة التنوع
   return [...reviewCategories[chosenCategory], ...reviewCategories.default];
 }
 
@@ -94,58 +93,81 @@ function shuffleArray(array) {
 }
 
 async function seedReviewsForAllProducts() {
+  const client = await pool.connect();
   try {
     console.log('⏳ Fetching all products...');
     
-    // مسح التقييمات القديمة
-    await pool.query('DELETE FROM reviews');
+    await client.query('DELETE FROM reviews');
     console.log('🗑️ All old reviews deleted!');
 
-    const productsRes = await pool.query('SELECT id, title FROM products');
+    const productsRes = await client.query('SELECT id, title FROM products');
     const products = productsRes.rows;
 
-    console.log(`Found ${products.length} products. Starting SMART review seeding...`);
+    console.log(`Found ${products.length} products. Starting SMART BATCH review seeding...`);
 
     let totalReviewsAdded = 0;
+    let batchValues = [];
+    let batchCounter = 1;
+    const BATCH_SIZE = 500; // ✨ إدخال 500 تقييم في طلب واحد لسرعة فائقة
 
     for (const product of products) {
       const targetReviews = Math.floor(Math.random() * 21) + 5; // 5 to 25
 
-      // ✨ استدعاء الدالة الذكية لاختيار التعليقات بناءً على اسم المنتج
       let applicableContents = getSmartReviews(product.title);
-      
       let shuffledAuthors = shuffleArray([...authors]);
       let shuffledContents = shuffleArray([...applicableContents]);
 
       for (let i = 0; i < targetReviews; i++) {
-        // إذا احتجنا تقييمات أكثر من عدد التعليقات المتاحة، نعيد خلطها
-        if (i >= shuffledContents.length) {
-          shuffledContents = shuffleArray([...applicableContents]);
-        }
-        if (i >= shuffledAuthors.length) {
-          shuffledAuthors = shuffleArray([...authors]);
-        }
+        if (i >= shuffledContents.length) shuffledContents = shuffleArray([...applicableContents]);
+        if (i >= shuffledAuthors.length) shuffledAuthors = shuffleArray([...authors]);
 
         const author = shuffledAuthors[i % shuffledAuthors.length];
         const country = countries[Math.floor(Math.random() * countries.length)];
         const content = shuffledContents[i % shuffledContents.length];
-        
         const rating = Math.random() > 0.2 ? 5 : 4;
         const daysAgo = Math.floor(Math.random() * 90);
         const created_at = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
 
-        await pool.query(
-          'INSERT INTO reviews (product_id, author, rating, content, country, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-          [product.id, author, rating, content, country, created_at]
-        );
-        totalReviewsAdded++;
+        batchValues.push(product.id, author, rating, content, country, created_at);
+        batchCounter++;
+
+        // ✨ عند الوصول لـ 500 تقييم، نرسلهم دفعة واحدة
+        if (batchCounter > BATCH_SIZE) {
+          let queryText = 'INSERT INTO reviews (product_id, author, rating, content, country, created_at) VALUES ';
+          let placeholders = [];
+          for (let j = 0; j < batchCounter - 1; j++) {
+            placeholders.push(`($${j * 6 + 1}, $${j * 6 + 2}, $${j * 6 + 3}, $${j * 6 + 4}, $${j * 6 + 5}, $${j * 6 + 6})`);
+          }
+          queryText += placeholders.join(', ');
+          
+          await client.query(queryText, batchValues);
+          totalReviewsAdded += batchValues.length / 6;
+          
+          // تصفير المصفوفات للدفعة التالية
+          batchValues = [];
+          batchCounter = 1;
+          console.log(`Inserted ${totalReviewsAdded} reviews so far...`);
+        }
       }
+    }
+
+    // ✨ إدخال ما تبقى في آخر دفعة
+    if (batchValues.length > 0) {
+      let queryText = 'INSERT INTO reviews (product_id, author, rating, content, country, created_at) VALUES ';
+      let placeholders = [];
+      for (let j = 0; j < batchValues.length / 6; j++) {
+        placeholders.push(`($${j * 6 + 1}, $${j * 6 + 2}, $${j * 6 + 3}, $${j * 6 + 4}, $${j * 6 + 5}, $${j * 6 + 6})`);
+      }
+      queryText += placeholders.join(', ');
+      await client.query(queryText, batchValues);
+      totalReviewsAdded += batchValues.length / 6;
     }
 
     console.log(`🎉 Success! Added a total of ${totalReviewsAdded} SMART reviews across all products.`);
   } catch (err) {
     console.error('❌ Error seeding reviews:', err);
   } finally {
+    client.release();
     await pool.end();
   }
 }
