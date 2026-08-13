@@ -24,6 +24,7 @@ const fs = require('fs');
 
 const app = express();
 const cookieParser = require('cookie-parser');
+app.set('trust proxy', 1); // ✨ ضروري لعمل express-rate-limit على Render
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true })); // ✨ السماح بالكوكيز
 app.use(cookieParser());
 // ==========================================
@@ -703,7 +704,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
 
         const newUser = await pool.query('INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email', [name, email, passwordHash]);
         const verifyToken = jwt.sign({ id: newUser.rows[0].id }, JWT_SECRET, { expiresIn: '1d' });
-        const verifyUrl = `http://localhost:5000/api/verify-email?token=${verifyToken}`;
+        const verifyUrl = `https://neo-store-backend.onrender.com/api/verify-email?token=${verifyToken}`;
 
         try {
             await transporter.sendMail({ from: `"NEO Store Support" <${process.env.EMAIL_USER}>`, to: email, subject: 'Confirm your Email for NEO Store', html: `<h2>Welcome to NEO Store, ${name}!</h2><p>Please click the button below to activate your account:</p><a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>` });
