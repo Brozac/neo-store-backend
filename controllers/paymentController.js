@@ -169,6 +169,12 @@ router.post('/stripe', async (req, res) => {
         quantity: item.quantity,
       })),
       mode: 'payment',
+      // ✨ ===== الإضافة الجديدة هنا ===== ✨
+      shipping_address_collection: { 
+        allowed_countries: ['US', 'GB', 'CA', 'DZ', 'AE', 'SA', 'FR', 'DE', 'MA', 'TN'] 
+      },
+      phone_number_collection: { enabled: true },
+      // ================================
       success_url: `${process.env.FRONTEND_URL}/success?method=stripe`,
       cancel_url: `${process.env.FRONTEND_URL}/cart`,
       metadata: { orderId: orderId.toString() },
@@ -292,7 +298,7 @@ router.post('/crypto', async (req, res) => {
       );
     }
 
-    const apiUrl = 'https://api.nowpayments.io/v1/invoice'; 
+    const apiUrl = 'https://api-sandbox.nowpayments.io/v1/invoice'; //https://api.nowpayments.io/v1/invoice; 
     const response = await axios.post(apiUrl, {
       price_amount: totalAmount,
       price_currency: 'usd',
