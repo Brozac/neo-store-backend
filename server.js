@@ -5,7 +5,6 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const axios = require('axios');
-const nodemailer = require('nodemailer');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const puppeteer = require('puppeteer-extra');
@@ -153,16 +152,33 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// ✨ إعدادات الإيميل باستخدام Brevo عبر Nodemailer
-const transporter = nodemailer.createTransport({
-  host: 'smtp-relay.brevo.com',
-  port: 587,
-  secure: false,
-  auth: { 
-    user: process.env.BREVO_USER, 
-    pass: process.env.BREVO_SMTP_KEY 
+// ==========================================
+// ✨ إرسال الإيميلات عبر Brevo HTTP API (بدل SMTP/Nodemailer)
+// السبب: Render يبلوكي outbound traffic على SMTP ports (25, 465, 587)
+// فـ free tier (ومزال حتى port 25 مبلوكي فـ plans المدفوعة). الـ API
+// يخدم فوق HTTPS (port 443) لي ماهوش مبلوكي أبدا.
+// لازم تزيد BREVO_API_KEY فـ .env (Brevo Dashboard → SMTP & API → API Keys)
+// ملاحظة: هذا ماشي نفس BREVO_SMTP_KEY القديم.
+// ==========================================
+async function sendEmail({ to, subject, html }) {
+  try {
+    await axios.post('https://api.brevo.com/v3/smtp/email', {
+      sender: { name: 'NEO Store Support', email: process.env.BREVO_USER },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html
+    }, {
+      headers: {
+        'api-key': process.env.BREVO_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      }
+    });
+    console.log(`📧 Email sent to ${to}`);
+  } catch (err) {
+    logger.logError('Send Email (Brevo API)', err.response?.data || err.message);
   }
-});
+}
 
 // ==========================================
 // إعداد مجلد رفع الصور و Multer
@@ -182,7 +198,7 @@ const upload = multer({ storage: storage });
 // فحص متغيرات البيئة الأساسية في الإنتاج
 // ==========================================
 if (process.env.NODE_ENV === 'production') {
-  const requiredEnvVars = ['DATABASE_URL', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'JWT_SECRET', 'CJ_API_KEY', 'ADMIN_EMAIL', 'ADMIN_PASSWORD'];
+  const requiredEnvVars = ['DATABASE_URL', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'JWT_SECRET', 'CJ_API_KEY', 'ADMIN_EMAIL', 'ADMIN_PASSWORD', 'BREVO_API_KEY', 'BREVO_USER'];
   const missing = requiredEnvVars.filter((v) => !process.env[v]);
   if (missing.length > 0) {
     console.error(`❌ Missing required environment variables in production: ${missing.join(', ')}`);
@@ -695,14 +711,13 @@ app.post('/api/register', authLimiter, async (req, res) => {
         const verifyUrl = `${process.env.FRONTEND_URL}/auth/verify-email?token=${verifyToken}`;
 
         // ✨ إرسال الإيميل في الخلفية (بدون await) لكي لا يعلق المستخدم في Loading
-        transporter.sendMail({
-          from: `"NEO Store Support" <${process.env.BREVO_USER}>`,
+        sendEmail({
           to: email,
           subject: 'Confirm your Email for NEO Store',
           html: `<h2>Welcome to NEO Store, ${name}!</h2>
                  <p>Please click the button below to activate your account:</p>
                  <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
-        }).catch(emailErr => console.error("❌ Email Sending Error:", emailErr));
+        });
 
         res.status(201).json({ message: 'User registered successfully! Please check your email to verify your account.' });
     } catch (error) {
@@ -734,14 +749,13 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
             const resetUrl = `${process.env.FRONTEND_URL}/auth/reset-password?token=${resetToken}`;
 
             // ✨ إرسال الإيميل في الخلفية (بدون await)
-            transporter.sendMail({
-              from: `"NEO Store Support" <${process.env.BREVO_USER}>`,
+            sendEmail({
               to: email,
               subject: 'Password Reset Request',
               html: `<h2>Did you forget your password?</h2>
                      <p>Click the button below to set a new password. This link will expire in 15 minutes.</p>
                      <a href="${resetUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Reset My Password</a>`
-            }).catch(emailErr => console.error("❌ Email Sending Error:", emailErr));
+            });
         }
         
         res.json({ message: 'If that email exists in our system, a reset link has been sent.' });
@@ -1137,8 +1151,7 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
       </div>
     `;
 
-    await transporter.sendMail({
-      from: `"NEO Store Support" <${process.env.BREVO_USER || 'store@support.com'}>`,
+    await sendEmail({
       to: email,
       subject: `Order Confirmation #${orderId} - NEO Store`,
       html: htmlContent
