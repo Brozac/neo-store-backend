@@ -64,7 +64,7 @@ async function getCJToken(forceRefresh = false) {
   }
 }
 
-async function cjRequest(requestFn) {
+async function cjRequest(requestFn, retryCount = 0) {
   try {
     const token = await getCJToken();
     const config = { timeout: 60000 }; 
@@ -76,10 +76,14 @@ async function cjRequest(requestFn) {
 
     // ✨ إذا كان الخطأ هو تجاوز معدل الطلبات (Too Many Requests)
     if (cjCode === 1600200) {
-      console.log('⚠️ CJ API rate limit hit (QPS=1). Waiting 1s and retrying...');
-      await new Promise(r => setTimeout(r, 1100)); // انتظار 1.1 ثانية
-      const token = await getCJToken();
-      return await requestFn(token, { timeout: 60000 }); // إعادة المحاولة
+      if (retryCount < 3) { // الحد الأقصى لإعادة المحاولة هو 3
+        console.log(`⚠️ CJ API rate limit hit (QPS=1). Waiting 1.5s and retrying (Attempt ${retryCount + 1}/3)...`);
+        await new Promise(r => setTimeout(r, 1500)); // انتظار 1.5 ثانية لضمان عدم التداخل
+        return cjRequest(requestFn, retryCount + 1); // إعادة المحاولة بنفس الطلب
+      } else {
+        console.error('❌ CJ API rate limit exceeded after 3 retries.');
+        throw err; // رمي الخطأ بعد فشل 3 محاولات
+      }
     }
 
     if (isAuthError) {
