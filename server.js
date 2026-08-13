@@ -16,7 +16,7 @@ const requireAdmin = require('./middleware/requireAdmin');
 const rateLimit = require('express-rate-limit');
 const { fulfillCJOrder, getCJToken, cjRequest, parseNumeric } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
-const logger = require('./logger'); // ✨ استيراد Logger
+const logger = require('./logger');
 
 const multer = require('multer');
 const path = require('path');
@@ -25,17 +25,11 @@ const fs = require('fs');
 const app = express();
 const cookieParser = require('cookie-parser');
 app.set('trust proxy', 1); // ✨ ضروري لعمل express-rate-limit على Render
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true })); // ✨ السماح بالكوكيز
+app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
 app.use(cookieParser());
 
-const Sib = require('@getbrevo/brevo');
-const brevoClient = new Sib.default.ApiClient();
-brevoClient.authentications['api-key'].apiKey = process.env.BREVO_API_KEY;
-const transactionalEmailsApi = new Sib.default.TransactionalEmailsApi(brevoClient);
-
-const BREVO_SENDER = { email: 'brozac512@gmail.com', name: 'NEO Store' }; // ضع بريدك المعتمد في Brevo
 // ==========================================
-// 1. الاتصال بقاعدة البيانات PostgreSQL (يجب أن يكون أولاً)
+// 1. الاتصال بقاعدة البيانات PostgreSQL
 // ==========================================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -47,7 +41,7 @@ pool.query('SELECT NOW()')
   .catch((err) => console.error('❌ Database connection error:', err.stack));
 
 // ==========================================
-// تشغيل كل ساعة للتحقق من الطلبات المنتهية الصلاحية (BaridiMob Auto-Expiry)
+// تشغيل كل ساعة للتحقق من الطلبات المنتهية الصلاحية
 // ==========================================
 setInterval(async () => {
   try {
@@ -61,7 +55,7 @@ setInterval(async () => {
   } catch (err) {
     console.error('Cron job error:', err);
   }
-}, 3600000); // ساعة
+}, 3600000);
 
 // ✅ 1. Stripe Webhook (قبل express.json)
 app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -126,7 +120,7 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
         await sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, items);
       }
     } catch (dbErr) {
-      logger.logError('Stripe Webhook DB Update', dbErr); // ✨ تسجيل الخطأ
+      logger.logError('Stripe Webhook DB Update', dbErr);
     }
   }
 
@@ -146,6 +140,7 @@ if (!JWT_SECRET) {
   console.error('❌ FATAL ERROR: JWT_SECRET is not defined in .env file.');
   process.exit(1);
 }
+
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -158,13 +153,14 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// ✨ إعدادات الإيميل باستخدام Brevo عبر Nodemailer
 const transporter = nodemailer.createTransport({
-  host: 'smtp-relay.brevo.com', // ✨ خوادم Brevo
-  port: 587, // ✨ المنفذ الآمن لـ Brevo
-  secure: false, // false للمنفذ 587
+  host: 'smtp-relay.brevo.com',
+  port: 587,
+  secure: false,
   auth: { 
-    user: process.env.BREVO_USER, // بريدك المسجل في Brevo
-    pass: process.env.BREVO_SMTP_KEY // مفتاح SMTP من Brevo
+    user: process.env.BREVO_USER, 
+    pass: process.env.BREVO_SMTP_KEY 
   }
 });
 
@@ -195,19 +191,18 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // ==========================================
-// مسار تسجيل دخول الأدمن (يضع التوكن في HttpOnly Cookie)
+// مسار تسجيل دخول الأدمن
 // ==========================================
 app.post('/api/admin/login', async (req, res) => {
   const { email, password } = req.body;
   if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
     const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '2h' });
     
-    // ✨ وضع التوكن في كوكي لا يمكن قراءته عبر JavaScript (HttpOnly)
     res.cookie('admin_token', token, {
-      httpOnly: true, // ✅ لا يمكن الوصول له عبر document.cookie
-      secure: false, //process.env.NODE_ENV === 'production', // ✅ يُرسل فقط عبر HTTPS في الإنتاج
-      sameSite: 'lax', //'strict', // ✅ يحمي من هجمات CSRF
-      maxAge: 2 * 60 * 60 * 1000 // ينتهي بعد ساعتين
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 2 * 60 * 60 * 1000
     });
 
     return res.json({ message: 'Logged in successfully' });
@@ -215,13 +210,11 @@ app.post('/api/admin/login', async (req, res) => {
   res.status(401).json({ message: 'Invalid admin credentials' });
 });
 
-// مسار تسجيل الخروج (لحذف الكوكي)
 app.post('/api/admin/logout', (req, res) => {
   res.clearCookie('admin_token');
   res.json({ message: 'Logged out successfully' });
 });
 
-// ✅✅✅ درع حماية جميع مسارات الأدمن (مرة واحدة فقط)
 app.use('/api/admin', requireAdmin);
 
 // ==========================================
@@ -330,9 +323,7 @@ app.post('/api/admin/add-review', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-// ==========================================
-// مسار إضافة تقييم للعميل المسجل دخول
-// ==========================================
+
 app.post('/api/reviews/add', authenticateToken, async (req, res) => {
   try {
     const { product_id, rating, content, country } = req.body;
@@ -354,7 +345,7 @@ app.post('/api/reviews/add', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-// جعل مجلد uploads عاماً
+
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.post('/api/admin/upload', upload.array('images', 10), (req, res) => {
@@ -368,7 +359,7 @@ app.post('/api/admin/upload', upload.array('images', 10), (req, res) => {
 });
 
 // ==========================================
-// 4. مسار إضافة منتج يدوياً (Add Product)
+// 4. مسار إضافة منتج يدوياً
 // ==========================================
 app.post('/api/admin/add-product', async (req, res) => {
   try {
@@ -404,7 +395,7 @@ app.post('/api/admin/add-product', async (req, res) => {
 });
 
 // ==========================================
-// مسارات إدارة المنتجات (Delete, Reorder)
+// مسارات إدارة المنتجات
 // ==========================================
 app.delete('/api/admin/delete-product/:id', async (req, res) => {
   try {
@@ -444,7 +435,7 @@ app.put('/api/admin/reorder-products', async (req, res) => {
 });
 
 // ==========================================
-// مسارات إدارة النزاعات (Disputes) والتتبع
+// مسارات إدارة النزاعات والتتبع
 // ==========================================
 app.get('/api/admin/disputes', async (req, res) => {
   try {
@@ -479,15 +470,12 @@ app.get('/api/admin/track/:trackNumber', async (req, res) => {
 });
 
 // ==========================================
-// 4.5 مسارات شجرة فئات CJ الرسمية (Categories Tree)
+// 4.5 مسارات شجرة فئات CJ الرسمية
 // ==========================================
-
-// ✨ مزامنة شجرة الفئات الرسمية من CJ لجدول categories المحلي (أدمن فقط)
-// خاص تتشغل مرة قبل أول استعمال، وبعدين من وقت لوقت (CJ ممكن يزيدو فئات جديدة)
 app.post('/api/admin/sync-categories', async (req, res) => {
   try {
     const result = await syncCategoriesFromCJ();
-    categoryTreeCache = null; // ✨ إبطال الكاش باش /api/categories يرجع يجيب النسخة الجديدة
+    categoryTreeCache = null;
     res.json({ message: `Categories synced! Level 1: ${result.level1Count}, Level 2: ${result.level2Count}, Level 3: ${result.level3Count}.`, ...result });
   } catch (err) {
     logger.logError('Sync Categories', err);
@@ -495,10 +483,9 @@ app.post('/api/admin/sync-categories', async (req, res) => {
   }
 });
 
-// ✨ مسار عام (بلا حماية أدمن) كيرجع شجرة الفئات كاملة — يستعملو الفرونت للتنقل
 let categoryTreeCache = null;
 let categoryTreeCacheTime = 0;
-const CATEGORY_TREE_CACHE_TTL = 10 * 60 * 1000; // 10 دقايق (الشجرة ماكتبدلش بزربة)
+const CATEGORY_TREE_CACHE_TTL = 10 * 60 * 1000;
 
 app.get('/api/categories', async (req, res) => {
   try {
@@ -514,7 +501,6 @@ app.get('/api/categories', async (req, res) => {
   }
 });
 
-// ✨ باكفيل: كيعمر cj_category_id للمنتجات القديمة
 app.post('/api/admin/backfill-categories', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -529,7 +515,7 @@ app.post('/api/admin/backfill-categories', async (req, res) => {
 
     for (const p of rows) {
       try {
-        await new Promise((r) => setTimeout(r, 1200)); // ✨ احترام حد CJ (QPS=1)
+        await new Promise((r) => setTimeout(r, 1200));
 
         const detailRes = await cjRequest((token, config) =>
           axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { ...config, headers: { 'CJ-Access-Token': token }, params: { pid: p.cj_product_id } })
@@ -555,7 +541,7 @@ app.post('/api/admin/backfill-categories', async (req, res) => {
       }
     }
 
-    productsCache = null; // ✨ إبطال كاش المنتجات
+    productsCache = null;
     console.log(`🎉 Backfill complete! Updated: ${updatedCount}, Skipped: ${skipped.length}`);
     res.json({ message: `Backfilled ${updatedCount} product(s). ${skipped.length} skipped.`, updatedCount, skippedIds: skipped });
   } catch (err) {
@@ -565,7 +551,7 @@ app.post('/api/admin/backfill-categories', async (req, res) => {
 });
 
 // ==========================================
-// 5. مسار مزامنة منتجات CJ (للأدمن)
+// 5. مسار مزامنة منتجات CJ
 // ==========================================
 app.get('/api/sync-cj-products', requireAdmin, async (req, res) => {
   try {
@@ -601,7 +587,6 @@ app.get('/api/sync-cj-products', requireAdmin, async (req, res) => {
           const details = detailRes.data?.data;
           if (!details) continue;
 
-          // ======[ الفلترة المعدلة ]======
           const hasTitle = details.productNameEn?.trim() !== '';
           const hasMainImage = details.bigImage?.startsWith('http');
           const hasImages = details.productImageSet?.length >= 1;
@@ -616,7 +601,6 @@ app.get('/api/sync-cj-products', requireAdmin, async (req, res) => {
           if (pcBlacklistRegex.test(lowerTitle)) continue;
 
           if (!hasTitle || !hasMainImage || !hasImages || !hasValidDescription || !hasPrice || !hasVariants || !isWorldwideShipping) continue;
-          // ===================================
 
           const cjPrice = parseNumeric(details.sellPrice);
           let sellingPrice = cjPrice <= 5 ? cjPrice * 3.5 : cjPrice <= 15 ? cjPrice * 2.8 : cjPrice <= 30 ? cjPrice * 2.2 : cjPrice * 1.8;
@@ -625,10 +609,6 @@ app.get('/api/sync-cj-products', requireAdmin, async (req, res) => {
           const safePrice = parseFloat(sellingPrice.toFixed(2));
           const safeOriginalPrice = parseFloat((safePrice * 1.5).toFixed(2));
 
-          // ✅ الإصلاح الكبير: بدل ما نستنتجو الفئة بالكلمات، نستعملو categoryId
-          // اللي CJ كيعطيه هو نفسو مع كل منتج، ونبحثو عليه فالشجرة المزامنة محلياً.
-          // إلا الشجرة ماكانتش متزامنة بعد (ولا CJ زاد فئة جديدة ماوصلاتناش)، كنرجعو
-          // للطريقة القديمة بالكلمات كـ fallback باش المنتج ما يبقاش بلا تصنيف نهائياً.
           const cjCategoryId = details.categoryId || null;
           let categorySlug;
           if (cjCategoryId) {
@@ -681,9 +661,6 @@ app.get('/api/sync-cj-products', requireAdmin, async (req, res) => {
   }
 });
 
-// ==========================================
-// مسار تتبع الشحنات (Customer Facing)
-// ==========================================
 app.get('/api/track/:trackNumber', async (req, res) => {
   try {
     const { trackNumber } = req.params;
@@ -695,9 +672,6 @@ app.get('/api/track/:trackNumber', async (req, res) => {
   }
 });
 
-// ==========================================
-// Rate Limiter للمصادقة
-// ==========================================
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5, message: { message: 'Too many attempts, please try again after 15 minutes.' } });
 
 // ==========================================
@@ -720,17 +694,16 @@ app.post('/api/register', authLimiter, async (req, res) => {
         const verifyToken = jwt.sign({ id: newUser.rows[0].id }, JWT_SECRET, { expiresIn: '1d' });
         const verifyUrl = `${process.env.FRONTEND_URL}/auth/verify-email?token=${verifyToken}`;
 
-        // ✨ استخدام Brevo
-transporter.sendMail({
-  from: `"NEO Store Support" <${process.env.BREVO_USER}>`,
-  to: email,
-  subject: 'Confirm your Email for NEO Store',
-  html: `<h2>Welcome to NEO Store, ${name}!</h2>
-         <p>Please click the button below to activate your account:</p>
-         <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
-}).catch(emailErr => console.error("❌ Email Sending Error:", emailErr));
+        // ✨ إرسال الإيميل في الخلفية (بدون await) لكي لا يعلق المستخدم في Loading
+        transporter.sendMail({
+          from: `"NEO Store Support" <${process.env.BREVO_USER}>`,
+          to: email,
+          subject: 'Confirm your Email for NEO Store',
+          html: `<h2>Welcome to NEO Store, ${name}!</h2>
+                 <p>Please click the button below to activate your account:</p>
+                 <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
+        }).catch(emailErr => console.error("❌ Email Sending Error:", emailErr));
 
-        // الرد فوراً للمستخدم بأن العملية تمت بنجاح
         res.status(201).json({ message: 'User registered successfully! Please check your email to verify your account.' });
     } catch (error) {
         console.error("Register Error:", error);
@@ -760,19 +733,17 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
             const resetToken = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '15m' });
             const resetUrl = `${process.env.FRONTEND_URL}/auth/reset-password?token=${resetToken}`;
 
-            // ✨ استخدام Brevo
-            // في /register
-transporter.sendMail({
-  from: `"NEO Store Support" <${process.env.BREVO_USER}>`,
-  to: email,
-  subject: 'Confirm your Email for NEO Store',
-  html: `<h2>Welcome to NEO Store, ${name}!</h2>
-         <p>Please click the button below to activate your account:</p>
-         <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
-}).catch(emailErr => console.error("❌ Email Sending Error:", emailErr));
+            // ✨ إرسال الإيميل في الخلفية (بدون await)
+            transporter.sendMail({
+              from: `"NEO Store Support" <${process.env.BREVO_USER}>`,
+              to: email,
+              subject: 'Password Reset Request',
+              html: `<h2>Did you forget your password?</h2>
+                     <p>Click the button below to set a new password. This link will expire in 15 minutes.</p>
+                     <a href="${resetUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Reset My Password</a>`
+            }).catch(emailErr => console.error("❌ Email Sending Error:", emailErr));
         }
         
-        // الرد فوراً للمستخدم
         res.json({ message: 'If that email exists in our system, a reset link has been sent.' });
     } catch (error) {
         console.error("Forgot Password Error:", error);
@@ -807,6 +778,7 @@ app.post('/api/login', authLimiter, async (req, res) => {
         const token = jwt.sign({ id: user.rows[0].id, name: user.rows[0].name }, JWT_SECRET, { expiresIn: '7d' });
         res.json({ message: 'Logged in successfully', token, user: { id: user.rows[0].id, name: user.rows[0].name, email: user.rows[0].email } });
     } catch (error) {
+        console.error("Login Error:", error);
         res.status(500).json({ message: 'Server error' });
     }
 });
@@ -942,30 +914,25 @@ app.post('/api/admin/auto-categorize', async (req, res) => {
 // ==========================================
 app.get('/', (req, res) => res.send('Dropshipping API is running on point!'));
 
-// ✨ In-Memory Caching لجلب كل المنتجات (مُحسّن لتقليل استهلاك الرام)
 let productsCache = null;
 let cacheTime = 0;
-const CACHE_TTL = 60000; // دقيقة واحدة
+const CACHE_TTL = 60000;
 
 app.get('/api/products', async (req, res) => {
   try {
     const search = req.query.search || '';
     const category = req.query.category || 'All';
     
-    // 1. إذا لم يكن هناك بحث أو قسم محدد، نرجع كل المنتجات المخزنة في الكاش
     if (search === '' && category === 'All') {
       if (productsCache && (Date.now() - cacheTime < CACHE_TTL)) {
         return res.json(productsCache);
       }
-      
-      // ✨ نجلب الأعمدة الأساسية فقط للصفحة الرئيسية (لا نجلب description أو variants لتوفير الرام)
       const result = await pool.query('SELECT id, title, price, original_price, image_url, category FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC');
       productsCache = result.rows;
       cacheTime = Date.now();
       return res.json(result.rows);
     }
 
-    // 2. إذا كان هناك بحث أو قسم، نبحث في قاعدة البيانات
     let query = 'SELECT id, title, price, original_price, image_url, category FROM products WHERE stock_status = true';
     let params = [];
     let paramIndex = 1;
@@ -1086,8 +1053,6 @@ app.put('/api/admin/update-product/:id', async (req, res) => {
   }
 });
 
-
-
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
@@ -1130,20 +1095,14 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
 
     const htmlContent = `
       <div style="font-family: 'Arial', sans-serif; max-width: 600px; margin: 0 auto; background-color: #f4f3f8; border-radius: 15px; overflow: hidden; border: 1px solid #ddd;">
-        
-        <!-- Email Header -->
         <div style="background: linear-gradient(135deg, #1D1E3C 0%, #8B78C6 100%); padding: 30px; text-align: center;">
           <h1 style="color: #fff; margin: 0; font-size: 28px; letter-spacing: 1px;">NEO STORE</h1>
         </div>
-
-        <!-- Email Body -->
         <div style="padding: 30px;">
-          <h2 style="color: #1D1E3C; margin-top: 0;">Order Confirmed Successfully! </h2>
+          <h2 style="color: #1D1E3C; margin-top: 0;">Order Confirmed Successfully! 🎉</h2>
           <p style="color: #555; font-size: 16px; line-height: 1.6;">
             Thank you for your purchase from NEO Store. Your order <strong style="color: #8B78C6;">#${orderId}</strong> is currently being processed and will be shipped soon.
           </p>
-
-          <!-- Product Details -->
           <table style="width: 100%; border-collapse: collapse; margin: 25px 0;">
             <thead>
               <tr style="border-bottom: 2px solid #8B78C6;">
@@ -1155,29 +1114,22 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
               ${itemsHtml}
             </tbody>
           </table>
-
-          <!-- Total -->
           <div style="text-align: right; margin-top: 20px; border-top: 2px dashed #eee; padding-top: 20px;">
             <span style="font-size: 18px; color: #1D1E3C; font-weight: bold;">Total Paid:</span>
             <span style="font-size: 22px; color: #FF6B9D; font-weight: bold; margin-left: 10px;">$${Number(total).toFixed(2)}</span>
           </div>
-
-          <!-- Shipping Info -->
           <div style="background-color: #f9f9f9; border-left: 4px solid #8B78C6; padding: 15px; margin-top: 30px; border-radius: 5px;">
             <p style="margin: 0; color: #1D1E3C; font-weight: bold; font-size: 14px;">Shipping & Tracking Information:</p>
             <p style="margin: 5px 0 0 0; color: #777; font-size: 13px;">
               Once CJ Dropshipping ships your order, we will send you the tracking number. You can track your shipment directly through the "Track My Order" page on our website.
             </p>
           </div>
-
           <div style="text-align: center; margin-top: 40px;">
             <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}" style="background-color: #FF6B9D; color: #fff; text-decoration: none; padding: 12px 30px; border-radius: 25px; font-weight: bold; display: inline-block;">
               Continue Shopping
             </a>
           </div>
         </div>
-
-        <!-- Email Footer -->
         <div style="background-color: #1D1E3C; padding: 20px; text-align: center; color: #888; font-size: 12px;">
           &copy; ${new Date().getFullYear()} NEO Store. All rights reserved.<br>
           This is an automated message, please do not reply.
@@ -1186,7 +1138,7 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
     `;
 
     await transporter.sendMail({
-      from: `"NEO Store Support" <${process.env.EMAIL_USER || 'store@support.com'}>`,
+      from: `"NEO Store Support" <${process.env.BREVO_USER || 'store@support.com'}>`,
       to: email,
       subject: `Order Confirmation #${orderId} - NEO Store`,
       html: htmlContent
@@ -1198,7 +1150,7 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
 }
 
 // ==========================================
-// مسارات النظام المتقدم (COGS, Merging, Makeup, Addresses)
+// مسارات النظام المتقدم
 // ==========================================
 app.post('/api/admin/cogs', async (req, res) => {
   try {
