@@ -157,13 +157,14 @@ const authenticateToken = (req, res, next) => {
     next();
   });
 };
+
 const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com', // ✨ تحديد الخادم مباشرة
-  port: 587, // ✨ استخدام المنفذ 587 المعروف بتجاوزه لقيود الاستضافة
-  secure: false, // ✨ false للمنفذ 587
+  host: 'smtp-relay.brevo.com', // ✨ خوادم Brevo
+  port: 587, // ✨ المنفذ الآمن لـ Brevo
+  secure: false, // false للمنفذ 587
   auth: { 
-    user: process.env.EMAIL_USER, 
-    pass: process.env.EMAIL_PASS 
+    user: process.env.BREVO_USER, // بريدك المسجل في Brevo
+    pass: process.env.BREVO_SMTP_KEY // مفتاح SMTP من Brevo
   }
 });
 
@@ -720,14 +721,14 @@ app.post('/api/register', authLimiter, async (req, res) => {
         const verifyUrl = `${process.env.FRONTEND_URL}/auth/verify-email?token=${verifyToken}`;
 
         // ✨ استخدام Brevo
-        transactionalEmailsApi.sendTransacEmail({
-          sender: BREVO_SENDER,
-          to: [{ email: email }],
-          subject: 'Confirm your Email for NEO Store',
-          htmlContent: `<h2>Welcome to NEO Store, ${name}!</h2>
-                 <p>Please click the button below to activate your account:</p>
-                 <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
-        }).catch(err => console.error("Brevo Error:", err));
+transporter.sendMail({
+  from: `"NEO Store Support" <${process.env.BREVO_USER}>`,
+  to: email,
+  subject: 'Confirm your Email for NEO Store',
+  html: `<h2>Welcome to NEO Store, ${name}!</h2>
+         <p>Please click the button below to activate your account:</p>
+         <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
+}).catch(emailErr => console.error("❌ Email Sending Error:", emailErr));
 
         // الرد فوراً للمستخدم بأن العملية تمت بنجاح
         res.status(201).json({ message: 'User registered successfully! Please check your email to verify your account.' });
@@ -760,14 +761,15 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
             const resetUrl = `${process.env.FRONTEND_URL}/auth/reset-password?token=${resetToken}`;
 
             // ✨ استخدام Brevo
-            transactionalEmailsApi.sendTransacEmail({
-              sender: BREVO_SENDER,
-              to: [{ email: email }],
-              subject: 'Password Reset Request',
-              htmlContent: `<h2>Did you forget your password?</h2>
-                     <p>Click the button below to set a new password. This link will expire in 15 minutes.</p>
-                     <a href="${resetUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Reset My Password</a>`
-            }).catch(err => console.error("Brevo Error:", err));
+            // في /register
+transporter.sendMail({
+  from: `"NEO Store Support" <${process.env.BREVO_USER}>`,
+  to: email,
+  subject: 'Confirm your Email for NEO Store',
+  html: `<h2>Welcome to NEO Store, ${name}!</h2>
+         <p>Please click the button below to activate your account:</p>
+         <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
+}).catch(emailErr => console.error("❌ Email Sending Error:", emailErr));
         }
         
         // الرد فوراً للمستخدم
