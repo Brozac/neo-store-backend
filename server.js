@@ -74,22 +74,26 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // ✨ الرد على Stripe فوراً بـ 200 OK لمنع الـ Timeout!
+  res.status(200).json({ received: true });
+
+  // ✨ معالجة الطلب في الخلفية (بدون انتظار)
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const orderId = session.metadata?.orderId;
-    if (!orderId) return res.status(400).send('No orderId in metadata');
+    if (!orderId) return;
 
     try {
       const existingOrder = await pool.query('SELECT status FROM orders WHERE id = $1', [orderId]);
-
       if (existingOrder.rows.length === 0) {
         logger.logError('Stripe Webhook', new Error(`Order #${orderId} not found`));
-        return res.status(200).json({ received: true });
+        return;
       }
 
+      // منع المعالجة المكررة إذا أعاد Stripe المحاولة
       if (existingOrder.rows[0].status !== 'pending') {
         console.log(`⚠️ Order #${orderId} already processed. Skipping duplicate webhook.`);
-        return res.status(200).json({ received: true, duplicate: true });
+        return;
       }
 
       const customerName = session.customer_details?.name || 'Guest Customer';
@@ -113,17 +117,18 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
 
       console.log(`✅ Order #${orderId} saved in database!`);
 
-      await fulfillCJOrder(orderId, customerName, session.customer_details, items);
+      // تنفيذ العمليات الثقيلة في الخلفية
+      fulfillCJOrder(orderId, customerName, session.customer_details, items)
+        .catch(err => logger.logError('CJ Fulfillment (Background)', err));
 
       if (customerEmail) {
-        await sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, items);
+        sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, items)
+          .catch(err => logger.logError('Send Email (Background)', err));
       }
     } catch (dbErr) {
       logger.logError('Stripe Webhook DB Update', dbErr);
     }
   }
-
-  res.status(200).json({ received: true });
 });
 
 // ✅ 2. express.json

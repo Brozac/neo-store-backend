@@ -149,6 +149,8 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
     let orderSuccess = false;
     let lastError = null;
 
+await new Promise(r => setTimeout(r, 1500)); // ✨ تأخير 1.5 ثانية قبل كل محاولة شحن
+
     for (const logisticName of logisticsToTry) {
       const cjOrderPayload = {
         orderNumber: `STORE-${orderId}`,
