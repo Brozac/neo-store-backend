@@ -152,6 +152,20 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// ✨ نفس فكرة authenticateToken، بصح ماتوقفش الطلب إذا ماكانش توكن ولا كان خايب
+// (نستعملوها فـ checkout باش نربطو الطلب بالحساب إذا الزبون رايح logged-in،
+// وفـ نفس الوقت نخليو الـ guest checkout يخدم عادي بلا توكن)
+function getOptionalUser(req) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return null;
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch (e) {
+    return null;
+  }
+}
+
 // ==========================================
 // ✨ إرسال الإيميلات: Brevo (أساسي) + Resend (احتياطي تلقائي)
 // السبب: Render يبلوكي outbound traffic على SMTP ports، فبعثنا بالـ HTTP API.
@@ -393,6 +407,21 @@ app.post('/api/reviews/add', authenticateToken, async (req, res) => {
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.post('/api/admin/upload', upload.array('images', 10), (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
+    const urls = req.files.map(file => `${req.protocol}://${req.get('host')}/uploads/${file.filename}`);
+    res.status(200).json({ urls });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to upload files' });
+  }
+});
+
+// ✨ مسار رفع صورة للمستخدمين العاديين (ماشي أدمن)
+// السبب: صفحة "My Profile" كانت تبعث لـ /api/admin/upload، وهاذي محمية بـ
+// requireAdmin (app.use('/api/admin', requireAdmin) فوق يخليها تطلب admin_token
+// cookie) — زبون عادي معندوش هاذ الكوكي، فالرفع كان يفشل بصمت والصورة
+// ماكانتش تتسجل. هاذ المسار محمي غير بـ authenticateToken (JWT ديال المستخدم).
+app.post('/api/upload', authenticateToken, upload.array('images', 10), (req, res) => {
   try {
     if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
     const urls = req.files.map(file => `${req.protocol}://${req.get('host')}/uploads/${file.filename}`);
@@ -854,6 +883,17 @@ app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
 
       const customerDetails = { address: parsedAddress, phone: order.customer_phone };
       await fulfillCJOrder(order.id, order.customer_name, customerDetails, items);
+
+      // ✨ نبعثو إيميل تأكيد للزبون هنا زادة (قبل، كان يتبعث غير كي الدفع
+      // يكون عبر Stripe؛ طلبات BaridiMob كانت توليو موافق عليها بلا ما يوصل
+      // أي إيميل للزبون)
+      if (order.customer_email) {
+        const emailItemsRes = await pool.query(
+          `SELECT oi.quantity, oi.price_at_purchase, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`,
+          [id]
+        );
+        await sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, emailItemsRes.rows);
+      }
     }
 
     res.json({ message: 'Order approved and sent to CJ successfully!' });
@@ -1007,7 +1047,13 @@ app.post('/api/create-checkout-session', async (req, res) => {
     let baseUrl = origin && origin.startsWith('http') ? origin : 'http://localhost:3000';
     baseUrl = baseUrl.replace(/\/+$/, '');
 
-    const orderResult = await pool.query("INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status) VALUES ($1, $2, $3, $4, $5) RETURNING id", ['Pending Customer', 'pending@neo.com', 'Pending', 0, 'pending']);
+    // ✨ إذا الزبون logged-in، نربطو الطلب بالحساب متاعو (user_id) باش يبان فـ "My Orders"
+    // حتى لو دخل إيميل مختلف فـ Stripe Checkout. الـ guest checkout يبقى يخدم عادي (user_id = null).
+    const optionalUser = getOptionalUser(req);
+    const orderResult = await pool.query(
+      "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, user_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+      ['Pending Customer', 'pending@neo.com', 'Pending', 0, 'pending', optionalUser ? optionalUser.id : null]
+    );
     const orderId = orderResult.rows[0].id;
 
     for (const item of items) {
@@ -1055,6 +1101,23 @@ app.get('/api/orders/:id/items', async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(`SELECT oi.quantity, oi.price_at_purchase, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [id]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ✨ مسار "My Orders" الخاص بالحساب المسجّل — يجيب الطلبات المربوطة بـ user_id
+// (الطلبات الجديدة بعد هاذ التعديل)، وكـ fallback يجيب حتى الطلبات القديمة
+// اللي إيميلها يطابق إيميل الحساب (لكن ماشي الطلبات pending اللي مازال معندهاش إيميل حقيقي).
+app.get('/api/orders/my-orders', authenticateToken, async (req, res) => {
+  try {
+    const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
+    const userEmail = userRes.rows[0]?.email || null;
+    const result = await pool.query(
+      `SELECT * FROM orders WHERE user_id = $1 OR (customer_email = $2 AND status != 'pending') ORDER BY id DESC`,
+      [req.user.id, userEmail]
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
