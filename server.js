@@ -153,14 +153,23 @@ const authenticateToken = (req, res, next) => {
 };
 
 // ==========================================
-// ✨ إرسال الإيميلات عبر Brevo HTTP API (بدل SMTP/Nodemailer)
-// السبب: Render يبلوكي outbound traffic على SMTP ports (25, 465, 587)
-// فـ free tier (ومزال حتى port 25 مبلوكي فـ plans المدفوعة). الـ API
-// يخدم فوق HTTPS (port 443) لي ماهوش مبلوكي أبدا.
-// لازم تزيد BREVO_API_KEY فـ .env (Brevo Dashboard → SMTP & API → API Keys)
-// ملاحظة: هذا ماشي نفس BREVO_SMTP_KEY القديم.
+// ✨ إرسال الإيميلات: Brevo (أساسي) + Resend (احتياطي تلقائي)
+// السبب: Render يبلوكي outbound traffic على SMTP ports، فبعثنا بالـ HTTP API.
+// وحيت حساب Brevo يحتاج تفعيل يدوي فـ البداية، زدنا Resend كـ fallback:
+// إذا Brevo رجع خطأ (مهما كان السبب: ماهوش مفعّل، quota، ...)، نبعثو
+// عبر Resend مباشرة بلا ما نوقفو تدفق التسجيل/الطلب.
+//
+// Env vars لازمين:
+//   BREVO_API_KEY   → Brevo Dashboard → SMTP & API → API Keys
+//   BREVO_USER      → الإيميل المرسل عندك فـ Brevo (موجود ديجا)
+//   RESEND_API_KEY  → resend.com/api-keys (تفعيل فوري بلا مراجعة يدوية)
+//   RESEND_FROM_EMAIL → اختياري، إيميل مرسل تحققت منه فـ Resend
+//                        (إذا ماحطيتوش، نستعملو onboarding@resend.dev
+//                        اللي يخدم للتجربة لكن يقيد الإرسال لإيميلك
+//                        المسجل فـ Resend حتى توثق دومين)
 // ==========================================
 async function sendEmail({ to, subject, html }) {
+  // 1) نجربو Brevo أولا (الحل الأساسي)
   try {
     await axios.post('https://api.brevo.com/v3/smtp/email', {
       sender: { name: 'NEO Store Support', email: process.env.BREVO_USER },
@@ -174,9 +183,28 @@ async function sendEmail({ to, subject, html }) {
         'Accept': 'application/json'
       }
     });
-    console.log(`📧 Email sent to ${to}`);
-  } catch (err) {
-    logger.logError('Send Email (Brevo API)', err.response?.data || err.message);
+    console.log(`📧 Email sent via Brevo to ${to}`);
+    return;
+  } catch (brevoErr) {
+    logger.logError('Send Email (Brevo API)', brevoErr.response?.data || brevoErr.message);
+  }
+
+  // 2) إذا فشل Brevo، نجربو Resend كـ fallback تلقائي
+  try {
+    await axios.post('https://api.resend.com/emails', {
+      from: process.env.RESEND_FROM_EMAIL || 'NEO Store <onboarding@resend.dev>',
+      to: [to],
+      subject,
+      html
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    console.log(`📧 Email sent via Resend (fallback) to ${to}`);
+  } catch (resendErr) {
+    logger.logError('Send Email (Resend fallback)', resendErr.response?.data || resendErr.message);
   }
 }
 
@@ -198,7 +226,7 @@ const upload = multer({ storage: storage });
 // فحص متغيرات البيئة الأساسية في الإنتاج
 // ==========================================
 if (process.env.NODE_ENV === 'production') {
-  const requiredEnvVars = ['DATABASE_URL', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'JWT_SECRET', 'CJ_API_KEY', 'ADMIN_EMAIL', 'ADMIN_PASSWORD', 'BREVO_API_KEY', 'BREVO_USER'];
+  const requiredEnvVars = ['DATABASE_URL', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'JWT_SECRET', 'CJ_API_KEY', 'ADMIN_EMAIL', 'ADMIN_PASSWORD', 'BREVO_API_KEY', 'BREVO_USER', 'RESEND_API_KEY'];
   const missing = requiredEnvVars.filter((v) => !process.env[v]);
   if (missing.length > 0) {
     console.error(`❌ Missing required environment variables in production: ${missing.join(', ')}`);
