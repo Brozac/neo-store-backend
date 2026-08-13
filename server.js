@@ -908,7 +908,7 @@ app.post('/api/admin/auto-categorize', async (req, res) => {
 // ==========================================
 app.get('/', (req, res) => res.send('Dropshipping API is running on point!'));
 
-// ✨ In-Memory Caching لجلب كل المنتجات (سريع جداً بفضل الكاش)
+// ✨ In-Memory Caching لجلب كل المنتجات (مُحسّن لتقليل استهلاك الرام)
 let productsCache = null;
 let cacheTime = 0;
 const CACHE_TTL = 60000; // دقيقة واحدة
@@ -923,14 +923,16 @@ app.get('/api/products', async (req, res) => {
       if (productsCache && (Date.now() - cacheTime < CACHE_TTL)) {
         return res.json(productsCache);
       }
-      const result = await pool.query('SELECT * FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC');
+      
+      // ✨ نجلب الأعمدة الأساسية فقط للصفحة الرئيسية (لا نجلب description أو variants لتوفير الرام)
+      const result = await pool.query('SELECT id, title, price, original_price, image_url, category FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC');
       productsCache = result.rows;
       cacheTime = Date.now();
       return res.json(result.rows);
     }
 
-    // 2. إذا كان هناك بحث أو قسم، نبحث في قاعدة البيانات (بفضل الفهارس سيكون سريعاً جداً)
-    let query = 'SELECT * FROM products WHERE stock_status = true';
+    // 2. إذا كان هناك بحث أو قسم، نبحث في قاعدة البيانات
+    let query = 'SELECT id, title, price, original_price, image_url, category FROM products WHERE stock_status = true';
     let params = [];
     let paramIndex = 1;
 
@@ -942,7 +944,7 @@ app.get('/api/products', async (req, res) => {
 
     if (category !== 'All') {
       query += ` AND category ILIKE $${paramIndex}`;
-      params.push(`${category}%`); // يبحث في بداية المسار (مثال: women/clothes)
+      params.push(`${category}%`);
       paramIndex++;
     }
 
