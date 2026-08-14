@@ -196,6 +196,7 @@ await new Promise(r => setTimeout(r, 1500)); // ✨ تأخير 1.5 ثانية ق
     }
 
     if (!orderSuccess) {
+      console.error(`❌ CJ Order Failed for #${orderId}. CJ Error:`, JSON.stringify(lastError, null, 2));
       await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
     }
   } catch (err) {
