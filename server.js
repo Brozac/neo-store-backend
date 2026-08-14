@@ -20,6 +20,9 @@ const logger = require('./logger');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+
 
 const app = express();
 const cookieParser = require('cookie-parser');
@@ -230,13 +233,25 @@ async function sendEmail({ to, subject, html }) {
 // ==========================================
 // إعداد مجلد رفع الصور و Multer
 // ==========================================
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) { cb(null, 'uploads/'); },
-  filename: function (req, file, cb) {
-    cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname));
+// ✨ إعداد Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+// ✨ إعداد Multer لاستخدام Cloudinary
+const storage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'neo_store_uploads', // اسم المجلد في Cloudinary
+    allowed_formats: ['jpg', 'png', 'jpeg', 'webp']
   }
 });
 const upload = multer({ storage: storage });
@@ -414,7 +429,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.post('/api/admin/upload', upload.array('images', 10), (req, res) => {
   try {
     if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
-    const urls = req.files.map(file => `${req.protocol}://${req.get('host')}/uploads/${file.filename}`);
+    // ✨ Cloudinary يرجع الرابط في file.path
+    const urls = req.files.map(file => file.path);
     res.status(200).json({ urls });
   } catch (error) {
     res.status(500).json({ error: 'Failed to upload files' });
@@ -429,7 +445,8 @@ app.post('/api/admin/upload', upload.array('images', 10), (req, res) => {
 app.post('/api/upload', authenticateToken, upload.array('images', 10), (req, res) => {
   try {
     if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
-    const urls = req.files.map(file => `${req.protocol}://${req.get('host')}/uploads/${file.filename}`);
+    // ✨ Cloudinary يرجع الرابط في file.path
+    const urls = req.files.map(file => file.path);
     res.status(200).json({ urls });
   } catch (error) {
     res.status(500).json({ error: 'Failed to upload files' });

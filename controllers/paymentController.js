@@ -4,6 +4,8 @@ const Stripe = require('stripe');
 const axios = require('axios');
 const crypto = require('crypto');
 const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const jwt = require('jsonwebtoken'); 
 const { Pool } = require('pg');
 const { fulfillCJOrder } = require('../services/cjService');
@@ -16,11 +18,20 @@ const pool = new Pool({
 });
 
 // إعداد Multer
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'uploads/'),
-  filename: (req, file, cb) => cb(null, `receipt-${Date.now()}.png`)
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
 });
-const upload = multer({ storage });
+
+const storage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'neo_store_receipts',
+    allowed_formats: ['jpg', 'png', 'jpeg']
+  }
+});
+const upload = multer({ storage: storage });
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const NOWPAYMENTS_API_KEY = process.env.NOWPAYMENTS_API_KEY;
@@ -28,8 +39,8 @@ const PAYSERA_PROJECT_ID = process.env.PAYSERA_PROJECT_ID;
 const PAYSERA_PASSWORD = process.env.PAYSERA_PASSWORD;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// ✨ مصفوفة تحتوي على جميع رموز دول العالم المعتمدة في Stripe
-const ALL_WORLD_COUNTRIES = ['AF','AX','AL','DZ','AS','AD','AO','AI','AQ','AG','AR','AM','AW','AU','AT','AZ','BS','BH','BD','BB','BY','BE','BZ','BJ','BM','BT','BO','BQ','BA','BW','BV','BR','IO','BN','BG','BF','BI','CV','KH','CM','CA','KY','CF','TD','CL','CN','CX','CC','CO','KM','CG','CD','CK','CR','CI','HR','CU','CW','CY','CZ','DK','DJ','DM','DO','EC','EG','SV','GQ','ER','EE','ET','FK','FO','FJ','FI','FR','GF','PF','TF','GA','GM','GE','DE','GH','GI','GR','GL','GD','GP','GU','GT','GG','GN','GW','GY','HT','HM','VA','HN','HK','HU','IS','IN','ID','IR','IQ','IE','IM','IL','IT','JM','JP','JE','JO','KZ','KE','KI','KP','KR','KW','KG','LA','LV','LB','LS','LR','LY','LI','LT','LU','MO','MK','MG','MW','MY','MV','ML','MT','MH','MQ','MR','MU','YT','MX','FM','MD','MC','MN','ME','MS','MA','MZ','MM','NA','NR','NP','NL','NC','NZ','NI','NE','NG','NU','NF','MP','NO','OM','PK','PW','PS','PA','PG','PY','PE','PH','PN','PL','PT','PR','QA','RE','RO','RU','RW','BL','SH','KN','LC','MF','PM','VC','WS','SM','ST','SA','SN','RS','SC','SL','SG','SX','SK','SI','SB','SO','ZA','GS','SS','ES','LK','SD','SR','SJ','SZ','SE','CH','SY','TW','TJ','TZ','TH','TL','TG','TK','TO','TT','TN','TR','TM','TC','TV','UG','UA','AE','GB','US','UM','UY','UZ','VU','VE','VN','VG','VI','WF','EH','YE','ZM','ZW'];
+// ✨ مصفوفة رسمية نظيفة تحتوي على جميع رموز دول العالم المعتمدة في Stripe للشحن
+const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
 
 // ==========================================
 // ✨ دوال الإيميل (Brevo + Resend Fallback)
@@ -300,7 +311,7 @@ router.post('/crypto', async (req, res) => {
     }
 
     // ✨ تأكدي من استخدام رابط التجربة هنا إذا كنتي تختبرين
-    const apiUrl = 'https://api-sandbox.nowpayments.io/v1/invoice'; 
+    const apiUrl = 'https://api.nowpayments.io/v1/invoice'; 
     // للإنتاج الحقيقي استخدمي: 'https://api.nowpayments.io/v1/invoice'
     
     const response = await axios.post(apiUrl, {
@@ -334,7 +345,7 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'يرجى رفع صورة الإيصال' });
 
     const { totalAmount, items, customerName, customerPhone, customerAddress, customerEmail } = req.body;
-    const receiptUrl = `${process.env.BACKEND_URL}/uploads/${req.file.filename}`;
+    const receiptUrl = req.file.path; // ✨ رابط Cloudinary
     const fullShippingAddress = customerAddress || JSON.stringify({ line1: 'N/A', city: 'N/A', state: 'N/A', postal_code: '00000', country: 'DZ' });
     
     const optionalUser = getOptionalUser(req); 

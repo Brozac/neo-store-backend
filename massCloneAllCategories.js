@@ -5,8 +5,10 @@ const { cjRequest, parseNumeric } = require('./services/cjService');
 const { parseVariants, getCategorySlug, phoneAccRegex, pcBlacklistRegex } = require('./utils/parser');
 const { resolveCategoryByCjId } = require('./services/categoryService');
 
+// ✨ 1. إضافة ssl: { rejectUnauthorized: false } للاتصال الآمن
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
 async function runMassClone() {
@@ -23,7 +25,7 @@ async function runMassClone() {
     const category = categories[i];
     console.log(`\n📂 [${i + 1}/${categories.length}] Fetching products for: ${category.name} (${category.slug})`);
 
-    const pagesToFetch = 2; // نجلب صفحتين (40 منتج) لكل قسم تحتي لتغطية واسعة دون إبطاء السيرفر
+    const pagesToFetch = 2; // نجلب صفحتين (40 منتج) لكل قسم تحتي
     let categoryImported = 0;
 
     for (let pageNum = 1; pageNum <= pagesToFetch; pageNum++) {
@@ -97,16 +99,17 @@ async function runMassClone() {
               if (videoRes.data.code === 200 && videoRes.data.data?.length > 0) videoUrl = videoRes.data.data[0].videoUrl;
             } catch (e) {}
 
+            // ✨ 2. إضافة patterns إلى الاستعلام
             await pool.query(
-              `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id) 
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+              `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, patterns, stock_status, cj_product_id, description, material, category, video_url, cj_category_id) 
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                ON CONFLICT (cj_product_id) DO UPDATE SET 
                  title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price, 
                  image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants, 
-                 colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status, 
+                 colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, patterns=EXCLUDED.patterns, stock_status=EXCLUDED.stock_status, 
                  description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, 
                  video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id`,
-              [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, details.description, material, categorySlug, videoUrl, cjCategoryId]
+              [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, parsedData.patterns, true, details.pid, details.description, material, categorySlug, videoUrl, cjCategoryId]
             );
 
             totalImported++;
@@ -123,6 +126,9 @@ async function runMassClone() {
   }
 
   console.log(`\n🎉 Mass Clone Complete! Successfully imported ${totalImported} products across ${categories.length} categories.`);
+  
+  // ✨ 3. إغلاق الاتصال بأمان
+  await pool.end();
   process.exit(0);
 }
 
