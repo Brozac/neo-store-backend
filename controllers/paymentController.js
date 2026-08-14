@@ -14,7 +14,11 @@ const logger = require('../logger');
 // إعداد قاعدة البيانات
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } 
+  ssl: { rejectUnauthorized: false },
+  // ✨ إعدادات الدبابة: تمنع انهيار قاعدة البيانات تحت الضغط
+  max: 20, // الحد الأقصى لعدد الاتصالات المفتوحة في نفس اللحظة (20 تكفي لمئات الزوار)
+  idleTimeoutMillis: 30000, // إغلاق أي اتصال خامل بعد 30 ثانية
+  connectionTimeoutMillis: 2000 // إذا لم تتمكن من الاتصال خلال ثانيتين، يرجع خطأ بدل أن يعلق السيرفر
 });
 
 // إعداد Multer
