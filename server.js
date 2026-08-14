@@ -233,11 +233,6 @@ async function sendEmail({ to, subject, html }) {
 // ==========================================
 // إعداد مجلد رفع الصور و Multer
 // ==========================================
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
-const cloudinary = require('cloudinary').v2;
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 // ✨ إعداد Cloudinary
 cloudinary.config({
