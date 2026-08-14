@@ -3,9 +3,13 @@ const { Pool } = require('pg');
 const axios = require('axios');
 const { getCJToken, cjRequest, parseNumeric } = require('./services/cjService');
 const { parseVariants, getCategorySlug } = require('./utils/parser');
+// ✨ استيراد دالة الفئات الرسمية
+const { resolveCategoryByCjId } = require('./services/categoryService');
 
+// ✨ إضافة ssl: { rejectUnauthorized: false } للاتصال بـ Neon/Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
 async function runMassSync() {
@@ -34,7 +38,7 @@ async function runMassSync() {
       }
 
       for (const cjItem of cjProducts) {
-        await new Promise(r => setTimeout(r, 1200)); 
+        await new Promise(r => setTimeout(r, 1200)); // تأخير لتفادي الـ Rate Limit
 
         const productId = cjItem.pid ? String(cjItem.pid) : null;
         if (!productId) continue;
@@ -79,9 +83,16 @@ async function runMassSync() {
           const safePrice = parseFloat(sellingPrice.toFixed(2));
           const safeOriginalPrice = parseFloat((safePrice * 1.5).toFixed(2));
 
-          const categorySlug = getCategorySlug(`${details.categoryName} ${details.productNameEn}`);
+          // ✨ تصنيف ذكي باستخدام الشجرة الرسمية لـ CJ
+          const cjCategoryId = details.categoryId || null;
+          let categorySlug;
+          if (cjCategoryId) {
+            const resolved = await resolveCategoryByCjId(cjCategoryId);
+            categorySlug = resolved ? resolved.slugPath : getCategorySlug(`${details.categoryName} ${details.productNameEn}`);
+          } else {
+            categorySlug = getCategorySlug(`${details.categoryName} ${details.productNameEn}`);
+          }
           
-          // ✨ parseVariants الآن يرجع colors, sizes, و patterns
           const parsedData = parseVariants(details.variants || []);
           
           let material = 'Premium Quality';
@@ -103,19 +114,19 @@ async function runMassSync() {
             }
           } catch (e) {}
 
-          // ✨ الحفظ في قاعدة البيانات (تمت إضافة patterns)
+          // ✨ الحفظ في قاعدة البيانات (تمت إضافة patterns و cj_category_id)
           await pool.query(
-            `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, patterns, stock_status, cj_product_id, description, material, category, video_url) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, patterns, stock_status, cj_product_id, description, material, category, cj_category_id, video_url) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
              ON CONFLICT (cj_product_id) DO UPDATE SET 
                title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price, 
                image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants, 
                colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, patterns=EXCLUDED.patterns, stock_status=EXCLUDED.stock_status, 
-               description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, video_url=EXCLUDED.video_url`,
+               description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, cj_category_id=EXCLUDED.cj_category_id, video_url=EXCLUDED.video_url`,
             [
               details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet,
               JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, parsedData.patterns, true, details.pid,
-              details.description, material, categorySlug, videoUrl
+              details.description, material, categorySlug, cjCategoryId, videoUrl
             ]
           );
           
@@ -132,6 +143,8 @@ async function runMassSync() {
   }
 
   console.log(`\n🎉 Mass Sync Complete! Successfully imported ${importedCount} high-quality products.`);
+  // ✨ إغلاق تجمع الاتصالات قبل الخروج لمنع تعليق السكريبت
+  await pool.end();
   process.exit(0);
 }
 

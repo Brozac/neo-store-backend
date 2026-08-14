@@ -4,15 +4,15 @@ const Stripe = require('stripe');
 const axios = require('axios');
 const crypto = require('crypto');
 const multer = require('multer');
-const jwt = require('jsonwebtoken'); // ✨ لاستخراج user_id
+const jwt = require('jsonwebtoken'); 
 const { Pool } = require('pg');
 const { fulfillCJOrder } = require('../services/cjService');
-const logger = require('../logger'); // ✨ لتسجيل الأخطاء
+const logger = require('../logger'); 
 
 // إعداد قاعدة البيانات
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // ✨ مهم لـ Render
+  ssl: { rejectUnauthorized: false } 
 });
 
 // إعداد Multer
@@ -27,6 +27,9 @@ const NOWPAYMENTS_API_KEY = process.env.NOWPAYMENTS_API_KEY;
 const PAYSERA_PROJECT_ID = process.env.PAYSERA_PROJECT_ID;
 const PAYSERA_PASSWORD = process.env.PAYSERA_PASSWORD;
 const JWT_SECRET = process.env.JWT_SECRET;
+
+// ✨ مصفوفة تحتوي على جميع رموز دول العالم المعتمدة في Stripe
+const ALL_WORLD_COUNTRIES = ['AF','AX','AL','DZ','AS','AD','AO','AI','AQ','AG','AR','AM','AW','AU','AT','AZ','BS','BH','BD','BB','BY','BE','BZ','BJ','BM','BT','BO','BQ','BA','BW','BV','BR','IO','BN','BG','BF','BI','CV','KH','CM','CA','KY','CF','TD','CL','CN','CX','CC','CO','KM','CG','CD','CK','CR','CI','HR','CU','CW','CY','CZ','DK','DJ','DM','DO','EC','EG','SV','GQ','ER','EE','ET','FK','FO','FJ','FI','FR','GF','PF','TF','GA','GM','GE','DE','GH','GI','GR','GL','GD','GP','GU','GT','GG','GN','GW','GY','HT','HM','VA','HN','HK','HU','IS','IN','ID','IR','IQ','IE','IM','IL','IT','JM','JP','JE','JO','KZ','KE','KI','KP','KR','KW','KG','LA','LV','LB','LS','LR','LY','LI','LT','LU','MO','MK','MG','MW','MY','MV','ML','MT','MH','MQ','MR','MU','YT','MX','FM','MD','MC','MN','ME','MS','MA','MZ','MM','NA','NR','NP','NL','NC','NZ','NI','NE','NG','NU','NF','MP','NO','OM','PK','PW','PS','PA','PG','PY','PE','PH','PN','PL','PT','PR','QA','RE','RO','RU','RW','BL','SH','KN','LC','MF','PM','VC','WS','SM','ST','SA','SN','RS','SC','SL','SG','SX','SK','SI','SB','SO','ZA','GS','SS','ES','LK','SD','SR','SJ','SZ','SE','CH','SY','TW','TJ','TZ','TH','TL','TG','TK','TO','TT','TN','TR','TM','TC','TV','UG','UA','AE','GB','US','UM','UY','UZ','VU','VE','VN','VG','VI','WF','EH','YE','ZM','ZW'];
 
 // ==========================================
 // ✨ دوال الإيميل (Brevo + Resend Fallback)
@@ -143,7 +146,7 @@ function getOptionalUser(req) {
 router.post('/stripe', async (req, res) => {
   try {
     const { items, totalAmount } = req.body;
-    const optionalUser = getOptionalUser(req); // ✨
+    const optionalUser = getOptionalUser(req); 
 
     const orderResult = await pool.query(
       "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
@@ -169,12 +172,12 @@ router.post('/stripe', async (req, res) => {
         quantity: item.quantity,
       })),
       mode: 'payment',
-      // ✨ ===== الإضافة الجديدة هنا ===== ✨
+      // ✨ ===== تعديل الشحن لجميع دول العالم ===== ✨
       shipping_address_collection: { 
-        allowed_countries: ['US', 'GB', 'CA', 'DZ', 'AE', 'SA', 'FR', 'DE', 'MA', 'TN'] 
+        allowed_countries: ALL_WORLD_COUNTRIES 
       },
       phone_number_collection: { enabled: true },
-      // ================================
+      // ==========================================
       success_url: `${process.env.FRONTEND_URL}/success?method=stripe`,
       cancel_url: `${process.env.FRONTEND_URL}/cart`,
       metadata: { orderId: orderId.toString() },
@@ -193,7 +196,7 @@ router.post('/stripe', async (req, res) => {
 router.post('/paysera', async (req, res) => {
   try {
     const { items, totalAmount } = req.body;
-    const optionalUser = getOptionalUser(req); // ✨
+    const optionalUser = getOptionalUser(req); 
 
     const orderResult = await pool.query(
       "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
@@ -263,7 +266,6 @@ router.get('/paysera/callback', async (req, res) => {
           address: { line1: orderRes.rows[0].shipping_address, country: 'US' }
         }, items);
 
-        // ✨ إرسال الإيميل الاحترافي
         if (orderRes.rows[0].customer_email) {
           await sendOrderConfirmationEmail(orderRes.rows[0].customer_email, orderId, orderRes.rows[0].total_amount, items);
         }
@@ -277,14 +279,13 @@ router.get('/paysera/callback', async (req, res) => {
 });
 
 // ==========================================
-// 3. Crypto (NowPayments) - ✨ تم إصلاح الخلل هنا
+// 3. Crypto (NowPayments)
 // ==========================================
 router.post('/crypto', async (req, res) => {
   try {
     const { items, totalAmount } = req.body;
-    const optionalUser = getOptionalUser(req); // ✨
+    const optionalUser = getOptionalUser(req); 
 
-    // 1. حفظ الطلب في قاعدة البيانات أولاً (كان غير موجود وماكانش يربط الطلب)
     const orderResult = await pool.query(
       "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
       ['Pending Crypto', 'pending@neo.com', 'Pending', totalAmount, 'pending', 'Crypto', optionalUser ? optionalUser.id : null]
@@ -298,11 +299,14 @@ router.post('/crypto', async (req, res) => {
       );
     }
 
-    const apiUrl = 'https://api-sandbox.nowpayments.io/v1/invoice'; //https://api.nowpayments.io/v1/invoice; 
+    // ✨ تأكدي من استخدام رابط التجربة هنا إذا كنتي تختبرين
+    const apiUrl = 'https://api-sandbox.nowpayments.io/v1/invoice'; 
+    // للإنتاج الحقيقي استخدمي: 'https://api.nowpayments.io/v1/invoice'
+    
     const response = await axios.post(apiUrl, {
       price_amount: totalAmount,
       price_currency: 'usd',
-      order_id: orderId.toString(), // ✨ ربط الطلب
+      order_id: orderId.toString(), 
       order_description: 'NEO Store Purchase',
       ipn_callback_url: `${process.env.BACKEND_URL}/api/payment/crypto/callback`,
       success_url: `${process.env.FRONTEND_URL}/success?method=crypto`,
@@ -333,7 +337,7 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
     const receiptUrl = `${process.env.BACKEND_URL}/uploads/${req.file.filename}`;
     const fullShippingAddress = customerAddress || JSON.stringify({ line1: 'N/A', city: 'N/A', state: 'N/A', postal_code: '00000', country: 'DZ' });
     
-    const optionalUser = getOptionalUser(req); // ✨
+    const optionalUser = getOptionalUser(req); 
 
     const orderResult = await pool.query(
       `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, payment_status, receipt_url, user_id) 
@@ -351,15 +355,13 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
       );
     }
 
-    // ✨ إرسال إيميل للعميل بتأكيد استلام الطلب (احترافي)
     if (customerEmail && customerEmail !== 'manual@neo.com') {
       const itemsForEmail = parsedItems.map(it => ({ title: it.name, image_url: it.image_url, quantity: it.quantity, price_at_purchase: it.price }));
       await sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, itemsForEmail);
     }
 
-    // ✨ إرسال إيميل للأدمن لمراجعة الإيصال
     await sendEmail({
-      to: process.env.BREVO_USER, // يرسل للأدمن
+      to: process.env.BREVO_USER, 
       subject: `🚨 New BaridiMob Order #${orderId} - Action Required`,
       html: `<h2>New Manual Payment Received</h2>
              <p>A new order has been placed and requires your verification.</p>
@@ -407,7 +409,7 @@ router.post('/crypto/callback', async (req, res) => {
     const paymentData = req.body;
     if (paymentData.payment_status === 'finished' || paymentData.payment_status === 'confirmed') {
       
-      const orderId = paymentData.order_id; // ✨ أصبح مباشراً لأننا رسلناه كـ String
+      const orderId = paymentData.order_id; 
 
       const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
       if (orderRes.rows.length === 0) return res.status(404).send('Order not found');
@@ -430,7 +432,6 @@ router.post('/crypto/callback', async (req, res) => {
 
         await fulfillCJOrder(orderId, order.customer_name, customerDetails, items);
 
-        // ✨ إرسال الإيميل الاحترافي
         const finalEmail = paymentData.customer_email || order.customer_email;
         if (finalEmail) {
           await sendOrderConfirmationEmail(finalEmail, orderId, order.total_amount, items);

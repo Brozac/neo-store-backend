@@ -1045,7 +1045,26 @@ app.get('/api/products', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
-
+// ✨ مسار جديد لجلب تفاصيل منتج واحد بالكامل (لصفحة المنتج)
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    // جلب كل الأعمدة بما فيها images, description, colors, sizes, video_url
+    const result = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
+    
+    // تحويل نص images إلى مصفوفة إذا كان نصاً
+    const product = result.rows[0];
+    if (product.images && typeof product.images === 'string') {
+      try { product.images = JSON.parse(product.images); } catch (e) {}
+    }
+    
+    res.json(product);
+  } catch (err) {
+    console.error('❌ Error fetching product details:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
 app.post('/api/create-checkout-session', async (req, res) => {
   try {
     const { items, origin, couponCode } = req.body;
