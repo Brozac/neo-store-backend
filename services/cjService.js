@@ -187,7 +187,11 @@ await new Promise(r => setTimeout(r, 1500)); // ✨ تأخير 1.5 ثانية ق
           break;
         } else {
           lastError = cjResponse.data;
-          if (cjResponse.data.code !== 1605001 && cjResponse.data.code !== 1600200) break;
+          // ✨ إذا كان الخطأ هو تجاوز الحد (Rate Limit) أو طلب مكرر، توقف فوراً
+          if (lastError.code === 1600200 || lastError.code === 1605001) {
+            console.log(`⚠️ CJ blocked the request (Code: ${lastError.code}). Stopping shipping attempts to avoid ban.`);
+            break;
+          }
         }
       } catch (err) {
         lastError = err.response?.data || err.message;
