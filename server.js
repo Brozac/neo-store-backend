@@ -36,10 +36,10 @@ app.use(cookieParser());
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  // ✨ إعدادات الدبابة: تمنع انهيار قاعدة البيانات تحت الضغط
-  max: 20, // الحد الأقصى لعدد الاتصالات المفتوحة في نفس اللحظة (20 تكفي لمئات الزوار)
+  // ✨ إعدادات منع انقطاع الاتصال (مهمة جداً لـ Render/Neon)
+  max: 20, // أقصى عدد اتصالات في نفس اللحظة
   idleTimeoutMillis: 30000, // إغلاق أي اتصال خامل بعد 30 ثانية
-  connectionTimeoutMillis: 2000 // إذا لم تتمكن من الاتصال خلال ثانيتين، يرجع خطأ بدل أن يعلق السيرفر
+  connectionTimeoutMillis: 5000 // مهلة الاتصال: إذا لم يتصل خلال 5 ثوانٍ، يرمي خطأ بدل أن يعلق السيرفر
 });
 
 pool.query('SELECT NOW()')
