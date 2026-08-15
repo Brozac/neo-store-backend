@@ -29,7 +29,8 @@ const cookieParser = require('cookie-parser');
 app.set('trust proxy', 1); // ✨ ضروري لعمل express-rate-limit على Render
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
 app.use(cookieParser());
-
+// ✨ مصفوفة رسمية تحتوي على جميع رموز دول العالم المعتمدة في Stripe للشحن
+const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
 // ==========================================
 // 1. الاتصال بقاعدة البيانات PostgreSQL
 // ==========================================
@@ -933,7 +934,15 @@ app.put('/api/admin/manual-orders/reject/:id', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-
+// ✨ مسار جديد لجلب الطلبات المتعثرة (Stripe/Crypto/Paysera) التي لم تصل CJ
+app.get('/api/admin/failed-orders', async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM orders WHERE status = 'manual' AND payment_method != 'BaridiMob' ORDER BY id DESC");
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 // ==========================================
 // مسار البحث الذكي (Live Search)
 // ==========================================
@@ -1118,7 +1127,8 @@ app.post('/api/create-checkout-session', async (req, res) => {
         return { price_data: { currency: 'usd', product_data: { name: item.title || 'Product', images: hasValidImage ? [item.image_url] : [] }, unit_amount: Math.round(Number(item.price || 0) * 100) }, quantity: Number(item.quantity || 1) };
       }),
       mode: 'payment',
-      shipping_address_collection: { allowed_countries: ['US', 'GB', 'CA', 'DZ', 'AE', 'SA', 'FR', 'DE', 'MA', 'TN'] },
+      // ✨ السماح بالشحن لجميع دول العالم
+      shipping_address_collection: { allowed_countries: ALL_WORLD_COUNTRIES },
       phone_number_collection: { enabled: true },
       discounts: stripeDiscounts,
       shipping_options: [
