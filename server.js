@@ -1363,6 +1363,68 @@ app.post('/api/admin/sourcing/create', async (req, res) => {
 });
 
 // ==========================================
+// 🤖 الأتمتة اليومية (Cron Jobs)
+// ==========================================
+const cron = require('node-cron');
+
+// 1. تحديث 100 منتج عشوائي يومياً (السعر والمخزون) عند الساعة 3 صباحاً
+cron.schedule('0 3 * * *', async () => {
+  console.log('⏳ [Auto-Cron] Starting daily product stock/price update...');
+  try {
+    // جلب 100 منتج عشوائي من قاعدة البيانات
+    const { rows } = await pool.query("SELECT id, cj_product_id FROM products WHERE cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%' ORDER BY random() LIMIT 100");
+    
+    for (const p of rows) {
+      try {
+        await new Promise(r => setTimeout(r, 1500)); // احترام Rate Limit
+        const detailRes = await cjRequest((token, config) =>
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { ...config, headers: { 'CJ-Access-Token': token }, params: { pid: p.cj_product_id } })
+        );
+        const details = detailRes.data?.data;
+        if (!details) continue;
+
+        const cjPrice = parseNumeric(details.sellPrice);
+        let sellingPrice = cjPrice <= 5 ? cjPrice * 3.5 : cjPrice <= 15 ? cjPrice * 2.8 : cjPrice <= 30 ? cjPrice * 2.2 : cjPrice * 1.8;
+        sellingPrice = Math.floor(sellingPrice) - 0.01;
+        if (sellingPrice < 9.99) sellingPrice = 9.99;
+        const safePrice = parseFloat(sellingPrice.toFixed(2));
+
+        // تحديث السعر وحالة التوفر
+        await pool.query("UPDATE products SET price = $1, stock_status = $2 WHERE id = $3", [safePrice, details.isGlobalShipping !== false, p.id]);
+      } catch (e) {}
+    }
+    console.log('✅ [Auto-Cron] Daily product update completed!');
+  } catch (err) {
+    console.error('❌ [Auto-Cron] Error updating products:', err.message);
+  }
+});
+
+// 2. إضافة تقييمات جديدة لـ 5 منتجات عشوائية يومياً (الساعة 4 صباحاً)
+cron.schedule('0 4 * * *', async () => {
+  console.log('⏳ [Auto-Cron] Starting daily review seeding...');
+  const authors = ["Emma", "Liam", "Olivia", "Noah", "Ava", "Ethan", "Sophia", "Mason"];
+  const contents = ["Highly recommend!", "Exactly as described.", "Great quality.", "Fast shipping, very happy."];
+  
+  try {
+    const { rows } = await pool.query("SELECT id FROM products WHERE stock_status = true ORDER BY random() LIMIT 5");
+    
+    for (const p of rows) {
+      const author = authors[Math.floor(Math.random() * authors.length)];
+      const content = contents[Math.floor(Math.random() * contents.length)];
+      const rating = Math.random() > 0.2 ? 5 : 4;
+      
+      await pool.query(
+        'INSERT INTO reviews (product_id, author, rating, content, country) VALUES ($1, $2, $3, $4, $5)',
+        [p.id, author, rating, content, 'United States']
+      );
+    }
+    console.log('✅ [Auto-Cron] Added 5 new reviews successfully!');
+  } catch (err) {
+    console.error('❌ [Auto-Cron] Error seeding reviews:', err.message);
+  }
+});
+
+// ==========================================
 // 11. تشغيل السيرفر
 // ==========================================
 const PORT = process.env.PORT || 5000;
