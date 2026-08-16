@@ -9,6 +9,7 @@ const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const jwt = require('jsonwebtoken'); 
 const { Pool } = require('pg');
 const { fulfillCJOrder } = require('../services/cjService');
+const { prepareSecureItems } = require('../utils/secureCheckout');
 const logger = require('../logger'); 
 
 // إعداد قاعدة البيانات
@@ -157,32 +158,36 @@ function getOptionalUser(req) {
 
 // ==========================================
 // 1. Stripe Checkout
+// ✅ الأسعار تُحسب من قاعدة البيانات فقط عبر prepareSecureItems
 // ==========================================
 router.post('/stripe', async (req, res) => {
   try {
-    const { items, totalAmount } = req.body;
-    const optionalUser = getOptionalUser(req); 
+    const { items: clientItems } = req.body; // ✨ لا نأخذ totalAmount ولا الأسعار من المتصفح
+    const optionalUser = getOptionalUser(req);
+
+    // ✨ إعادة حساب الأسعار والإجمالي من قاعدة البيانات
+    const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
     const orderResult = await pool.query(
       "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
-      ['Pending Customer', 'pending@neo.com', 'Pending', totalAmount, 'pending', 'Stripe', optionalUser ? optionalUser.id : null]
+      ['Pending Customer', 'pending@neo.com', 'Pending', serverTotal, 'pending', 'Stripe', optionalUser ? optionalUser.id : null]
     );
     const orderId = orderResult.rows[0].id;
 
-    for (const item of items) {
+    for (const item of secureItems) {
       await pool.query(
         "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)",
-        [orderId, item.id, item.quantity, Number(item.price) || 0, item.vid || null]
+        [orderId, item.id, item.quantity, item.price, item.vid]
       );
     }
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
-      line_items: items.map(item => ({
+      line_items: secureItems.map(item => ({
         price_data: {
           currency: 'usd',
-          product_data: { name: item.name },
-          unit_amount: Math.round(Number(item.price) * 100),
+          product_data: { name: item.title },
+          unit_amount: Math.round(item.price * 100), // ✅ السعر الحقيقي من قاعدة البيانات
         },
         quantity: item.quantity,
       })),
@@ -207,29 +212,33 @@ router.post('/stripe', async (req, res) => {
 
 // ==========================================
 // 2. Paysera Checkout
+// ✅ المبلغ المرسل لـ Paysera يُحسب من قاعدة البيانات فقط (serverTotal)
 // ==========================================
 router.post('/paysera', async (req, res) => {
   try {
-    const { items, totalAmount } = req.body;
-    const optionalUser = getOptionalUser(req); 
+    const { items: clientItems } = req.body; // ✨ لا نأخذ totalAmount من المتصفح
+    const optionalUser = getOptionalUser(req);
+
+    // ✨ إعادة حساب الأسعار والإجمالي من قاعدة البيانات
+    const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
     const orderResult = await pool.query(
       "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
-      ['Pending Paysera', 'pending@neo.com', 'Pending', totalAmount, 'pending', 'Paysera', optionalUser ? optionalUser.id : null]
+      ['Pending Paysera', 'pending@neo.com', 'Pending', serverTotal, 'pending', 'Paysera', optionalUser ? optionalUser.id : null]
     );
     const orderId = orderResult.rows[0].id;
 
-    for (const item of items) {
+    for (const item of secureItems) {
       await pool.query(
         "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)",
-        [orderId, item.id, item.quantity, Number(item.price) || 0, item.vid || null]
+        [orderId, item.id, item.quantity, item.price, item.vid]
       );
     }
 
     const data = {
       projectid: process.env.PAYSERA_PROJECT_ID,
       orderid: orderId,
-      amount: Math.round(totalAmount * 100),
+      amount: Math.round(serverTotal * 100), // ✅ المبلغ الحقيقي وليس المصرح به من المتصفح
       currency: 'USD',
       accepturl: `${process.env.FRONTEND_URL}/success?method=paysera`,
       cancelurl: `${process.env.FRONTEND_URL}/cart`,
@@ -295,22 +304,26 @@ router.get('/paysera/callback', async (req, res) => {
 
 // ==========================================
 // 3. Crypto (NowPayments)
+// ✅ price_amount يُحسب من قاعدة البيانات فقط (serverTotal)
 // ==========================================
 router.post('/crypto', async (req, res) => {
   try {
-    const { items, totalAmount } = req.body;
-    const optionalUser = getOptionalUser(req); 
+    const { items: clientItems } = req.body; // ✨ لا نأخذ totalAmount من المتصفح
+    const optionalUser = getOptionalUser(req);
+
+    // ✨ إعادة حساب الأسعار والإجمالي من قاعدة البيانات
+    const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
     const orderResult = await pool.query(
       "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
-      ['Pending Crypto', 'pending@neo.com', 'Pending', totalAmount, 'pending', 'Crypto', optionalUser ? optionalUser.id : null]
+      ['Pending Crypto', 'pending@neo.com', 'Pending', serverTotal, 'pending', 'Crypto', optionalUser ? optionalUser.id : null]
     );
     const orderId = orderResult.rows[0].id;
 
-    for (const item of items) {
+    for (const item of secureItems) {
       await pool.query(
         "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)",
-        [orderId, item.id, item.quantity, Number(item.price) || 0, item.vid || null]
+        [orderId, item.id, item.quantity, item.price, item.vid]
       );
     }
 
@@ -319,7 +332,7 @@ router.post('/crypto', async (req, res) => {
     // للإنتاج الحقيقي استخدمي: 'https://api.nowpayments.io/v1/invoice'
     
     const response = await axios.post(apiUrl, {
-      price_amount: totalAmount,
+      price_amount: serverTotal, // ✅ المبلغ الحقيقي وليس المصرح به من المتصفح
       price_currency: 'usd',
       order_id: orderId.toString(), 
       order_description: 'NEO Store Purchase',
@@ -343,6 +356,8 @@ router.post('/crypto', async (req, res) => {
 
 // ==========================================
 // 4. BaridiMob / CCP (Manual Upload)
+// ✅ نحسب الإجمالي الحقيقي من قاعدة البيانات لتخزين price_at_purchase الصحيح،
+//    ونقارنه بالمبلغ المصرح به لتنبيه الأدمن في حال وجود فرق مشبوه قبل الموافقة
 // ==========================================
 router.post('/manual', upload.single('receipt'), async (req, res) => {
   try {
@@ -354,6 +369,14 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
     
     const optionalUser = getOptionalUser(req); 
 
+    const parsedItems = JSON.parse(items);
+
+    // ✨ نحسب الإجمالي الحقيقي من قاعدة البيانات لمقارنته بالمبلغ المصرح به
+    const { secureItems, serverTotal } = await prepareSecureItems(pool, parsedItems);
+    // ملاحظة: totalAmount هنا بالدينار الجزائري بينما serverTotal بالدولار —
+    // إذا عندك سعر صرف ثابت مستعمل في الواجهة الأمامية، طبقيه هنا قبل المقارنة.
+    // حالياً نكتفي بتخزين الإجمالي الحقيقي بالدولار في order_items لضمان صحة السجلات.
+
     const orderResult = await pool.query(
       `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, payment_status, receipt_url, user_id) 
        VALUES ($1, $2, $3, $4, $5, 'pending', 'BaridiMob', 'Pending Review', $6, $7) RETURNING id`,
@@ -362,16 +385,15 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
 
     const orderId = orderResult.rows[0].id;
 
-    const parsedItems = JSON.parse(items);
-    for (const item of parsedItems) {
+    for (const item of secureItems) {
       await pool.query(
         "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)",
-        [orderId, item.id, item.quantity, Number(item.price) || 0, item.vid || null]
+        [orderId, item.id, item.quantity, item.price, item.vid] // ✅ السعر الحقيقي من قاعدة البيانات
       );
     }
 
     if (customerEmail && customerEmail !== 'manual@neo.com') {
-      const itemsForEmail = parsedItems.map(it => ({ title: it.name, image_url: it.image_url, quantity: it.quantity, price_at_purchase: it.price }));
+      const itemsForEmail = secureItems.map(it => ({ title: it.title, image_url: it.image_url, quantity: it.quantity, price_at_purchase: it.price }));
       await sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, itemsForEmail);
     }
 
@@ -382,7 +404,8 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
              <p>A new order has been placed and requires your verification.</p>
              <p><strong>Customer:</strong> ${customerName}</p>
              <p><strong>Phone:</strong> ${customerPhone}</p>
-             <p><strong>Total:</strong> ${totalAmount} DZD</p>
+             <p><strong>Declared total:</strong> ${totalAmount} DZD</p>
+             <p><strong>Calculated total (DB prices, USD):</strong> $${serverTotal}</p>
              <p><a href="${receiptUrl}" target="_blank" style="background-color: #FF6B9D; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">View Receipt Image</a></p>
              <p>Please log in to your admin panel to approve or reject this order.</p>`
     });

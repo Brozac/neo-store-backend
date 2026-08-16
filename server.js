@@ -11,6 +11,7 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 const { parseVariants, getCategorySlug, phoneAccRegex, pcBlacklistRegex } = require('./utils/parser');
+const { prepareSecureItems } = require('./utils/secureCheckout');
 const requireAdmin = require('./middleware/requireAdmin');
 const rateLimit = require('express-rate-limit');
 const { fulfillCJOrder, getCJToken, cjRequest, parseNumeric } = require('./services/cjService');
@@ -1090,23 +1091,29 @@ app.get('/api/products/:id', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+// ✨ مسار إنشاء جلسة الدفع (Stripe Checkout Session)
+// ✅ الأسعار الآن تُحسب من قاعدة البيانات فقط عبر prepareSecureItems،
+//    ولا يتم الوثوق بأي سعر قادم من المتصفح (منع التلاعب بالأسعار).
 app.post('/api/create-checkout-session', async (req, res) => {
   try {
-    const { items, origin, couponCode } = req.body;
+    const { items: clientItems, origin, couponCode } = req.body;
     let baseUrl = origin && origin.startsWith('http') ? origin : 'http://localhost:3000';
     baseUrl = baseUrl.replace(/\/+$/, '');
+
+    // ✨ إعادة حساب الأسعار من قاعدة البيانات (لا نثق أبداً في clientItems مباشرة)
+    const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
     // ✨ إذا الزبون logged-in، نربطو الطلب بالحساب متاعو (user_id) باش يبان فـ "My Orders"
     // حتى لو دخل إيميل مختلف فـ Stripe Checkout. الـ guest checkout يبقى يخدم عادي (user_id = null).
     const optionalUser = getOptionalUser(req);
     const orderResult = await pool.query(
       "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, user_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-      ['Pending Customer', 'pending@neo.com', 'Pending', 0, 'pending', optionalUser ? optionalUser.id : null]
+      ['Pending Customer', 'pending@neo.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null]
     );
     const orderId = orderResult.rows[0].id;
 
-    for (const item of items) {
-      await pool.query("INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)", [orderId, item.id, item.quantity, Number(item.price) || 0, item.vid || null]);
+    for (const item of secureItems) {
+      await pool.query("INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)", [orderId, item.id, item.quantity, item.price, item.vid]);
     }
 
     let stripeDiscounts = [];
@@ -1122,9 +1129,9 @@ app.post('/api/create-checkout-session', async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
-      line_items: items.map(item => {
+      line_items: secureItems.map(item => {
         const hasValidImage = item.image_url && typeof item.image_url === 'string' && item.image_url.startsWith('http');
-        return { price_data: { currency: 'usd', product_data: { name: item.title || 'Product', images: hasValidImage ? [item.image_url] : [] }, unit_amount: Math.round(Number(item.price || 0) * 100) }, quantity: Number(item.quantity || 1) };
+        return { price_data: { currency: 'usd', product_data: { name: item.title || 'Product', images: hasValidImage ? [item.image_url] : [] }, unit_amount: Math.round(item.price * 100) }, quantity: item.quantity };
       }),
       mode: 'payment',
       // ✨ السماح بالشحن لجميع دول العالم
