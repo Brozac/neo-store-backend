@@ -148,26 +148,30 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
 
     let orderSuccess = false;
     let lastError = null;
+    let needsSplitting = false; // ✨ علم لتقسيم الطلب
 
-await new Promise(r => setTimeout(r, 1500)); // ✨ تأخير 1.5 ثانية قبل كل محاولة شحن
+    const basePayload = {
+      shippingCustomerName: customerName || 'Customer',
+      shippingCountry: addr.country || 'US',
+      shippingCountryCode: addr.country || 'US',
+      shippingProvince: addr.state || addr.city || 'N/A',
+      shippingCity: addr.city || 'N/A',
+      shippingAddress: `${addr.line1 || 'N/A'}${addr.line1 && !/\d/.test(addr.line1) ? ' 1' : ''}`,
+      shippingAddress2: addr.line2 || '',
+      shippingZip: addr.postal_code || '00000',
+      shippingPhone: customerDetails?.phone || '0000000000',
+      fromCountryCode: 'CN',
+      orderFlow: 1,
+      payType: 2, 
+      isSandbox: isSandbox
+    };
 
+    // 1. محاولة إرسال الطلب كامل
     for (const logisticName of logisticsToTry) {
       const cjOrderPayload = {
+        ...basePayload,
         orderNumber: `STORE-${orderId}`,
-        shippingCustomerName: customerName || 'Customer',
-        shippingCountry: addr.country || 'US',
-        shippingCountryCode: addr.country || 'US',
-        shippingProvince: addr.state || addr.city || 'N/A',
-        shippingCity: addr.city || 'N/A',
-        shippingAddress: `${addr.line1 || 'N/A'}${addr.line1 && !/\d/.test(addr.line1) ? ' 1' : ''}`,
-        shippingAddress2: addr.line2 || '',
-        shippingZip: addr.postal_code || '00000',
-        shippingPhone: customerDetails?.phone || '0000000000',
-        fromCountryCode: 'CN',
         logisticName: logisticName,
-        orderFlow: 1,
-        payType: 2, 
-        isSandbox: isSandbox, 
         products: cjProducts
       };
 
@@ -187,15 +191,77 @@ await new Promise(r => setTimeout(r, 1500)); // ✨ تأخير 1.5 ثانية ق
           break;
         } else {
           lastError = cjResponse.data;
-          // ✨ إذا كان الخطأ هو تجاوز الحد (Rate Limit) أو طلب مكرر، توقف فوراً
+          
+          // ✨ التقاط خطأ "منتجات في مستودعات مختلفة"
+          if (lastError.code === 1603000 || lastError.message?.includes('100230')) {
+            console.log(`⚠️ Order #${orderId} has products in different warehouses. Will attempt to split...`);
+            needsSplitting = true;
+            break; // نخرج من حلقة الشحن لأن التقسيم هو الحل الوحيد
+          }
+
+          // إيقاف محاولات الشحن إذا تجاوزنا الحد
           if (lastError.code === 1600200 || lastError.code === 1605001) {
-            console.log(`⚠️ CJ blocked the request (Code: ${lastError.code}). Stopping shipping attempts to avoid ban.`);
+            console.log(`⚠️ CJ blocked the request (Code: ${lastError.code}). Stopping shipping attempts.`);
             break;
           }
         }
       } catch (err) {
         lastError = err.response?.data || err.message;
         if (lastError.code === 1600200) await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    // 2. ✨ منطق التقسيم الآلي (Split Order)
+    if (!orderSuccess && needsSplitting) {
+      console.log(`📦 Splitting Order #${orderId} into individual shipments...`);
+      let allSplitsSuccessful = true;
+      let splitIndex = 1;
+
+      for (const product of cjProducts) {
+        let splitSuccess = false;
+        // نجرب شركات الشحن لكل منتج على حدة
+        for (const logisticName of logisticsToTry) {
+          const splitPayload = {
+            ...basePayload,
+            orderNumber: `STORE-${orderId}-SPLIT-${splitIndex}`, // رقم طلب فريد للمنتج المفرد
+            logisticName: logisticName,
+            products: [product] // منتج واحد فقط
+          };
+
+          try {
+            await new Promise(r => setTimeout(r, 1500));
+            const splitResponse = await cjRequest((token) =>
+              axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrderV2',
+                splitPayload,
+                { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+              )
+            );
+
+            if (splitResponse.data.code === 200) {
+              console.log(`✅ Split item ${splitIndex} (VID: ${product.vid}) shipped successfully using ${logisticName}!`);
+              splitSuccess = true;
+              break; // نجح، اخرجي لتجربة المنتج التالي
+            } else {
+              // إذا فشل المنتج المفرد أيضاً، سجلي الخطأ
+              console.log(`Failed to split item ${splitIndex} with ${logisticName}: ${splitResponse.data.message}`);
+            }
+          } catch (err) {
+            console.log(`Error splitting item ${splitIndex}:`, err.response?.data?.message || err.message);
+          }
+        }
+
+        if (!splitSuccess) {
+          allSplitsSuccessful = false;
+        }
+        splitIndex++;
+      }
+
+      if (allSplitsSuccessful) {
+        console.log(`🚀 Order #${orderId} successfully Auto-Split and Sent to CJ!`);
+        await pool.query("UPDATE orders SET status = 'fulfilled' WHERE id = $1", [orderId]);
+        orderSuccess = true;
+      } else {
+        console.error(`❌ Some items in Order #${orderId} could not be split and shipped.`);
       }
     }
 

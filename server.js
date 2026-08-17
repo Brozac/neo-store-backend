@@ -1431,6 +1431,50 @@ cron.schedule('0 4 * * *', async () => {
   }
 });
 
+// 3. دمج الطلبات تلقائياً على CJ (كل ساعة)
+cron.schedule('0 * * * *', async () => {
+  console.log('⏳ [Auto-Cron] Checking for mergeable CJ orders...');
+  try {
+    // 1. طلب قائمة الطلبات القابلة للدمج من CJ
+    const matchRes = await cjRequest((token) => 
+      axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/autoMatchMergeOrderListV3', 
+        { filterOrder: true, orderStatus: 100 }, 
+        { headers: { 'CJ-Access-Token': token } }
+      )
+    );
+    
+    // 2. إذا CJ وراتها طلبات قابلة للدمج
+    if (matchRes.data.code === 200 && matchRes.data.data?.result?.length > 0) {
+      const groups = matchRes.data.data.result;
+      console.log(`🔄 Found ${groups.length} mergeable group(s). Starting auto-merge...`);
+      
+      // 3. ندور على كل مجموعة ونحاول ندمجوها
+      for (const group of groups) {
+        try {
+          await new Promise(r => setTimeout(r, 1500)); // احترام Rate Limit
+          const submitRes = await cjRequest((token) => 
+            axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/submitMergeOrderBatchV3', 
+              group.mergeShopOrderVOList, 
+              { headers: { 'CJ-Access-Token': token } }
+            )
+          );
+          
+          if (submitRes.data.code === 200) {
+            console.log('✅ Successfully auto-merged a group of orders on CJ!');
+          } else {
+            console.log(`⚠️ Failed to auto-merge group: ${submitRes.data.message}`);
+          }
+        } catch (mergeErr) {
+          console.error('Error merging specific group:', mergeErr.message);
+        }
+      }
+    } else {
+      console.log('✅ [Auto-Cron] No mergeable orders found this hour.');
+    }
+  } catch (err) {
+    console.error('❌ [Auto-Cron] Merge check error:', err.message);
+  }
+});
 // ==========================================
 // 11. تشغيل السيرفر
 // ==========================================
