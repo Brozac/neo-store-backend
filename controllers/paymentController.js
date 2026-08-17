@@ -53,7 +53,7 @@ const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','
 async function sendEmail({ to, subject, html }) {
   try {
     await axios.post('https://api.brevo.com/v3/smtp/email', {
-      sender: { name: 'NEO Store Support', email: process.env.BREVO_USER },
+      sender: { name: 'Laclarc Support', email: process.env.BREVO_USER },
       to: [{ email: to }],
       subject,
       htmlContent: html
@@ -68,7 +68,7 @@ async function sendEmail({ to, subject, html }) {
 
   try {
     await axios.post('https://api.resend.com/emails', {
-      from: process.env.RESEND_FROM_EMAIL || 'NEO Store <onboarding@resend.dev>',
+      from: process.env.RESEND_FROM_EMAIL || 'Laclarc <onboarding@resend.dev>',
       to: [to],
       subject,
       html
@@ -98,12 +98,12 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
     const htmlContent = `
       <div style="font-family: 'Arial', sans-serif; max-width: 600px; margin: 0 auto; background-color: #f4f3f8; border-radius: 15px; overflow: hidden; border: 1px solid #ddd;">
         <div style="background: linear-gradient(135deg, #1D1E3C 0%, #8B78C6 100%); padding: 30px; text-align: center;">
-          <h1 style="color: #fff; margin: 0; font-size: 28px; letter-spacing: 1px;">NEO STORE</h1>
+          <h1 style="color: #fff; margin: 0; font-size: 28px; letter-spacing: 1px;">LACLARC</h1>
         </div>
         <div style="padding: 30px;">
           <h2 style="color: #1D1E3C; margin-top: 0;">Order Confirmed Successfully! 🎉</h2>
           <p style="color: #555; font-size: 16px; line-height: 1.6;">
-            Thank you for your purchase from NEO Store. Your order <strong style="color: #8B78C6;">#${orderId}</strong> is currently being processed and will be shipped soon.
+            Thank you for your purchase from LACLARC. Your order <strong style="color: #8B78C6;">#${orderId}</strong> is currently being processed and will be shipped soon.
           </p>
           <table style="width: 100%; border-collapse: collapse; margin: 25px 0;">
             <thead>
@@ -131,13 +131,13 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
           </div>
         </div>
         <div style="background-color: #1D1E3C; padding: 20px; text-align: center; color: #888; font-size: 12px;">
-          &copy; ${new Date().getFullYear()} NEO Store. All rights reserved.<br>
+          &copy; ${new Date().getFullYear()} Laclarc. All rights reserved.<br>
           This is an automated message, please do not reply.
         </div>
       </div>
     `;
 
-    await sendEmail({ to: email, subject: `Order Confirmation #${orderId} - NEO Store`, html: htmlContent });
+    await sendEmail({ to: email, subject: `Order Confirmation #${orderId} - Laclarc`, html: htmlContent });
     console.log(`📧 Professional confirmation email sent to ${email}`);
   } catch (err) {
     logger.logError('Send Order Email', err);
@@ -198,7 +198,7 @@ router.post('/stripe', async (req, res) => {
       },
       phone_number_collection: { enabled: true },
       // ==========================================
-      success_url: `${process.env.FRONTEND_URL}/success?method=stripe`,
+      success_url: `${process.env.FRONTEND_URL}/success?method=stripe&amount=${serverTotal}`,
       cancel_url: `${process.env.FRONTEND_URL}/cart`,
       metadata: { orderId: orderId.toString() },
     });
@@ -335,7 +335,7 @@ router.post('/crypto', async (req, res) => {
       price_amount: serverTotal, // ✅ المبلغ الحقيقي وليس المصرح به من المتصفح
       price_currency: 'usd',
       order_id: orderId.toString(), 
-      order_description: 'NEO Store Purchase',
+      order_description: 'Laclarc Purchase',
       ipn_callback_url: `${process.env.BACKEND_URL}/api/payment/crypto/callback`,
       success_url: `${process.env.FRONTEND_URL}/success?method=crypto`,
       cancel_url: `${process.env.FRONTEND_URL}/cart`,

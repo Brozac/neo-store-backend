@@ -200,7 +200,7 @@ async function sendEmail({ to, subject, html }) {
   // 1) نجربو Brevo أولا (الحل الأساسي)
   try {
     await axios.post('https://api.brevo.com/v3/smtp/email', {
-      sender: { name: 'NEO Store Support', email: process.env.BREVO_USER },
+      sender: { name: 'Laclarc Support', email: process.env.BREVO_USER },
       to: [{ email: to }],
       subject,
       htmlContent: html
@@ -220,7 +220,7 @@ async function sendEmail({ to, subject, html }) {
   // 2) إذا فشل Brevo، نجربو Resend كـ fallback تلقائي
   try {
     await axios.post('https://api.resend.com/emails', {
-      from: process.env.RESEND_FROM_EMAIL || 'NEO Store <onboarding@resend.dev>',
+      from: process.env.RESEND_FROM_EMAIL || 'Laclarc <onboarding@resend.dev>',
       to: [to],
       subject,
       html
@@ -481,7 +481,7 @@ app.post('/api/admin/add-product', async (req, res) => {
     await pool.query(
       `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-      [title, sellPrice, oldPrice, image_url, imagesArray, JSON.stringify([]), colorsArray, sizesArray, true, cjProductId, description || 'High quality product from NEO Store.', material || 'Premium Quality', category || 'other']
+      [title, sellPrice, oldPrice, image_url, imagesArray, JSON.stringify([]), colorsArray, sizesArray, true, cjProductId, description || 'High quality product from Laclarc.', material || 'Premium Quality', category || 'other']
     );
 
     res.status(201).json({ message: 'Product added successfully with Auto-Pricing!', calculatedPrice: sellPrice, originalPrice: oldPrice });
@@ -793,8 +793,8 @@ app.post('/api/register', authLimiter, async (req, res) => {
         // ✨ إرسال الإيميل في الخلفية (بدون await) لكي لا يعلق المستخدم في Loading
         sendEmail({
           to: email,
-          subject: 'Confirm your Email for NEO Store',
-          html: `<h2>Welcome to NEO Store, ${name}!</h2>
+          subject: 'Confirm your Email for Laclarc',
+          html: `<h2>Welcome to Laclarc, ${name}!</h2>
                  <p>Please click the button below to activate your account:</p>
                  <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
         });
@@ -1258,12 +1258,12 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
     const htmlContent = `
       <div style="font-family: 'Arial', sans-serif; max-width: 600px; margin: 0 auto; background-color: #f4f3f8; border-radius: 15px; overflow: hidden; border: 1px solid #ddd;">
         <div style="background: linear-gradient(135deg, #1D1E3C 0%, #8B78C6 100%); padding: 30px; text-align: center;">
-          <h1 style="color: #fff; margin: 0; font-size: 28px; letter-spacing: 1px;">NEO STORE</h1>
+          <h1 style="color: #fff; margin: 0; font-size: 28px; letter-spacing: 1px;">Laclarc</h1>
         </div>
         <div style="padding: 30px;">
           <h2 style="color: #1D1E3C; margin-top: 0;">Order Confirmed Successfully! 🎉</h2>
           <p style="color: #555; font-size: 16px; line-height: 1.6;">
-            Thank you for your purchase from NEO Store. Your order <strong style="color: #8B78C6;">#${orderId}</strong> is currently being processed and will be shipped soon.
+            Thank you for your purchase from Laclarc. Your order <strong style="color: #8B78C6;">#${orderId}</strong> is currently being processed and will be shipped soon.
           </p>
           <table style="width: 100%; border-collapse: collapse; margin: 25px 0;">
             <thead>
@@ -1293,7 +1293,7 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
           </div>
         </div>
         <div style="background-color: #1D1E3C; padding: 20px; text-align: center; color: #888; font-size: 12px;">
-          &copy; ${new Date().getFullYear()} NEO Store. All rights reserved.<br>
+          &copy; ${new Date().getFullYear()} Laclarc. All rights reserved.<br>
           This is an automated message, please do not reply.
         </div>
       </div>
@@ -1301,7 +1301,7 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
 
     await sendEmail({
       to: email,
-      subject: `Order Confirmation #${orderId} - NEO Store`,
+      subject: `Order Confirmation #${orderId} - Laclarc`,
       html: htmlContent
     });
     console.log(`📧 Professional confirmation email sent to ${email}`);
