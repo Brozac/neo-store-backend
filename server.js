@@ -1091,6 +1091,54 @@ app.get('/api/products/:id', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+// ✨ مسار جديد لجلب 4 منتجات مشابهة فقط (يحل مشكلة الأداء)
+app.get('/api/products/:id/related', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const productRes = await pool.query('SELECT category FROM products WHERE id = $1', [id]);
+    if (productRes.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
+    
+    const category = productRes.rows[0].category;
+    const baseCategory = category ? category.split('-')[0] : '';
+    
+    // 1. ابحث عن منتجات نفس الفئة
+    let relatedRes = await pool.query(
+      `SELECT id, title, price, image_url, category FROM products 
+       WHERE id != $1 AND category = $2 AND stock_status = true 
+       ORDER BY id DESC LIMIT 4`, [id, category]
+    );
+    
+    // 2. إذا لم يكفِ، ابحث عن منتجات نفس الفئة الأساسية
+    if (relatedRes.rows.length < 4 && baseCategory) {
+      const existingIds = relatedRes.rows.map(r => r.id);
+      existingIds.push(parseInt(id));
+      const moreRes = await pool.query(
+        `SELECT id, title, price, image_url, category FROM products 
+         WHERE id != ALL($1::int[]) AND category ILIKE $2 AND stock_status = true 
+         ORDER BY id DESC LIMIT $3`, [existingIds, `${baseCategory}%`, 4 - relatedRes.rows.length]
+      );
+      relatedRes.rows = [...relatedRes.rows, ...moreRes.rows];
+    }
+    
+    // 3. إذا لم يكفِ، اكمل بمنتجات عشوائية
+    if (relatedRes.rows.length < 4) {
+      const existingIds = relatedRes.rows.map(r => r.id);
+      existingIds.push(parseInt(id));
+      const randomRes = await pool.query(
+        `SELECT id, title, price, image_url, category FROM products 
+         WHERE id != ALL($1::int[]) AND stock_status = true 
+         ORDER BY random() LIMIT $2`, [existingIds, 4 - relatedRes.rows.length]
+      );
+      relatedRes.rows = [...relatedRes.rows, ...randomRes.rows];
+    }
+
+    res.json(relatedRes.rows);
+  } catch (err) {
+    console.error('❌ Error fetching related products:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // ✨ مسار إنشاء جلسة الدفع (Stripe Checkout Session)
 // ✅ الأسعار الآن تُحسب من قاعدة البيانات فقط عبر prepareSecureItems،
 //    ولا يتم الوثوق بأي سعر قادم من المتصفح (منع التلاعب بالأسعار).
@@ -1154,9 +1202,27 @@ app.post('/api/create-checkout-session', async (req, res) => {
   }
 });
 
+// ✨ إصلاح ثغرة IDOR: التحقق من ملكية الطلب قبل إرجاع المنتجات
 app.get('/api/orders/:id/items', async (req, res) => {
   try {
     const { id } = req.params;
+    const { email } = req.query;
+    const optionalUser = getOptionalUser(req); // التحقق إذا كان مسجل الدخول
+
+    // 1. جلب الطلب أولاً لمعرفة صاحبه
+    const orderRes = await pool.query('SELECT customer_email, user_id FROM orders WHERE id = $1', [id]);
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+
+    const order = orderRes.rows[0];
+
+    // 2. التحقق من الصلاحية: هل هو مالك الطلب (عبر التوكن) أو يعرف الإيميل الصحيح؟
+    const isOwner = (optionalUser && order.user_id === optionalUser.id) || (email && order.customer_email === email);
+
+    if (!isOwner) {
+      return res.status(403).json({ error: 'Unauthorized: You do not have permission to view these items.' });
+    }
+
+    // 3. إذا اجتاز الفحص، نرجع له المنتجات
     const result = await pool.query(`SELECT oi.quantity, oi.price_at_purchase, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [id]);
     res.json(result.rows);
   } catch (err) {
@@ -1181,10 +1247,30 @@ app.get('/api/orders/my-orders', authenticateToken, async (req, res) => {
   }
 });
 
+// ✨ إصلاح ثغرة IDOR: إلزام الزبون بإدخال الإيميل المطابق للطلب
 app.get('/api/orders/track/:identifier', async (req, res) => {
   try {
     const { identifier } = req.params;
-    const result = await pool.query(`SELECT * FROM orders WHERE id::text = $1 OR customer_email = $2 ORDER BY id DESC`, [identifier, identifier]);
+    const { email } = req.query; // ✨ نأخذ الإيميل من الـ Query Parameters
+
+    // إذا أدخل رقم الطلب، يجب أن يرفق الإيميل. أما إذا أدخل الإيميل وحده، نبحث به.
+    let queryStr = '';
+    let params = [];
+
+    if (email) {
+      // البحث برقم الطلب + الإيميل (أو بالإيميل وحسه إذا كان الـ identifier هو الإيميل نفسه)
+      queryStr = `SELECT * FROM orders WHERE (id::text = $1 OR customer_email = $2) AND customer_email = $2 ORDER BY id DESC`;
+      params = [identifier, email];
+    } else if (identifier.includes('@')) {
+      // إذا أدخل الإيميل في حقل الـ ID ولم يرفق باراميتر إيميل، نبحث بالإيميل
+      queryStr = `SELECT * FROM orders WHERE customer_email = $1 ORDER BY id DESC`;
+      params = [identifier];
+    } else {
+      // إذا أدخل رقم طلب ولم يرفق الإيميل -> نرفض الطلب لأسباب أمنية
+      return res.status(400).json({ error: 'Email is required to track an order by ID.' });
+    }
+
+    const result = await pool.query(queryStr, params);
     if (result.rows.length === 0) return res.status(404).json({ error: 'No orders found' });
     res.json(result.rows);
   } catch (err) {
