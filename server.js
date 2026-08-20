@@ -1456,7 +1456,7 @@ app.post('/api/admin/sourcing/create', async (req, res) => {
 });
 
 // ==========================================
-// 🤖 الأتمتة اليومية (Cron Jobs)
+// 🤖 الأتمتة اليومية والأسبوعية (Cron Jobs)
 // ==========================================
 const cron = require('node-cron');
 
@@ -1464,7 +1464,6 @@ const cron = require('node-cron');
 cron.schedule('0 3 * * *', async () => {
   console.log('⏳ [Auto-Cron] Starting daily product stock/price update...');
   try {
-    // جلب 100 منتج عشوائي من قاعدة البيانات
     const { rows } = await pool.query("SELECT id, cj_product_id FROM products WHERE cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%' ORDER BY random() LIMIT 100");
     
     for (const p of rows) {
@@ -1482,7 +1481,6 @@ cron.schedule('0 3 * * *', async () => {
         if (sellingPrice < 9.99) sellingPrice = 9.99;
         const safePrice = parseFloat(sellingPrice.toFixed(2));
 
-        // تحديث السعر وحالة التوفر
         await pool.query("UPDATE products SET price = $1, stock_status = $2 WHERE id = $3", [safePrice, details.isGlobalShipping !== false, p.id]);
       } catch (e) {}
     }
@@ -1521,7 +1519,6 @@ cron.schedule('0 4 * * *', async () => {
 cron.schedule('0 * * * *', async () => {
   console.log('⏳ [Auto-Cron] Checking for mergeable CJ orders...');
   try {
-    // 1. طلب قائمة الطلبات القابلة للدمج من CJ
     const matchRes = await cjRequest((token) => 
       axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/autoMatchMergeOrderListV3', 
         { filterOrder: true, orderStatus: 100 }, 
@@ -1529,15 +1526,13 @@ cron.schedule('0 * * * *', async () => {
       )
     );
     
-    // 2. إذا CJ وراتها طلبات قابلة للدمج
     if (matchRes.data.code === 200 && matchRes.data.data?.result?.length > 0) {
       const groups = matchRes.data.data.result;
       console.log(`🔄 Found ${groups.length} mergeable group(s). Starting auto-merge...`);
       
-      // 3. ندور على كل مجموعة ونحاول ندمجوها
       for (const group of groups) {
         try {
-          await new Promise(r => setTimeout(r, 1500)); // احترام Rate Limit
+          await new Promise(r => setTimeout(r, 1500)); 
           const submitRes = await cjRequest((token) => 
             axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/submitMergeOrderBatchV3', 
               group.mergeShopOrderVOList, 
@@ -1559,6 +1554,41 @@ cron.schedule('0 * * * *', async () => {
     }
   } catch (err) {
     console.error('❌ [Auto-Cron] Merge check error:', err.message);
+  }
+});
+
+// 4. فحص وتنظيف المنتجات المحذوفة من CJ أسبوعياً (كل يوم أحد الساعة 1:00 صباحاً)
+cron.schedule('0 1 * * 0', async () => {
+  console.log('⏳ [Auto-Cron] Starting weekly cleanup of deleted/out-of-stock products...');
+  try {
+    const { rows } = await pool.query("SELECT id, cj_product_id FROM products WHERE cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%' AND stock_status = true");
+    
+    let hiddenCount = 0;
+    
+    for (const p of rows) {
+      try {
+        await new Promise(r => setTimeout(r, 1200)); 
+        const detailRes = await cjRequest((token, config) =>
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { 
+            ...config, 
+            headers: { 'CJ-Access-Token': token }, 
+            params: { pid: p.cj_product_id } 
+          })
+        );
+
+        const details = detailRes.data?.data;
+
+        // إذا لم يجد CJ المنتج، أو لم يعد متاحاً للشحن العالمي
+        if (!details || details.isGlobalShipping === false) {
+          await pool.query("UPDATE products SET stock_status = false WHERE id = $1", [p.id]);
+          hiddenCount++;
+        }
+      } catch (e) {} 
+    }
+    
+    console.log(`✅ [Auto-Cron] Weekly cleanup completed! Hidden ${hiddenCount} products.`);
+  } catch (err) {
+    console.error('❌ [Auto-Cron] Error during weekly cleanup:', err.message);
   }
 });
 // ==========================================
