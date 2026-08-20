@@ -1456,6 +1456,55 @@ app.post('/api/admin/sourcing/create', async (req, res) => {
 });
 
 // ==========================================
+// 📘 النشر التلقائي على فيسبوك (Auto-Post)
+// ==========================================
+const POST_TEMPLATES = [
+  (title, price, link) => `🔥 Trending Now! 🔥\nGet your hands on the ${title}. Premium quality at an unbeatable price: $${price}.\nShop here: ${link}\n\n#Laclarc #Shopping #Trending #Deals`,
+  (title, price, link) => `✨ Elevate your lifestyle with our ${title}! ✨\nLimited stock available. Grab yours for just $${price} today!\nOrder now: ${link}\n\n#LaclarcStore #Gadgets #Fashion #OnlineShopping`,
+  (title, price, link) => `🚀 Don't miss out on the ${title}! 🚀\nWhy pay more? Get it for $${price} with Worldwide Shipping.\nTap to buy: ${link}\n\n#TrendingProducts #Laclarc #ShopNow`,
+  (title, price, link) => `💜 Premium quality meets affordability. 💜\nIntroducing: ${title} for only $${price}.\nFast shipping, secure payments. Get yours: ${link}\n\n#Laclarc #Tech #HomeDecor #DailyDeals`,
+];
+
+async function postDailyProductToFacebook() {
+  const PAGE_ACCESS_TOKEN = process.env.FB_PAGE_ACCESS_TOKEN;
+  const PAGE_ID = process.env.FB_PAGE_ID;
+  const FRONTEND_URL = process.env.FRONTEND_URL || 'https://neo-store-frontend-phip.vercel.app';
+
+  if (!PAGE_ACCESS_TOKEN || !PAGE_ID) {
+    console.warn('⚠️ [Auto-Post] Skipped: FB_PAGE_ACCESS_TOKEN or FB_PAGE_ID is missing.');
+    return;
+  }
+
+  console.log('⏳ [Auto-Cron] Fetching a random product for Facebook post...');
+  
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, title, price, image_url FROM products WHERE stock_status = true AND image_url IS NOT NULL ORDER BY random() LIMIT 1"
+    );
+
+    if (rows.length === 0) return;
+
+    const product = rows[0];
+    const productLink = `${FRONTEND_URL}/products/${product.id}`;
+    const randomTemplate = POST_TEMPLATES[Math.floor(Math.random() * POST_TEMPLATES.length)];
+    const caption = randomTemplate(product.title, product.price, productLink);
+
+    const fbApiUrl = `https://graph.facebook.com/v18.0/${PAGE_ID}/photos`;
+    const response = await axios.post(fbApiUrl, {
+      url: product.image_url,
+      caption: caption,
+      access_token: PAGE_ACCESS_TOKEN
+    });
+
+    if (response.data.id) {
+      console.log(`✅ [Auto-Cron] Successfully posted to Facebook! Product: ${product.title}`);
+    }
+  } catch (err) {
+    console.error('❌ [Auto-Cron] Error posting to Facebook:', err.response?.data?.error || err.message);
+  }
+}
+
+// ==========================================
 // 🤖 الأتمتة اليومية والأسبوعية (Cron Jobs)
 // ==========================================
 const cron = require('node-cron');
@@ -1590,6 +1639,11 @@ cron.schedule('0 1 * * 0', async () => {
   } catch (err) {
     console.error('❌ [Auto-Cron] Error during weekly cleanup:', err.message);
   }
+});
+
+// 5. نشر منتج يومياً على فيسبوك (الساعة 11:00 صباحاً و 18:00 مساءً)
+cron.schedule('0 11,18 * * *', async () => {
+  await postDailyProductToFacebook();
 });
 // ==========================================
 // 11. تشغيل السيرفر
