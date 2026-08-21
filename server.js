@@ -283,10 +283,11 @@ app.post('/api/admin/login', authLimiter, async (req, res) => {
   if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
     const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '2h' });
     
+    // ✨ تعديل إعدادات الكوكيز للسماح بالاتصال عبر النطاقات المختلفة (Vercel -> Render)
     res.cookie('admin_token', token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      secure: process.env.NODE_ENV === 'production', // يجب أن يكون true في الإنتاج (HTTPS)
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // ✨ السماح للنطاقات المشتركة
       maxAge: 2 * 60 * 60 * 1000
     });
 
@@ -296,7 +297,12 @@ app.post('/api/admin/login', authLimiter, async (req, res) => {
 });
 
 app.post('/api/admin/logout', (req, res) => {
-  res.clearCookie('admin_token');
+  // يجب أيضاً تطبيق sameSite: 'none' عند مسح الكوكيز ليتطابق مع إعداد إنشائه
+  res.clearCookie('admin_token', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
+  });
   res.json({ message: 'Logged out successfully' });
 });
 
