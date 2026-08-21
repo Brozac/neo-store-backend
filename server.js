@@ -2,7 +2,6 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const axios = require('axios');
 const bcrypt = require('bcrypt');
@@ -24,26 +23,27 @@ const fs = require('fs');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
+// ✨ Pool واحد مشترك (شوف db.js) بدل ما كل ملف يدير new Pool() ديالو —
+// كان يقدر يوصل لـ 50 اتصال فنفس الوقت لنفس الداتابيز (20+10+20)
+const pool = require('./db');
 
 const app = express();
 const cookieParser = require('cookie-parser');
 app.set('trust proxy', 1); // ✨ ضروري لعمل express-rate-limit على Render
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
 app.use(cookieParser());
+
+// ✨ Rate limiters — عرّفناهم هنا فوق (بدل فوسط الملف) باش يكونو متوفرين
+// لكل المسارات، بما فيها /api/admin/login اللي كانت ناقصاها الحماية.
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5, message: { message: 'Too many attempts, please try again after 15 minutes.' } });
+const couponLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts, please try again later.' } });
+
 // ✨ مصفوفة رسمية تحتوي على جميع رموز دول العالم المعتمدة في Stripe للشحن
 const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
-// ==========================================
-// 1. الاتصال بقاعدة البيانات PostgreSQL
-// ==========================================
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  // ✨ إعدادات منع انقطاع الاتصال (مهمة جداً لـ Render/Neon)
-  max: 20, // أقصى عدد اتصالات في نفس اللحظة
-  idleTimeoutMillis: 30000, // إغلاق أي اتصال خامل بعد 30 ثانية
-  connectionTimeoutMillis: 5000 // مهلة الاتصال: إذا لم يتصل خلال 5 ثوانٍ، يرمي خطأ بدل أن يعلق السيرفر
-});
 
+// ==========================================
+// 1. الاتصال بقاعدة البيانات PostgreSQL (فحص أولي فقط — الـ pool نفسو جاي من db.js)
+// ==========================================
 pool.query('SELECT NOW()')
   .then(() => console.log('✅ Connected to PostgreSQL Database successfully!'))
   .catch((err) => console.error('❌ Database connection error:', err.stack));
@@ -141,8 +141,11 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
 });
 
 // ✅ 2. express.json
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// ✨ خفضنا الحد من 50mb لـ 2mb: ما كاين حتى مسار كيحتاج JSON body كبير (رفع الصور
+// كيمشي عبر multer/Cloudinary، ماشي عبر هاذ الـ parser)، وحد كبير بحال 50mb كيفتح
+// الباب لهجمات DoS بـ payloads ثقيلة على أي مسار عمومي.
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ limit: '2mb', extended: true }));
 
 // ✅ 3. راوتر الدفع المتعدد
 const paymentRoutes = require('./controllers/paymentController');
@@ -259,9 +262,11 @@ const upload = multer({ storage: storage });
 
 // ==========================================
 // فحص متغيرات البيئة الأساسية في الإنتاج
+// ✨ زدنا FRONTEND_URL ومتغيرات Cloudinary: كانوا ناقصين، وبلاهم CORS يبقى
+// يقبل غير localhost ورفع الصور يفشل بصمت بلا ما يوقف السيرفر.
 // ==========================================
 if (process.env.NODE_ENV === 'production') {
-  const requiredEnvVars = ['DATABASE_URL', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'JWT_SECRET', 'CJ_API_KEY', 'ADMIN_EMAIL', 'ADMIN_PASSWORD', 'BREVO_API_KEY', 'BREVO_USER', 'RESEND_API_KEY'];
+  const requiredEnvVars = ['DATABASE_URL', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'JWT_SECRET', 'CJ_API_KEY', 'ADMIN_EMAIL', 'ADMIN_PASSWORD', 'BREVO_API_KEY', 'BREVO_USER', 'RESEND_API_KEY', 'FRONTEND_URL', 'CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'];
   const missing = requiredEnvVars.filter((v) => !process.env[v]);
   if (missing.length > 0) {
     console.error(`❌ Missing required environment variables in production: ${missing.join(', ')}`);
@@ -271,8 +276,9 @@ if (process.env.NODE_ENV === 'production') {
 
 // ==========================================
 // مسار تسجيل دخول الأدمن
+// ✨ زدنا authLimiter: هذا كان المسار الوحيد الحساس بلا حماية من bruteforce
 // ==========================================
-app.post('/api/admin/login', async (req, res) => {
+app.post('/api/admin/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
     const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '2h' });
@@ -349,14 +355,20 @@ app.post('/api/admin/scrape-product', async (req, res) => {
 // ==========================================
 // مسارات الكوبونات (Coupons)
 // ==========================================
-app.post('/api/validate-coupon', async (req, res) => {
+app.post('/api/validate-coupon', couponLimiter, async (req, res) => {
   try {
     const { code, cartTotal } = req.body;
+    if (!code || typeof cartTotal !== 'number' || cartTotal < 0) {
+      return res.status(400).json({ error: 'Invalid coupon request' });
+    }
+
     const result = await pool.query('SELECT * FROM coupons WHERE code = $1 AND is_active = true', [code.toUpperCase()]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Invalid or expired coupon code.' });
 
     const coupon = result.rows[0];
     let discount = coupon.discount_type === 'percentage' ? (cartTotal * coupon.discount_value) / 100 : coupon.discount_value;
+    // ✨ الخصم ما يفوتش قيمة السلة، وإلا newTotal يقدر يولي رقم سالب
+    discount = Math.min(discount, cartTotal);
 
     res.json({
       discount: parseFloat(discount).toFixed(2),
@@ -597,165 +609,172 @@ app.get('/api/categories', async (req, res) => {
   }
 });
 
+// ✨ مسار الـ backfill دابا كيرد فوراً ويكمل الخدمة فالخلفية (شوف runCategoryBackfill
+// تحت) — قبل، كان الـ HTTP request كيبقى معلق مدة طويلة (طلب CJ + 1.2s لكل منتج)
+// وكان يقدر يعطي timeout من Render قبل ما يكمل.
 app.post('/api/admin/backfill-categories', async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, cj_product_id FROM products
-       WHERE cj_category_id IS NULL AND cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%'`
-    );
-
-    console.log(`⏳ Starting backfill for ${rows.length} products...`);
-
-    let updatedCount = 0;
-    const skipped = [];
-
-    for (const p of rows) {
-      try {
-        await new Promise((r) => setTimeout(r, 1200));
-
-        const detailRes = await cjRequest((token, config) =>
-          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { ...config, headers: { 'CJ-Access-Token': token }, params: { pid: p.cj_product_id } })
-        );
-
-        const details = detailRes.data?.data;
-        const cjCategoryId = details?.categoryId;
-        if (!cjCategoryId) { 
-          console.log(`⚠️ Skipped ${p.id} (No categoryId found)`);
-          skipped.push(p.id); 
-          continue; 
-        }
-
-        const resolved = await resolveCategoryByCjId(cjCategoryId);
-        const newCategory = resolved ? resolved.slugPath : getCategorySlug(`${details.categoryName || ''} ${details.productNameEn || ''}`);
-
-        await pool.query('UPDATE products SET cj_category_id = $1, category = $2 WHERE id = $3', [cjCategoryId, newCategory, p.id]);
-        console.log(`✅ Updated product ${p.id} -> ${newCategory}`);
-        updatedCount++;
-      } catch (itemErr) {
-        console.log(`⚠️ Skipped ${p.id} due to error:`, itemErr.message);
-        skipped.push(p.id);
-      }
-    }
-
-    productsCache = null;
-    console.log(`🎉 Backfill complete! Updated: ${updatedCount}, Skipped: ${skipped.length}`);
-    res.json({ message: `Backfilled ${updatedCount} product(s). ${skipped.length} skipped.`, updatedCount, skippedIds: skipped });
-  } catch (err) {
-    logger.logError('Backfill Categories', err);
-    res.status(500).json({ error: 'Server error', details: err.message });
-  }
+  res.json({ message: 'Backfill started in background. Check server logs for progress.' });
+  runCategoryBackfill().catch((err) => logger.logError('Backfill Categories (Background)', err));
 });
+
+async function runCategoryBackfill() {
+  const { rows } = await pool.query(
+    `SELECT id, cj_product_id FROM products
+     WHERE cj_category_id IS NULL AND cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%'`
+  );
+
+  console.log(`⏳ Starting backfill for ${rows.length} products...`);
+
+  let updatedCount = 0;
+  const skipped = [];
+
+  for (const p of rows) {
+    try {
+      await new Promise((r) => setTimeout(r, 1200));
+
+      const detailRes = await cjRequest((token, config) =>
+        axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { ...config, headers: { 'CJ-Access-Token': token }, params: { pid: p.cj_product_id } })
+      );
+
+      const details = detailRes.data?.data;
+      const cjCategoryId = details?.categoryId;
+      if (!cjCategoryId) {
+        console.log(`⚠️ Skipped ${p.id} (No categoryId found)`);
+        skipped.push(p.id);
+        continue;
+      }
+
+      const resolved = await resolveCategoryByCjId(cjCategoryId);
+      const newCategory = resolved ? resolved.slugPath : getCategorySlug(`${details.categoryName || ''} ${details.productNameEn || ''}`);
+
+      await pool.query('UPDATE products SET cj_category_id = $1, category = $2 WHERE id = $3', [cjCategoryId, newCategory, p.id]);
+      console.log(`✅ Updated product ${p.id} -> ${newCategory}`);
+      updatedCount++;
+    } catch (itemErr) {
+      console.log(`⚠️ Skipped ${p.id} due to error:`, itemErr.message);
+      skipped.push(p.id);
+    }
+  }
+
+  productsCache = null;
+  console.log(`🎉 Backfill complete! Updated: ${updatedCount}, Skipped: ${skipped.length}`);
+}
 
 // ==========================================
 // 5. مسار مزامنة منتجات CJ
+// ✨ دابا كيرد فوراً ويخدم فالخلفية (شوف runCjProductSync تحت) — نفس السبب:
+// الحلقة تقدر تاخذ دقايق (5 صفحات × 20 منتج × ~1-2 ثانية لكل واحد).
 // ==========================================
 app.get('/api/sync-cj-products', requireAdmin, async (req, res) => {
-  try {
-    const keyword = req.query.keyword || '';
-    const pagesToFetch = 5; 
-    const pageSize = 20;
-    let importedCount = 0;
+  const keyword = req.query.keyword || '';
+  res.json({ message: `Sync started in background for keyword: ${keyword || 'Trending'}. Check server logs for progress.` });
 
-    for (let pageNum = 1; pageNum <= pagesToFetch; pageNum++) {
-      console.log(`Fetching page ${pageNum} for keyword: ${keyword || 'Trending'}...`);
+  runCjProductSync(keyword).catch((err) => {
+    logger.logError('CJ Product Sync (Background)', err);
+  });
+});
 
-      const params = { pageNum, pageSize };
-      if (keyword) params.productNameEn = keyword;
-      else params.searchType = 2;
+async function runCjProductSync(keyword) {
+  const pagesToFetch = 5;
+  const pageSize = 20;
+  let importedCount = 0;
 
-      const listRes = await cjRequest((token, config) =>
-        axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list', { ...config, headers: { 'CJ-Access-Token': token }, params })
-      );
+  for (let pageNum = 1; pageNum <= pagesToFetch; pageNum++) {
+    console.log(`Fetching page ${pageNum} for keyword: ${keyword || 'Trending'}...`);
 
-      const cjProducts = listRes.data?.data?.list || [];
-      if (cjProducts.length === 0) break;
+    const params = { pageNum, pageSize };
+    if (keyword) params.productNameEn = keyword;
+    else params.searchType = 2;
 
-      for (const cjItem of cjProducts) {
-        await new Promise(r => setTimeout(r, 1000));
-        const productId = cjItem.pid ? String(cjItem.pid) : null;
-        if (!productId) continue;
+    const listRes = await cjRequest((token, config) =>
+      axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list', { ...config, headers: { 'CJ-Access-Token': token }, params })
+    );
+
+    const cjProducts = listRes.data?.data?.list || [];
+    if (cjProducts.length === 0) break;
+
+    for (const cjItem of cjProducts) {
+      await new Promise(r => setTimeout(r, 1000));
+      const productId = cjItem.pid ? String(cjItem.pid) : null;
+      if (!productId) continue;
+
+      try {
+        const detailRes = await cjRequest((token, config) =>
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { ...config, headers: { 'CJ-Access-Token': token }, params: { pid: productId } })
+        );
+
+        const details = detailRes.data?.data;
+        if (!details) continue;
+
+        const hasTitle = details.productNameEn?.trim() !== '';
+        const hasMainImage = details.bigImage?.startsWith('http');
+        const hasImages = details.productImageSet?.length >= 1;
+        const strippedDescription = details.description?.replace(/<[^>]*>?/gm, '').trim() || '';
+        const hasValidDescription = strippedDescription.length > 10;
+        const hasPrice = parseNumeric(details.sellPrice) >= 1.00;
+        const hasVariants = details.variants?.length > 0;
+        const isWorldwideShipping = details.isGlobalShipping !== false;
+
+        const lowerTitle = (details.productNameEn || '').toLowerCase();
+        if (phoneAccRegex.test(lowerTitle)) continue;
+        if (pcBlacklistRegex.test(lowerTitle)) continue;
+
+        if (!hasTitle || !hasMainImage || !hasImages || !hasValidDescription || !hasPrice || !hasVariants || !isWorldwideShipping) continue;
+
+        const cjPrice = parseNumeric(details.sellPrice);
+        let sellingPrice = cjPrice <= 5 ? cjPrice * 3.5 : cjPrice <= 15 ? cjPrice * 2.8 : cjPrice <= 30 ? cjPrice * 2.2 : cjPrice * 1.8;
+        sellingPrice = Math.floor(sellingPrice) - 0.01;
+        if (sellingPrice < 9.99) sellingPrice = 9.99;
+        const safePrice = parseFloat(sellingPrice.toFixed(2));
+        const safeOriginalPrice = parseFloat((safePrice * 1.5).toFixed(2));
+
+        const cjCategoryId = details.categoryId || null;
+        let categorySlug;
+        if (cjCategoryId) {
+          const resolved = await resolveCategoryByCjId(cjCategoryId);
+          categorySlug = resolved ? resolved.slugPath : getCategorySlug(`${details.categoryName} ${details.productNameEn}`);
+        } else {
+          categorySlug = getCategorySlug(`${details.categoryName} ${details.productNameEn}`);
+        }
+
+        const parsedData = parseVariants(details.variants || []);
+        let material = 'Premium Quality';
+        if (details.materialNameEnSet?.length > 0) material = details.materialNameEnSet.filter(m => m && m !== "").join(', ');
+
+        let videoUrl = '';
+        try {
+          const videoRes = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/product/queryVideosByProductId', { productId: productId }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
+          if (videoRes.data.code === 200 && videoRes.data.data?.length > 0) videoUrl = videoRes.data.data[0].videoUrl;
+        } catch (e) {}
+
+        await pool.query(
+          `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+           ON CONFLICT (cj_product_id) DO UPDATE SET 
+             title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price, 
+             image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants, 
+             colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status, 
+             description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, 
+             video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id`,
+          [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, details.description, material, categorySlug, videoUrl, cjCategoryId]
+        );
 
         try {
-          const detailRes = await cjRequest((token, config) =>
-            axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { ...config, headers: { 'CJ-Access-Token': token }, params: { pid: productId } })
-          );
-
-          const details = detailRes.data?.data;
-          if (!details) continue;
-
-          const hasTitle = details.productNameEn?.trim() !== '';
-          const hasMainImage = details.bigImage?.startsWith('http');
-          const hasImages = details.productImageSet?.length >= 1;
-          const strippedDescription = details.description?.replace(/<[^>]*>?/gm, '').trim() || '';
-          const hasValidDescription = strippedDescription.length > 10;
-          const hasPrice = parseNumeric(details.sellPrice) >= 1.00;
-          const hasVariants = details.variants?.length > 0;
-          const isWorldwideShipping = details.isGlobalShipping !== false;
-
-          const lowerTitle = (details.productNameEn || '').toLowerCase();
-          if (phoneAccRegex.test(lowerTitle)) continue;
-          if (pcBlacklistRegex.test(lowerTitle)) continue;
-
-          if (!hasTitle || !hasMainImage || !hasImages || !hasValidDescription || !hasPrice || !hasVariants || !isWorldwideShipping) continue;
-
-          const cjPrice = parseNumeric(details.sellPrice);
-          let sellingPrice = cjPrice <= 5 ? cjPrice * 3.5 : cjPrice <= 15 ? cjPrice * 2.8 : cjPrice <= 30 ? cjPrice * 2.2 : cjPrice * 1.8;
-          sellingPrice = Math.floor(sellingPrice) - 0.01;
-          if (sellingPrice < 9.99) sellingPrice = 9.99;
-          const safePrice = parseFloat(sellingPrice.toFixed(2));
-          const safeOriginalPrice = parseFloat((safePrice * 1.5).toFixed(2));
-
-          const cjCategoryId = details.categoryId || null;
-          let categorySlug;
-          if (cjCategoryId) {
-            const resolved = await resolveCategoryByCjId(cjCategoryId);
-            categorySlug = resolved ? resolved.slugPath : getCategorySlug(`${details.categoryName} ${details.productNameEn}`);
-          } else {
-            categorySlug = getCategorySlug(`${details.categoryName} ${details.productNameEn}`);
-          }
-
-          const parsedData = parseVariants(details.variants || []);
-          let material = 'Premium Quality';
-          if (details.materialNameEnSet?.length > 0) material = details.materialNameEnSet.filter(m => m && m !== "").join(', ');
-
-          let videoUrl = '';
-          try {
-            const videoRes = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/product/queryVideosByProductId', { productId: productId }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
-            if (videoRes.data.code === 200 && videoRes.data.data?.length > 0) videoUrl = videoRes.data.data[0].videoUrl;
-          } catch (e) {}
-
-          await pool.query(
-            `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-             ON CONFLICT (cj_product_id) DO UPDATE SET 
-               title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price, 
-               image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants, 
-               colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status, 
-               description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, 
-               video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id`,
-            [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, details.description, material, categorySlug, videoUrl, cjCategoryId]
-          );
-
-          try {
-            await new Promise(r => setTimeout(r, 500));
-            await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/product/addToMyProduct', { productId: productId }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
-          } catch (addToMyErr) {
-            if (addToMyErr.response?.data?.code !== 1600000) console.log(`⚠️ Note: Could not add ${productId} to My Products.`);
-          }
-
-          importedCount++;
-        } catch (productErr) {
-          console.log(`⚠️ Skipped ${productId} due to error.`);
+          await new Promise(r => setTimeout(r, 500));
+          await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/product/addToMyProduct', { productId: productId }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
+        } catch (addToMyErr) {
+          if (addToMyErr.response?.data?.code !== 1600000) console.log(`⚠️ Note: Could not add ${productId} to My Products.`);
         }
+
+        importedCount++;
+      } catch (productErr) {
+        console.log(`⚠️ Skipped ${productId} due to error.`);
       }
     }
-
-    res.json({ message: `Sync complete! Imported ${importedCount} products for keyword: ${keyword || 'Trending'}.`, count: importedCount });
-  } catch (error) {
-    console.error('CJ Sync Error:', error.message);
-    res.status(500).json({ error: 'Failed to sync products', details: error.message });
   }
-});
+
+  console.log(`✅ [CJ Sync] Finished. Imported ${importedCount} products for keyword: ${keyword || 'Trending'}.`);
+}
 
 app.get('/api/track/:trackNumber', async (req, res) => {
   try {
@@ -767,8 +786,6 @@ app.get('/api/track/:trackNumber', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5, message: { message: 'Too many attempts, please try again after 15 minutes.' } });
 
 // ==========================================
 // 7. مسارات المصادقة (Authentication)
@@ -889,37 +906,49 @@ app.get('/api/admin/manual-orders', async (req, res) => {
   }
 });
 
+// ✨ الموافقة على الطلب دابا كترد فوراً وتكمل الإرسال لـ CJ فالخلفية.
+// قبل: fulfillCJOrder كانت متسناة (awaited) مباشرة داخل الـ route — ودالة هاذي
+// كتدير عدة محاولات شحن (حتى 8) مع تأخير 1.5 ثانية بين كل وحدة، وإذا صار
+// "split order" العدد يتضاعف (منتج × شركة شحن). هذا كان يقدر يخلي الـ request
+// يبقى معلق دقائق ويعطي timeout من Render.
 app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+
     await pool.query("UPDATE orders SET status = 'paid' WHERE id = $1", [id]);
 
-    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
-    const itemsRes = await pool.query('SELECT * FROM order_items WHERE order_id = $1', [id]);
-    
-    if (orderRes.rows.length > 0) {
-      const order = orderRes.rows[0];
-      const items = itemsRes.rows;
-      let parsedAddress = {};
-      try { parsedAddress = JSON.parse(order.shipping_address); } 
-      catch (e) { parsedAddress = { line1: order.shipping_address, country: 'DZ' }; }
+    res.json({ message: 'Order approved. Sending to CJ in background...' });
 
-      const customerDetails = { address: parsedAddress, phone: order.customer_phone };
-      await fulfillCJOrder(order.id, order.customer_name, customerDetails, items);
+    // ✨ معالجة CJ + إرسال إيميل التأكيد فالخلفية، بلا ما نخلي المستخدم الأدمن ينتظر
+    (async () => {
+      try {
+        const order = orderRes.rows[0];
+        const itemsRes = await pool.query('SELECT * FROM order_items WHERE order_id = $1', [id]);
+        const items = itemsRes.rows;
 
-      // ✨ نبعثو إيميل تأكيد للزبون هنا زادة (قبل، كان يتبعث غير كي الدفع
-      // يكون عبر Stripe؛ طلبات BaridiMob كانت توليو موافق عليها بلا ما يوصل
-      // أي إيميل للزبون)
-      if (order.customer_email) {
-        const emailItemsRes = await pool.query(
-          `SELECT oi.quantity, oi.price_at_purchase, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`,
-          [id]
-        );
-        await sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, emailItemsRes.rows);
+        let parsedAddress = {};
+        try { parsedAddress = JSON.parse(order.shipping_address); }
+        catch (e) { parsedAddress = { line1: order.shipping_address, country: 'DZ' }; }
+
+        const customerDetails = { address: parsedAddress, phone: order.customer_phone };
+        await fulfillCJOrder(order.id, order.customer_name, customerDetails, items);
+
+        // ✨ نبعثو إيميل تأكيد للزبون هنا زادة (قبل، كان يتبعث غير كي الدفع
+        // يكون عبر Stripe؛ طلبات BaridiMob كانت توليو موافق عليها بلا ما يوصل
+        // أي إيميل للزبون)
+        if (order.customer_email) {
+          const emailItemsRes = await pool.query(
+            `SELECT oi.quantity, oi.price_at_purchase, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`,
+            [id]
+          );
+          await sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, emailItemsRes.rows);
+        }
+      } catch (bgErr) {
+        logger.logError('Approve BaridiMob Order (Background)', bgErr);
       }
-    }
-
-    res.json({ message: 'Order approved and sent to CJ successfully!' });
+    })();
   } catch (err) {
     logger.logError('Approve BaridiMob Order', err);
     res.status(500).json({ error: 'Server error' });
@@ -1140,15 +1169,15 @@ app.get('/api/products/:id/related', async (req, res) => {
 });
 
 // ✨ مسار إنشاء جلسة الدفع (Stripe Checkout Session)
-// ✅ الأسعار الآن تُحسب من قاعدة البيانات فقط عبر prepareSecureItems،
-//    ولا يتم الوثوق بأي سعر قادم من المتصفح (منع التلاعب بالأسعار).
+// ✅ الأسعار والـ vid الآن تُحسب/تتحقق من قاعدة البيانات فقط عبر prepareSecureItems،
+//    ولا يتم الوثوق بأي سعر أو vid قادم من المتصفح (منع التلاعب بالأسعار والمنتجات).
 app.post('/api/create-checkout-session', async (req, res) => {
   try {
     const { items: clientItems, origin, couponCode } = req.body;
     let baseUrl = origin && origin.startsWith('http') ? origin : 'http://localhost:3000';
     baseUrl = baseUrl.replace(/\/+$/, '');
 
-    // ✨ إعادة حساب الأسعار من قاعدة البيانات (لا نثق أبداً في clientItems مباشرة)
+    // ✨ إعادة حساب الأسعار والـ vid من قاعدة البيانات (لا نثق أبداً في clientItems مباشرة)
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
     // ✨ إذا الزبون logged-in، نربطو الطلب بالحساب متاعو (user_id) باش يبان فـ "My Orders"
@@ -1429,14 +1458,17 @@ app.get('/api/admin/makeup/list', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.get('/api/addresses', async (req, res) => {
+// ✨ إصلاح ثغرة: هاذوك المسارين ماكانوش تحت /api/admin فـ الـ path، يعني ماكانوش
+// محميين بـ requireAdmin تلقائياً (الميدلوير مربوط غير بـ prefix /api/admin).
+// أي حد كان يقدر يشوف/يزيد عناوين المخزون الخاص بلا تسجيل دخول. زدنا requireAdmin يدوياً.
+app.get('/api/addresses', requireAdmin, async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/privateInventory/address/list', {}, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
   } catch (err) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/addresses/create', async (req, res) => {
+app.post('/api/addresses/create', requireAdmin, async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/privateInventory/address/create', req.body, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
@@ -1468,7 +1500,7 @@ const POST_TEMPLATES = [
 async function postDailyProductToFacebook() {
   const PAGE_ACCESS_TOKEN = process.env.FB_PAGE_ACCESS_TOKEN;
   const PAGE_ID = process.env.FB_PAGE_ID;
-  const FRONTEND_URL = process.env.FRONTEND_URL || 'https://neo-store-frontend-phip.vercel.app';
+  const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laclarc.com';
 
   if (!PAGE_ACCESS_TOKEN || !PAGE_ID) {
     console.warn('⚠️ [Auto-Post] Skipped: FB_PAGE_ACCESS_TOKEN or FB_PAGE_ID is missing.');
@@ -1503,7 +1535,6 @@ async function postDailyProductToFacebook() {
     console.error('❌ [Auto-Cron] Error posting to Facebook:', err.response?.data?.error || err.message);
   }
 }
-
 // ==========================================
 // 🤖 الأتمتة اليومية والأسبوعية (Cron Jobs)
 // ==========================================
@@ -1645,8 +1676,22 @@ cron.schedule('0 1 * * 0', async () => {
 cron.schedule('0 11,18 * * *', async () => {
   await postDailyProductToFacebook();
 });
+
 // ==========================================
-// 11. تشغيل السيرفر
+// 11. 404 + معالج أخطاء عام (لازم يكونو آخر شي قبل app.listen)
+// ==========================================
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+app.use((err, req, res, next) => {
+  logger.logError('Unhandled Error', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// ==========================================
+// 12. تشغيل السيرفر
 // ==========================================
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Server is running on http://localhost:${PORT}`));

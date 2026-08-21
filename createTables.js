@@ -1,8 +1,10 @@
 require('dotenv').config();
 const { Pool } = require('pg');
 
+// ✨ 1. إضافة ssl: { rejectUnauthorized: false } للاتصال الآمن بـ Render/Neon
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
 const createTables = async () => {
@@ -21,9 +23,9 @@ const createTables = async () => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    // ✨ إضافة فهارس لتسريع البحث في الشجرة
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_categories_cj_id ON categories(cj_category_id);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_categories_level_slug ON categories(level, slug);`);
     console.log('✅ Table "categories" ready with indexes.');
 
     // 2. جدول المنتجات
@@ -50,7 +52,6 @@ const createTables = async () => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    // ✨ فهارس لتسريع عرض المنتجات في الموقع
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_stock ON products(stock_status);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_cj_category ON products(cj_category_id);`);
@@ -71,26 +72,16 @@ const createTables = async () => {
         payment_status VARCHAR(50) DEFAULT 'pending',
         receipt_url TEXT,
         stripe_session_id VARCHAR(255) UNIQUE,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, /* ✨ إضافة user_id هنا */
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    console.log('✅ Table "orders" ready.');
+    // ✨ إضافة الفهرس لـ user_id لتسريع جلب طلبات الزبون
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);`);
+    console.log('✅ Table "orders" ready (with user_id).');
 
-    // 4. جدول عناصر الطلب
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS order_items (
-        id SERIAL PRIMARY KEY,
-        order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
-        product_id INTEGER REFERENCES products(id),
-        quantity INTEGER NOT NULL,
-        price_at_purchase DECIMAL(10, 2) NOT NULL,
-        vid VARCHAR(100)
-      );
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);`);
-    console.log('✅ Table "order_items" ready with indexes.');
-
-    // 5. جدول المستخدمين
+    // 4. جدول المستخدمين (لازم قبل orders حيت orders.user_id يشير ليها)
+    // ✨ نقلنا جدول المستخدمين ليكون قبل جدول الطلبات لتفادي أخطاء الـ Foreign Key
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -103,6 +94,20 @@ const createTables = async () => {
       );
     `);
     console.log('✅ Table "users" ready.');
+
+    // 5. جدول عناصر الطلب
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS order_items (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+        product_id INTEGER REFERENCES products(id),
+        quantity INTEGER NOT NULL,
+        price_at_purchase DECIMAL(10, 2) NOT NULL,
+        vid VARCHAR(100)
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);`);
+    console.log('✅ Table "order_items" ready with indexes.');
 
     // 6. جدول الكوبونات
     await pool.query(`
@@ -134,9 +139,11 @@ const createTables = async () => {
     console.log('✅ Table "reviews" ready with indexes.');
 
     console.log('🎉 Database setup (Divine Version) completed successfully!');
+    await pool.end();
     process.exit(0);
   } catch (err) {
     console.error('❌ Error creating tables:', err);
+    await pool.end();
     process.exit(1);
   }
 };

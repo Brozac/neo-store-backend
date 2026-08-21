@@ -1,12 +1,7 @@
 require('dotenv').config();
 const axios = require('axios');
-const { Pool } = require('pg');
-
-// إعداد قاعدة البيانات
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+// ✨ Pool مشترك بدل new Pool() محلي — يتفادى تكاثر الاتصالات (شوف db.js)
+const pool = require('../db');
 
 let cachedCjToken = null;
 let cachedCjTokenExpiry = null;
@@ -67,7 +62,7 @@ async function getCJToken(forceRefresh = false) {
 async function cjRequest(requestFn, retryCount = 0) {
   try {
     const token = await getCJToken();
-    const config = { timeout: 60000 }; 
+    const config = { timeout: 60000 };
     return await requestFn(token, config);
   } catch (err) {
     const status = err.response?.status;
@@ -107,6 +102,9 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
     const addr = customerDetails?.address || {};
     const isSandbox = process.env.CJ_SANDBOX_MODE === 'true' ? 1 : 0;
 
+    // ✨ ملاحظة: هاذ الدالة دابا كتُستعمل غير كـ fallback نادر — منذ إصلاح
+    // secureCheckout.js، الـ vid الصحيح كيتسجل ديما فـ order_items وقت الشراء
+    // (item.vid). هادي كتبقى فقط لطلبات قديمة قبل الإصلاح أو منتجات بلا vid مسجل.
     const getVidFromDB = async (productId) => {
       const res = await pool.query('SELECT variants FROM products WHERE id = $1', [productId]);
       if (res.rows.length > 0 && res.rows[0].variants) {
@@ -162,7 +160,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
       shippingPhone: customerDetails?.phone || '0000000000',
       fromCountryCode: 'CN',
       orderFlow: 1,
-      payType: 2, 
+      payType: 2,
       isSandbox: isSandbox
     };
 
@@ -191,7 +189,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
           break;
         } else {
           lastError = cjResponse.data;
-          
+
           // ✨ التقاط خطأ "منتجات في مستودعات مختلفة"
           if (lastError.code === 1603000 || lastError.message?.includes('100230')) {
             console.log(`⚠️ Order #${orderId} has products in different warehouses. Will attempt to split...`);

@@ -1,16 +1,8 @@
 require('dotenv').config();
 const axios = require('axios');
-const { Pool } = require('pg');
+// ✨ Pool مشترك بدل new Pool() محلي — يتفادى تكاثر الاتصالات (شوف db.js)
+const pool = require('../db');
 const { cjRequest } = require('./cjService');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  // ✨ إعدادات منع انقطاع الاتصال (مهمة جداً لـ Render/Neon)
-  max: 20, // أقصى عدد اتصالات في نفس اللحظة
-  idleTimeoutMillis: 30000, // إغلاق أي اتصال خامل بعد 30 ثانية
-  connectionTimeoutMillis: 5000 // مهلة الاتصال: إذا لم يتصل خلال 5 ثوانٍ، يرمي خطأ بدل أن يعلق السيرفر
-});
 
 // ==========================================
 // 🔤 slugify بسيط: "Computer & Office" -> "computer-and-office"
