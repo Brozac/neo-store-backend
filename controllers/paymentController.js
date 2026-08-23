@@ -203,6 +203,9 @@ router.post('/stripe', async (req, res) => {
       metadata: { orderId: orderId.toString() },
     });
 
+    // 🚨 حفظ Stripe Session ID لاستخدامه في الـ Cron Job لاحقاً
+    await pool.query("UPDATE orders SET stripe_session_id = $1 WHERE id = $2", [session.id, orderId]);
+
     res.json({ url: session.url });
   } catch (error) {
     console.error('Stripe Error:', error.message);
@@ -264,6 +267,12 @@ router.post('/paysera', async (req, res) => {
 });
 
 // ✨ Webhook الخاص بـ Paysera
+// ✨ دابا كنردو 'OK' لـ Paysera فوراً بعد التحقق من التوقيع والحالة، ونديرو
+// fulfillCJOrder فالخلفية بلا await — نفس النمط ديال Stripe webhook. السبب:
+// fulfillCJOrder تقدر تدير حتى 8 محاولات شحن (× 1.5 ثانية) وتتضاعف إذا صار
+// split order، وباقي webhooks عندهم غالباً timeout قصير (10-30 ثانية) على
+// الـ callback response — تأخير الرد كان يقدر يخلي Paysera تعتبر الـ callback
+// فشل وتعاود تبعثو (retry)، ممكن يؤدي لمعالجة الطلب مرتين.
 router.get('/paysera/callback', async (req, res) => {
   try {
     const { data, ss1 } = req.query;
@@ -279,20 +288,36 @@ router.get('/paysera/callback', async (req, res) => {
     const status = params.get('status');
 
     if (status === '1') {
-      const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
-      if (orderRes.rows.length > 0 && orderRes.rows[0].status === 'pending') {
-        
-        await pool.query("UPDATE orders SET status = 'paid' WHERE id = $1", [orderId]);
-        const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [orderId]);
-        const items = itemsRes.rows;
+      // 🚨 تحديث ذري لمنع الـ Race Condition
+      const updateRes = await pool.query(
+        "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING *", 
+        [orderId]
+      );
 
-        await fulfillCJOrder(orderId, orderRes.rows[0].customer_name, {
-          address: { line1: orderRes.rows[0].shipping_address, country: 'US' }
-        }, items);
+      if (updateRes.rows.length > 0) {
+        const order = updateRes.rows[0]; // أمسكنا الطلب، يمكننا المتابعة بأمان
 
-        if (orderRes.rows[0].customer_email) {
-          await sendOrderConfirmationEmail(orderRes.rows[0].customer_email, orderId, orderRes.rows[0].total_amount, items);
-        }
+        // ✨ الرد فوراً على Paysera بعد تسجيل الدفع كـ 'paid' — قبل معالجة CJ
+        res.send('OK');
+
+        // ✨ باقي المعالجة الثقيلة (CJ + الإيميل) فالخلفية
+        (async () => {
+          try {
+            const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [orderId]);
+            const items = itemsRes.rows;
+
+            await fulfillCJOrder(orderId, order.customer_name, {
+              address: { line1: order.shipping_address, country: 'US' }
+            }, items);
+
+            if (order.customer_email) {
+              await sendOrderConfirmationEmail(order.customer_email, orderId, order.total_amount, items);
+            }
+          } catch (bgErr) {
+            logger.logError('Paysera Fulfillment (Background)', bgErr);
+          }
+        })();
+        return;
       }
     }
     res.send('OK');
@@ -430,6 +455,9 @@ function sortObject(obj) {
 }
 
 // ✨ Webhook الخاص بـ Crypto
+// ✨ دابا كنردو 200 لـ NowPayments فوراً بعد التحقق من التوقيع وتسجيل 'paid'،
+// ونديرو fulfillCJOrder فالخلفية — نفس السبب بالضبط ديال Paysera فوق.
+// NowPayments IPN عندها retry policy إذا ماوصلهاش 200 فوقت معقول.
 router.post('/crypto/callback', async (req, res) => {
   try {
     const ipnSecret = process.env.NOWPAYMENTS_IPN_SECRET;
@@ -452,31 +480,46 @@ router.post('/crypto/callback', async (req, res) => {
       const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
       if (orderRes.rows.length === 0) return res.status(404).send('Order not found');
 
-      const order = orderRes.rows[0];
+      // 🚨 تحديث ذري لمنع الـ Race Condition
+      const updateRes = await pool.query(
+        "UPDATE orders SET status='paid', customer_email=$1 WHERE id=$2 AND status='pending' RETURNING *",
+        [paymentData.customer_email || orderRes.rows[0].customer_email, orderId]
+      );
 
-      if (order.status === 'pending') {
-        await pool.query(
-          "UPDATE orders SET status='paid', customer_email=$1 WHERE id=$2",
-          [paymentData.customer_email || order.customer_email, orderId]
-        );
+      if (updateRes.rows.length > 0) {
+        const updatedOrder = updateRes.rows[0];
 
-        const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [orderId]);
-        const items = itemsRes.rows;
+        // ✨ الرد فوراً على NowPayments بعد تسجيل الدفع
+        res.status(200).send('OK');
 
-        const customerDetails = {
-          address: { line1: order.shipping_address || 'N/A', city: order.customer_city || 'N/A', country: 'US', state: 'N/A', postal_code: '00000' },
-          phone: order.customer_phone || '0000000000'
-        };
+        // ✨ باقي المعالجة الثقيلة (CJ + الإيميل) فالخلفية
+        (async () => {
+          try {
+            const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [orderId]);
+            const items = itemsRes.rows;
 
-        await fulfillCJOrder(orderId, order.customer_name, customerDetails, items);
+            const customerDetails = {
+              address: { line1: updatedOrder.shipping_address || 'N/A', city: updatedOrder.customer_city || 'N/A', country: 'US', state: 'N/A', postal_code: '00000' },
+              phone: updatedOrder.customer_phone || '0000000000'
+            };
 
-        const finalEmail = paymentData.customer_email || order.customer_email;
-        if (finalEmail) {
-          await sendOrderConfirmationEmail(finalEmail, orderId, order.total_amount, items);
-        }
+            await fulfillCJOrder(orderId, updatedOrder.customer_name, customerDetails, items);
+
+            const finalEmail = paymentData.customer_email || updatedOrder.customer_email;
+            if (finalEmail) {
+              await sendOrderConfirmationEmail(finalEmail, orderId, updatedOrder.total_amount, items);
+            }
+          } catch (bgErr) {
+            logger.logError('Crypto Fulfillment (Background)', bgErr);
+          }
+        })();
+        return;
       }
+      // إذا لم يتم تحديث أي صف (RETURNING * رجع فارغ)، معناها أنه تمت معالجته مسبقاً
+      res.status(200).send('OK');
+    } else {
+      res.status(200).send('OK');
     }
-    res.status(200).send('OK');
   } catch (error) {
     console.error('NowPayments IPN Error:', error);
     res.status(500).send('Error');

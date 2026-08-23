@@ -92,51 +92,49 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
     const orderId = session.metadata?.orderId;
     if (!orderId) return;
 
-    try {
-      const existingOrder = await pool.query('SELECT status FROM orders WHERE id = $1', [orderId]);
-      if (existingOrder.rows.length === 0) {
-        logger.logError('Stripe Webhook', new Error(`Order #${orderId} not found`));
-        return;
+    (async () => {
+      try {
+        const customerName = session.customer_details?.name || 'Guest Customer';
+        const customerEmail = session.customer_details?.email || '';
+        const addr = session.customer_details?.address;
+        const shippingAddress = addr ? `${addr.line1 || ''}, ${addr.city || ''}, ${addr.country || ''}` : 'Online Store Purchase';
+        const totalAmount = session.amount_total / 100;
+
+        // 🚨 إصلاح ثغرة Race Condition (التحديث الذري)
+        // نعمل UPDATE مباشر بشرط أن الحالة هي 'pending'. 
+        // إذا رجع لنا RETURNING id، معناها أمسكنا الطلب. إذا ما رجع والو، معناها webhook آخر سبقنا.
+        const updateRes = await pool.query(
+          "UPDATE orders SET customer_name=$1, customer_email=$2, shipping_address=$3, total_amount=$4, status='paid' WHERE id=$5 AND status='pending' RETURNING id",
+          [customerName, customerEmail, shippingAddress, totalAmount, orderId]
+        );
+
+        if (updateRes.rows.length === 0) {
+          console.log(`⚠️ Order #${orderId} already processed or not pending. Skipping duplicate webhook.`);
+          return;
+        }
+
+        const itemsRes = await pool.query(`
+          SELECT oi.*, p.title, p.image_url 
+          FROM order_items oi 
+          LEFT JOIN products p ON oi.product_id = p.id 
+          WHERE oi.order_id = $1
+        `, [orderId]);
+        const items = itemsRes.rows;
+
+        console.log(`✅ Order #${orderId} saved in database! Background processing started.`);
+
+        // تنفيذ العمليات الثقيلة في الخلفية
+        fulfillCJOrder(orderId, customerName, session.customer_details, items)
+          .catch(err => logger.logError('CJ Fulfillment (Background)', err));
+
+        if (customerEmail) {
+          sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, items)
+            .catch(err => logger.logError('Send Email (Background)', err));
+        }
+      } catch (dbErr) {
+        logger.logError('Stripe Webhook DB Update', dbErr);
       }
-
-      // منع المعالجة المكررة إذا أعاد Stripe المحاولة
-      if (existingOrder.rows[0].status !== 'pending') {
-        console.log(`⚠️ Order #${orderId} already processed. Skipping duplicate webhook.`);
-        return;
-      }
-
-      const customerName = session.customer_details?.name || 'Guest Customer';
-      const customerEmail = session.customer_details?.email || '';
-      const addr = session.customer_details?.address;
-      const shippingAddress = addr ? `${addr.line1 || ''}, ${addr.city || ''}, ${addr.country || ''}` : 'Online Store Purchase';
-      const totalAmount = session.amount_total / 100;
-
-      await pool.query(
-        "UPDATE orders SET customer_name=$1, customer_email=$2, shipping_address=$3, total_amount=$4, status='paid' WHERE id=$5",
-        [customerName, customerEmail, shippingAddress, totalAmount, orderId]
-      );
-
-      const itemsRes = await pool.query(`
-        SELECT oi.*, p.title, p.image_url 
-        FROM order_items oi 
-        LEFT JOIN products p ON oi.product_id = p.id 
-        WHERE oi.order_id = $1
-      `, [orderId]);
-      const items = itemsRes.rows;
-
-      console.log(`✅ Order #${orderId} saved in database!`);
-
-      // تنفيذ العمليات الثقيلة في الخلفية
-      fulfillCJOrder(orderId, customerName, session.customer_details, items)
-        .catch(err => logger.logError('CJ Fulfillment (Background)', err));
-
-      if (customerEmail) {
-        sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, items)
-          .catch(err => logger.logError('Send Email (Background)', err));
-      }
-    } catch (dbErr) {
-      logger.logError('Stripe Webhook DB Update', dbErr);
-    }
+    })();
   }
 });
 
@@ -502,6 +500,7 @@ app.post('/api/admin/add-product', async (req, res) => {
       [title, sellPrice, oldPrice, image_url, imagesArray, JSON.stringify([]), colorsArray, sizesArray, true, cjProductId, description || 'High quality product from Laclarc.', material || 'Premium Quality', category || 'other']
     );
 
+    clearProductsCache(); // ✨ تفريغ الكاش بعد إضافة منتج جديد
     res.status(201).json({ message: 'Product added successfully with Auto-Pricing!', calculatedPrice: sellPrice, originalPrice: oldPrice });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -515,6 +514,7 @@ app.delete('/api/admin/delete-product/:id', async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query('UPDATE products SET stock_status = false WHERE id = $1', [id]);
+    clearProductsCache(); // ✨ تفريغ الكاش بعد حذف منتج  
     res.json({ message: 'Product hidden successfully!' });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -531,6 +531,7 @@ app.put('/api/admin/reorder-product/:id', async (req, res) => {
     if (direction === 'up') newOrder -= 1;
     else if (direction === 'down') newOrder += 1;
     await pool.query('UPDATE products SET sort_order = $1 WHERE id = $2', [newOrder, id]);
+    clearProductsCache(); // ✨ تفريغ الكاش بعد تعديل ترتيب المنتج  
     res.json({ message: 'Order updated successfully' });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -542,6 +543,7 @@ app.put('/api/admin/reorder-products', async (req, res) => {
     const { items } = req.body;
     const updatePromises = items.map((item, index) => pool.query('UPDATE products SET sort_order = $1 WHERE id = $2', [index, item.id]));
     await Promise.all(updatePromises);
+    clearProductsCache(); // ✨ تفريغ الكاش بعد تعديل ترتيب المنتجات  
     res.json({ message: 'Order updated successfully' });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -1071,6 +1073,13 @@ let productsCache = null;
 let cacheTime = 0;
 const CACHE_TTL = 60000;
 
+// ✨ دالة لتفريغ الكاش إجبارياً عند إضافة/تعديل/حذف منتج
+function clearProductsCache() {
+  productsCache = null;
+  cacheTime = 0;
+  console.log('🧹 Products cache cleared.');
+}
+
 app.get('/api/products', async (req, res) => {
   try {
     const search = req.query.search || '';
@@ -1234,7 +1243,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
       success_url: `${baseUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${baseUrl}/cancel`,
     });
-
+    await pool.query("UPDATE orders SET stripe_session_id = $1 WHERE id = $2", [session.id, orderId]);
     res.json({ url: session.url });
   } catch (err) {
     logger.logError('Create Checkout Session', err);
@@ -1335,6 +1344,7 @@ app.put('/api/admin/update-product/:id', async (req, res) => {
     const { id } = req.params;
     const { title, price, original_price, image_url, images, description, material, colors, sizes, category } = req.body;
     await pool.query(`UPDATE products SET title = $1, price = $2, original_price = $3, image_url = $4, images = $5, description = $6, material = $7, colors = $8, sizes = $9, category = $10 WHERE id = $11`, [title || null, Number(price) || 0, Number(original_price) || 0, image_url || null, images || null, description || null, material || null, colors || null, sizes || null, category || 'other', id]);
+    clearProductsCache(); // ✨ تفريغ الكاش بعد تعديل منتج  
     res.json({ message: 'Product updated successfully' });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -1702,7 +1712,108 @@ app.use((err, req, res, next) => {
 });
 
 // ==========================================
+// 🔄 6. كرون مطابقة مدفوعات Stripe (Payment Reconciliation)
+// ==========================================
+cron.schedule('*/15 * * * *', async () => {
+  console.log('▶️ [Stripe Reconcile] بدء فحص الطلبات المتعثرة...');
+  
+  try {
+    const query = `
+      SELECT id, stripe_session_id, total_amount 
+      FROM orders 
+      WHERE payment_method = 'Stripe' 
+        AND (status = 'paid' OR status = 'reconciling') 
+        AND cj_order_id IS NULL 
+        AND created_at <= NOW() - INTERVAL '10 minutes'
+      LIMIT 20;
+    `;
+    const { rows: pendingOrders } = await pool.query(query);
+
+    if (pendingOrders.length === 0) return;
+
+    console.log(`🔍 [Stripe Reconcile] تم العثور على ${pendingOrders.length} طلب للتحقق منه.`);
+
+    for (const order of pendingOrders) {
+      try {
+        // 1. قفل الطلب مؤقتاً
+        await pool.query("UPDATE orders SET status = 'reconciling' WHERE id = $1 AND status = 'paid'", [order.id]);
+
+        // 2. الاستعلام المباشر من Stripe API
+        const session = await stripe.checkout.sessions.retrieve(order.stripe_session_id);
+
+        // 3. التحقق من حالة الدفع الفعلية في Stripe
+        if (session.payment_status === 'paid') {
+          console.log(`💰 [Stripe Reconcile] الطلب ${order.id} تم دفعه في Stripe. إرساله إلى CJ...`);
+          
+          // ✨ جلب تفاصيل الطلب والمنتجات لتمريرها لـ CJ (نفس نمط الـ Webhook)
+          const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [order.id]);
+          const fullOrder = orderRes.rows[0];
+          const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [order.id]);
+          const items = itemsRes.rows;
+
+          // ✨ معالجة العنوان بنفس نمط BaridiMob لتجنب أخطاء CJ
+          let parsedAddress = {};
+          try { parsedAddress = JSON.parse(fullOrder.shipping_address); } 
+          catch (e) { parsedAddress = { line1: fullOrder.shipping_address, country: 'US' }; }
+          const customerDetails = { address: parsedAddress, phone: fullOrder.customer_phone || '0000000000' };
+
+          // 4. إرسال الطلب إلى CJ
+          const cjResponse = await fulfillCJOrder(order.id, fullOrder.customer_name, customerDetails, items);
+
+          if (!cjResponse || !cjResponse.success) {
+             await pool.query("UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'reconciling'", [order.id]);
+          } else {
+             // إرسال إيميل التأكيد إذا نجح الطلب (لأنه لم يمر عبر الـ Webhook)
+             if (fullOrder.customer_email) {
+                sendOrderConfirmationEmail(fullOrder.customer_email, order.id, fullOrder.total_amount, items)
+                  .catch(err => logger.logError('Reconcile Email (Background)', err));
+             }
+          }
+        } else {
+          console.log(`⚠️ [Stripe Reconcile] الطلب ${order.id} لم يُدفع في Stripe. إلغاءه.`);
+          await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status = 'reconciling'", [order.id]);
+        }
+      } catch (error) {
+        console.error(`❌ [Stripe Reconcile] خطأ أثناء معالجة الطلب ${order.id}:`, error.message);
+        await pool.query("UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'reconciling'", [order.id]);
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  } catch (error) {
+    console.error('🔥 [Stripe Reconcile] خطأ عام في الـ Cron Job:', error.message);
+  }
+});
+
+// ==========================================
+// 🧹 7. كرون تنظيف الطلبات المعلقة (Pending Orders Sweeper)
+// يلغي تلقائياً أي طلب لم يُدفع خلال ساعتين (Stripe, Paysera, Crypto)
+// لمنع تراكم الطلبات الوهمية في قاعدة البيانات
+// ==========================================
+cron.schedule('0 * * * *', async () => {
+  try {
+    const result = await pool.query(`
+      UPDATE orders 
+      SET status = 'expired' 
+      WHERE status = 'pending' 
+        AND payment_method IN ('Stripe', 'Paysera', 'Crypto') 
+        AND created_at < NOW() - INTERVAL '2 hours'
+    `);
+    
+    if (result.rowCount > 0) {
+      console.log(`🧹 [Sweeper] تم تنظيف ${result.rowCount} طلب معلق منتهي الصلاحية.`);
+    }
+  } catch (err) {
+    console.error('❌ [Sweeper] Error cleaning pending orders:', err.message);
+  }
+});
+
+// ==========================================
 // 12. تشغيل السيرفر
 // ==========================================
 const PORT = process.env.PORT || 5000;
+// ✨ التقاط أي Promise لم يتم عمل catch له (يمنع تسرب الذاكرة وتشويش السيرفر)
+process.on('unhandledRejection', (reason, promise) => {
+  logger.logError('Unhandled Rejection', reason);
+  // لا نوقف السيرفر (process.exit)، بل نكتفي بتسجيل الخطأ ليبقى المتجر شغال
+});
 app.listen(PORT, () => console.log(`🚀 Server is running on http://localhost:${PORT}`));
