@@ -1718,12 +1718,11 @@ cron.schedule('*/15 * * * *', async () => {
   console.log('▶️ [Stripe Reconcile] بدء فحص الطلبات المتعثرة...');
   
   try {
-    const query = `
+        const query = `
       SELECT id, stripe_session_id, total_amount 
       FROM orders 
       WHERE payment_method = 'Stripe' 
         AND (status = 'paid' OR status = 'reconciling') 
-        AND cj_order_id IS NULL 
         AND created_at <= NOW() - INTERVAL '10 minutes'
       LIMIT 20;
     `;
