@@ -585,17 +585,22 @@ app.get('/api/admin/track/:trackNumber', async (req, res) => {
 
 // ==========================================
 // 4.5 مسارات شجرة فئات CJ الرسمية
+// ✨ دابا كترد فوراً وتكمل المزامنة فالخلفية (نفس نمط backfill-categories و
+// sync-cj-products تحت) — كانت synchrone وكتدير مئات الاستعلامات المتسلسلة
+// لقاعدة البيانات (شجرة CJ كاملة، مستوى بمستوى)، معرضة لـ timeout ديال
+// axios (60s) ولا ديال Render قبل ما تكمل.
 // ==========================================
 app.post('/api/admin/sync-categories', async (req, res) => {
-  try {
-    const result = await syncCategoriesFromCJ();
-    categoryTreeCache = null;
-    res.json({ message: `Categories synced! Level 1: ${result.level1Count}, Level 2: ${result.level2Count}, Level 3: ${result.level3Count}.`, ...result });
-  } catch (err) {
-    logger.logError('Sync Categories', err);
-    res.status(500).json({ error: 'Failed to sync categories from CJ', details: err.message });
-  }
+  res.json({ message: 'Category sync started in background. Check server logs for progress.' });
+  runCategorySync().catch((err) => logger.logError('Sync Categories (Background)', err));
 });
+
+async function runCategorySync() {
+  console.log('⏳ Starting official CJ categories tree sync...');
+  const result = await syncCategoriesFromCJ();
+  categoryTreeCache = null;
+  console.log(`🎉 Categories synced! Level 1: ${result.level1Count}, Level 2: ${result.level2Count}, Level 3: ${result.level3Count}.`);
+}
 
 let categoryTreeCache = null;
 let categoryTreeCacheTime = 0;
