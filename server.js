@@ -1125,6 +1125,15 @@ app.get('/api/products', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+// ✨ مسار جلب منتجات الـ Lightning Deals للواجهة الأمامية
+app.get('/api/products/deals', async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, title, price, original_price, image_url FROM products WHERE stock_status = true AND is_sourced = true ORDER BY id DESC LIMIT 10");
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 // ✨ مسار جديد لجلب تفاصيل منتج واحد بالكامل (لصفحة المنتج)
 app.get('/api/products/:id', async (req, res) => {
   try {
@@ -1192,15 +1201,7 @@ app.get('/api/products/:id/related', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
-// ✨ مسار جلب منتجات الـ Lightning Deals للواجهة الأمامية
-app.get('/api/products/deals', async (req, res) => {
-  try {
-    const result = await pool.query("SELECT id, title, price, original_price, image_url FROM products WHERE stock_status = true AND is_sourced = true ORDER BY id DESC LIMIT 10");
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+
 
 // ✨ مسار الأدمن لتفعيل/إلغاء ميزة Lightning Deal
 app.put('/api/admin/toggle-deal/:id', async (req, res) => {
