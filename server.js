@@ -762,13 +762,13 @@ async function runCjProductSync(keyword) {
 
         await pool.query(
           `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id, is_sourced) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, true)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, false)
            ON CONFLICT (cj_product_id) DO UPDATE SET 
              title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price, 
              image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants, 
              colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status, 
              description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, 
-             video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id, is_sourced=true`,
+             video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id`,
           [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, details.description, material, categorySlug, videoUrl, cjCategoryId]
         );
 
