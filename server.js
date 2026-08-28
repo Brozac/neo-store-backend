@@ -761,14 +761,14 @@ async function runCjProductSync(keyword) {
         } catch (e) {}
 
         await pool.query(
-          `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+          `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id, is_sourced) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, true)
            ON CONFLICT (cj_product_id) DO UPDATE SET 
              title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price, 
              image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants, 
              colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status, 
              description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, 
-             video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id`,
+             video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id, is_sourced=true`,
           [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, details.description, material, categorySlug, videoUrl, cjCategoryId]
         );
 
@@ -1003,10 +1003,15 @@ app.get('/api/search', async (req, res) => {
 
 app.get('/api/admin/search-products', async (req, res) => {
   const q = req.query.q || '';
-  if (q.length < 1) return res.json([]);
-
   try {
-    const result = await pool.query("SELECT id, title, price, original_price, image_url, stock_status FROM products WHERE title ILIKE $1 ORDER BY id DESC LIMIT 50", [`%${q}%`]);
+    let result;
+    if (q.length > 0) {
+      // إذا بحثنا، نجلب 30 نتيجة
+      result = await pool.query("SELECT id, title, price, original_price, image_url, stock_status, category FROM products WHERE title ILIKE $1 ORDER BY id DESC LIMIT 30", [`%${q}%`]);
+    } else {
+      // إذا لم نبحث، نجلب آخر 30 منتج مضاف لمنع تجميد المتصفح
+      result = await pool.query("SELECT id, title, price, original_price, image_url, stock_status, category FROM products ORDER BY id DESC LIMIT 30");
+    }
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -1187,7 +1192,32 @@ app.get('/api/products/:id/related', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+// ✨ مسار جلب منتجات الـ Lightning Deals للواجهة الأمامية
+app.get('/api/products/deals', async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, title, price, original_price, image_url FROM products WHERE stock_status = true AND is_sourced = true ORDER BY id DESC LIMIT 10");
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
+// ✨ مسار الأدمن لتفعيل/إلغاء ميزة Lightning Deal
+app.put('/api/admin/toggle-deal/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('SELECT is_sourced FROM products WHERE id = $1', [id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
+    
+    const newStatus = !result.rows[0].is_sourced;
+    await pool.query('UPDATE products SET is_sourced = $1 WHERE id = $2', [newStatus, id]);
+    
+    clearProductsCache(); // ✨ تفريغ الكاش لكي يختفي/يظهر فوراً في الواجهة
+    res.json({ message: 'Deal status updated', is_sourced: newStatus });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 // ✨ مسار إنشاء جلسة الدفع (Stripe Checkout Session)
 // ✅ الأسعار والـ vid الآن تُحسب/تتحقق من قاعدة البيانات فقط عبر prepareSecureItems،
 //    ولا يتم الوثوق بأي سعر أو vid قادم من المتصفح (منع التلاعب بالأسعار والمنتجات).
