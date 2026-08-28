@@ -760,15 +760,15 @@ async function runCjProductSync(keyword) {
           if (videoRes.data.code === 200 && videoRes.data.data?.length > 0) videoUrl = videoRes.data.data[0].videoUrl;
         } catch (e) {}
 
-                await pool.query(
-          `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id, is_sourced) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, true)
+        await pool.query(
+          `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
            ON CONFLICT (cj_product_id) DO UPDATE SET 
              title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price, 
              image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants, 
              colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status, 
              description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, 
-             video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id, is_sourced=true`,
+             video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id`,
           [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, details.description, material, categorySlug, videoUrl, cjCategoryId]
         );
 
@@ -1089,8 +1089,7 @@ app.get('/api/products', async (req, res) => {
       if (productsCache && (Date.now() - cacheTime < CACHE_TTL)) {
         return res.json(productsCache);
       }
-      // ✨ أضفنا LIMIT 200 هنا لمنع تحميل آلاف المنتجات وتجميد المتصفح
-      const result = await pool.query('SELECT id, title, price, original_price, image_url, category FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC LIMIT 200');
+      const result = await pool.query('SELECT id, title, price, original_price, image_url, category FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC');
       productsCache = result.rows;
       cacheTime = Date.now();
       return res.json(result.rows);
@@ -1508,30 +1507,7 @@ app.post('/api/admin/sourcing/create', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-// ✨ مسار جلب منتجات الـ Sourcing (Lightning Deals) للواجهة الأمامية
-app.get('/api/products/deals', async (req, res) => {
-  try {
-    const result = await pool.query("SELECT id, title, price, original_price, image_url FROM products WHERE stock_status = true AND is_sourced = true ORDER BY id DESC LIMIT 10");
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
 
-// ✨ مسار الأدمن لتفعيل/إلغاء ميزة Lightning Deal
-app.put('/api/admin/toggle-deal/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await pool.query('SELECT is_sourced FROM products WHERE id = $1', [id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
-    
-    const newStatus = !result.rows[0].is_sourced;
-    await pool.query('UPDATE products SET is_sourced = $1 WHERE id = $2', [newStatus, id]);
-    res.json({ message: 'Deal status updated', is_sourced: newStatus });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
 // ==========================================
 // 📘 النشر التلقائي على فيسبوك (Auto-Post)
 // ==========================================
