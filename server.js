@@ -615,6 +615,15 @@ app.get('/api/sync-cj-products', requireAdmin, async (req, res) => {
   runCjProductSync(keyword).catch((err) => logger.logError('CJ Product Sync (Background)', err));
 });
 
+// ✨ مسار تشغيل محرك الاستيراد بالجملة (Mass Sync)
+const { runMassSync } = require('./massSync');
+
+app.post('/api/admin/mass-sync', requireAdmin, async (req, res) => {
+  res.json({ message: '🚀 Mass Sync Engine started in background! Check server logs.' });
+  // تشغيل المحرك في الخلفية لكي لا يعلق الطلب (Render Timeout)
+  runMassSync().catch(err => logger.logError('Mass Sync Engine', err));
+});
+
 app.post('/api/admin/sync-single-product', async (req, res) => {
   const { pid } = req.body;
   if (!pid) return res.status(400).json({ error: 'Product ID (PID) is required' });

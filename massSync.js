@@ -85,4 +85,10 @@ async function runMassSync() {
   }
 }
 
-runMassSync();
+// ✨ تصدير الدالة بدلاً من تشغيلها تلقائياً
+module.exports = { runMassSync };
+
+// السماح بتشغيله يدوياً من التيرمينال إذا أردت: node massSync.js
+if (require.main === module) {
+  runMassSync();
+}
