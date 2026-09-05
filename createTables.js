@@ -1,18 +1,30 @@
+// createTables.js - Laclarc Enterprise Database Schema Setup
 require('dotenv').config();
-const { Pool } = require('pg');
-
-// ✨ 1. إضافة ssl: { rejectUnauthorized: false } للاتصال الآمن بـ Render/Neon
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+const pool = require('./db'); // ✨ استخدام الـ Pool الموحد والمحصن
 
 const createTables = async () => {
+  const client = await pool.connect();
   try {
-    console.log('⏳ Starting database setup (Divine Version)...');
+    console.log('⏳ Starting database setup (Enterprise Architecture)...');
+    await client.query('BEGIN');
 
-    // 1. جدول الأقسام الرسمية (CJ Category Tree)
-    await pool.query(`
+    // 1. جدول المستخدمين (يجب أن يكون الأول لأن orders و reviews ترتبط به)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        is_verified BOOLEAN DEFAULT false,
+        profile_picture TEXT,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);`);
+    console.log('✅ 1. Table "users" ready.');
+
+    // 2. جدول شجرة فئات CJ الرسمية (Categories Tree)
+    await client.query(`
       CREATE TABLE IF NOT EXISTS categories (
         id SERIAL PRIMARY KEY,
         level SMALLINT NOT NULL,
@@ -20,16 +32,16 @@ const createTables = async () => {
         slug VARCHAR(255) NOT NULL,
         parent_id INTEGER REFERENCES categories(id) ON DELETE CASCADE,
         cj_category_id VARCHAR(100) UNIQUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_categories_cj_id ON categories(cj_category_id);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_categories_level_slug ON categories(level, slug);`);
-    console.log('✅ Table "categories" ready with indexes.');
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_categories_cj_id ON categories(cj_category_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_categories_level_slug ON categories(level, slug);`);
+    console.log('✅ 2. Table "categories" ready with indexes.');
 
-    // 2. جدول المنتجات
-    await pool.query(`
+    // 3. جدول المنتجات (مع دعم Lightning Deals و 1688 Sourcing)
+    await client.query(`
       CREATE TABLE IF NOT EXISTS products (
         id SERIAL PRIMARY KEY,
         title VARCHAR(255) NOT NULL,
@@ -46,19 +58,22 @@ const createTables = async () => {
         category VARCHAR(255),
         cj_category_id VARCHAR(100),
         stock_status BOOLEAN DEFAULT true,
+        is_sourced BOOLEAN DEFAULT false, /* ✨ ميزة الـ Lightning Deals وسحب 1688 */
         cj_product_id VARCHAR(100) UNIQUE,
         video_url TEXT,
         sort_order INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_stock ON products(stock_status);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_cj_category ON products(cj_category_id);`);
-    console.log('✅ Table "products" ready with indexes.');
+    // فهرس للعرض السريع وفهرس العروض
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_products_display ON products(stock_status, sort_order ASC, id DESC);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_products_deals ON products(stock_status, is_sourced);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_products_cj_product_id ON products(cj_product_id);`);
+    console.log('✅ 3. Table "products" ready with advanced indexes.');
 
-    // 3. جدول الطلبات
-    await pool.query(`
+    // 4. جدول الطلبات (Orders)
+    await client.query(`
       CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY,
         customer_name VARCHAR(255) NOT NULL,
@@ -72,79 +87,70 @@ const createTables = async () => {
         payment_status VARCHAR(50) DEFAULT 'pending',
         receipt_url TEXT,
         stripe_session_id VARCHAR(255) UNIQUE,
-        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, /* ✨ إضافة user_id هنا */
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    // ✨ إضافة الفهرس لـ user_id لتسريع جلب طلبات الزبون
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);`);
-    console.log('✅ Table "orders" ready (with user_id).');
+    // فهارس استعلامات الـ Reconcile، Sweeper، والتتبع
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_email ON orders(customer_email);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_reconcile ON orders(payment_method, status, created_at);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_stripe_session ON orders(stripe_session_id);`);
+    console.log('✅ 4. Table "orders" ready with indexes.');
 
-    // 4. جدول المستخدمين (لازم قبل orders حيت orders.user_id يشير ليها)
-    // ✨ نقلنا جدول المستخدمين ليكون قبل جدول الطلبات لتفادي أخطاء الـ Foreign Key
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        password_hash VARCHAR(255) NOT NULL,
-        is_verified BOOLEAN DEFAULT false,
-        profile_picture TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('✅ Table "users" ready.');
-
-    // 5. جدول عناصر الطلب
-    await pool.query(`
+    // 5. جدول تفاصيل الطلبات (Order Items)
+    await client.query(`
       CREATE TABLE IF NOT EXISTS order_items (
         id SERIAL PRIMARY KEY,
-        order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
-        product_id INTEGER REFERENCES products(id),
+        order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
         quantity INTEGER NOT NULL,
         price_at_purchase DECIMAL(10, 2) NOT NULL,
         vid VARCHAR(100)
       );
     `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);`);
-    console.log('✅ Table "order_items" ready with indexes.');
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);`);
+    console.log('✅ 5. Table "order_items" ready.');
 
-    // 6. جدول الكوبونات
-    await pool.query(`
+    // 6. جدول الكوبونات (Coupons)
+    await client.query(`
       CREATE TABLE IF NOT EXISTS coupons (
         id SERIAL PRIMARY KEY,
         code VARCHAR(50) UNIQUE NOT NULL,
         discount_type VARCHAR(20) DEFAULT 'percentage',
         discount_value DECIMAL(10, 2) NOT NULL,
         is_active BOOLEAN DEFAULT true,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    console.log('✅ Table "coupons" ready.');
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_coupons_code ON coupons(code);`);
+    console.log('✅ 6. Table "coupons" ready.');
 
-    // 7. جدول التقييمات
-    await pool.query(`
+    // 7. جدول التقييمات (Reviews)
+    await client.query(`
       CREATE TABLE IF NOT EXISTS reviews (
         id SERIAL PRIMARY KEY,
-        product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+        product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
         user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
         author VARCHAR(255) NOT NULL,
         rating INTEGER DEFAULT 5,
         content TEXT NOT NULL,
         country VARCHAR(100) DEFAULT 'United States',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_reviews_product ON reviews(product_id);`);
-    console.log('✅ Table "reviews" ready with indexes.');
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reviews_product ON reviews(product_id);`);
+    console.log('✅ 7. Table "reviews" ready.');
 
-    console.log('🎉 Database setup (Divine Version) completed successfully!');
-    await pool.end();
+    await client.query('COMMIT');
+    console.log('🎉 Enterprise Database setup completed successfully without any conflicts!');
     process.exit(0);
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('❌ Error creating tables:', err);
-    await pool.end();
     process.exit(1);
+  } finally {
+    client.release();
   }
 };
 

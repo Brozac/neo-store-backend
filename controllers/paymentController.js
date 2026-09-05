@@ -1,3 +1,4 @@
+// controllers/paymentController.js - Laclarc Enterprise Payment Controller
 const express = require('express');
 const router = express.Router();
 const Stripe = require('stripe');
@@ -7,22 +8,12 @@ const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const jwt = require('jsonwebtoken'); 
-const { Pool } = require('pg');
+const pool = require('../db'); // ✨ استخدام الـ Pool الموحد حصراً
 const { fulfillCJOrder } = require('../services/cjService');
 const { prepareSecureItems } = require('../utils/secureCheckout');
 const logger = require('../logger'); 
 
-// إعداد قاعدة البيانات
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  // ✨ إعدادات منع انقطاع الاتصال (مهمة جداً لـ Render/Neon)
-  max: 20, // أقصى عدد اتصالات في نفس اللحظة
-  idleTimeoutMillis: 30000, // إغلاق أي اتصال خامل بعد 30 ثانية
-  connectionTimeoutMillis: 5000 // مهلة الاتصال: إذا لم يتصل خلال 5 ثوانٍ، يرمي خطأ بدل أن يعلق السيرفر
-});
-
-// إعداد Multer
+// إعداد Cloudinary لتخزين إيصالات بريدي موب
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -33,22 +24,18 @@ const storage = new CloudinaryStorage({
   cloudinary: cloudinary,
   params: {
     folder: 'neo_store_receipts',
-    allowed_formats: ['jpg', 'png', 'jpeg']
+    allowed_formats: ['jpg', 'png', 'jpeg', 'webp']
   }
 });
-const upload = multer({ storage: storage });
+const upload = multer({ storage: storage, limits: { fileSize: 5 * 1024 * 1024 } });
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-const NOWPAYMENTS_API_KEY = process.env.NOWPAYMENTS_API_KEY;
-const PAYSERA_PROJECT_ID = process.env.PAYSERA_PROJECT_ID;
-const PAYSERA_PASSWORD = process.env.PAYSERA_PASSWORD;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// ✨ مصفوفة رسمية نظيفة تحتوي على جميع رموز دول العالم المعتمدة في Stripe للشحن
 const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
 
 // ==========================================
-// ✨ دوال الإيميل (Brevo + Resend Fallback)
+// دوال الإيميل الموحدة
 // ==========================================
 async function sendEmail({ to, subject, html }) {
   try {
@@ -86,11 +73,11 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
     const itemsHtml = items.map(item => `
       <tr>
         <td style="padding: 15px 0; border-bottom: 1px solid #eee; display: flex; align-items: center;">
-          <img src="${item.image_url || item.image || 'https://via.placeholder.com/50'}" alt="${item.title || item.name}" style="width: 50px; height: 50px; object-fit: cover; border-radius: 8px; margin-right: 15px;">
-          <span style="color: #1D1E3C; font-weight: bold; font-size: 14px;">${item.title || item.name} (Qty: ${item.quantity})</span>
+          <img src="${item.image_url || 'https://via.placeholder.com/50'}" alt="${item.title || 'Product'}" style="width: 50px; height: 50px; object-fit: cover; border-radius: 8px; margin-right: 15px;">
+          <span style="color: #1D1E3C; font-weight: bold; font-size: 14px;">${item.title || 'Product'} (Qty: ${item.quantity})</span>
         </td>
         <td style="padding: 15px 0; border-bottom: 1px solid #eee; text-align: right; color: #FF6B9D; font-weight: bold; font-size: 14px;">
-          $${Number(item.price_at_purchase || item.price).toFixed(2)}
+          $${Number(item.price_at_purchase || item.price || 0).toFixed(2)}
         </td>
       </tr>
     `).join('');
@@ -98,12 +85,12 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
     const htmlContent = `
       <div style="font-family: 'Arial', sans-serif; max-width: 600px; margin: 0 auto; background-color: #f4f3f8; border-radius: 15px; overflow: hidden; border: 1px solid #ddd;">
         <div style="background: linear-gradient(135deg, #1D1E3C 0%, #8B78C6 100%); padding: 30px; text-align: center;">
-          <h1 style="color: #fff; margin: 0; font-size: 28px; letter-spacing: 1px;">LACLARC</h1>
+          <h1 style="color: #fff; margin: 0; font-size: 28px; letter-spacing: 1px;">Laclarc</h1>
         </div>
         <div style="padding: 30px;">
           <h2 style="color: #1D1E3C; margin-top: 0;">Order Confirmed Successfully! 🎉</h2>
           <p style="color: #555; font-size: 16px; line-height: 1.6;">
-            Thank you for your purchase from LACLARC. Your order <strong style="color: #8B78C6;">#${orderId}</strong> is currently being processed and will be shipped soon.
+            Thank you for your purchase from Laclarc. Your order <strong style="color: #8B78C6;">#${orderId}</strong> is currently being processed and will be shipped soon.
           </p>
           <table style="width: 100%; border-collapse: collapse; margin: 25px 0;">
             <thead>
@@ -125,14 +112,13 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
             </p>
           </div>
           <div style="text-align: center; margin-top: 40px;">
-            <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}" style="background-color: #FF6B9D; color: #fff; text-decoration: none; padding: 12px 30px; border-radius: 25px; font-weight: bold; display: inline-block;">
+            <a href="${process.env.FRONTEND_URL || 'https://laclarc.com'}" style="background-color: #FF6B9D; color: #fff; text-decoration: none; padding: 12px 30px; border-radius: 25px; font-weight: bold; display: inline-block;">
               Continue Shopping
             </a>
           </div>
         </div>
         <div style="background-color: #1D1E3C; padding: 20px; text-align: center; color: #888; font-size: 12px;">
-          &copy; ${new Date().getFullYear()} Laclarc. All rights reserved.<br>
-          This is an automated message, please do not reply.
+          &copy; ${new Date().getFullYear()} Laclarc. All rights reserved.
         </div>
       </div>
     `;
@@ -144,7 +130,6 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
   }
 }
 
-// ✨ استخراج user_id إذا كان الزبون مسجل الدخول
 function getOptionalUser(req) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -158,19 +143,19 @@ function getOptionalUser(req) {
 
 // ==========================================
 // 1. Stripe Checkout
-// ✅ الأسعار تُحسب من قاعدة البيانات فقط عبر prepareSecureItems
 // ==========================================
 router.post('/stripe', async (req, res) => {
   try {
-    const { items: clientItems } = req.body; // ✨ لا نأخذ totalAmount ولا الأسعار من المتصفح
-    const optionalUser = getOptionalUser(req);
+    const { items: clientItems, origin, couponCode } = req.body;
+    let baseUrl = origin && origin.startsWith('http') ? origin : (process.env.FRONTEND_URL || 'https://laclarc.com');
+    baseUrl = baseUrl.replace(/\/+$/, '');
 
-    // ✨ إعادة حساب الأسعار والإجمالي من قاعدة البيانات
+    const optionalUser = getOptionalUser(req);
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
     const orderResult = await pool.query(
-      "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
-      ['Pending Customer', 'pending@neo.com', 'Pending', serverTotal, 'pending', 'Stripe', optionalUser ? optionalUser.id : null]
+      "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, 'Stripe', $6) RETURNING id",
+      ['Pending Customer', 'pending@laclarc.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null]
     );
     const orderId = orderResult.rows[0].id;
 
@@ -181,53 +166,66 @@ router.post('/stripe', async (req, res) => {
       );
     }
 
+    let stripeDiscounts = [];
+    if (couponCode) {
+      const couponRes = await pool.query('SELECT * FROM coupons WHERE code = $1 AND is_active = true', [couponCode.toUpperCase()]);
+      if (couponRes.rows.length > 0) {
+        const coupon = couponRes.rows[0];
+        const stripeCouponData = coupon.discount_type === 'percentage' 
+          ? { percent_off: parseFloat(coupon.discount_value), duration: 'once' } 
+          : { amount_off: Math.round(parseFloat(coupon.discount_value) * 100), currency: 'usd', duration: 'once' };
+        const stripeCoupon = await stripe.coupons.create(stripeCouponData);
+        stripeDiscounts = [{ coupon: stripeCoupon.id }];
+      }
+    }
+
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
-      line_items: secureItems.map(item => ({
-        price_data: {
-          currency: 'usd',
-          product_data: { name: item.title },
-          unit_amount: Math.round(item.price * 100), // ✅ السعر الحقيقي من قاعدة البيانات
-        },
-        quantity: item.quantity,
-      })),
+      line_items: secureItems.map(item => {
+        const hasValidImage = item.image_url && typeof item.image_url === 'string' && item.image_url.startsWith('http');
+        return {
+          price_data: {
+            currency: 'usd',
+            product_data: { name: item.title, images: hasValidImage ? [item.image_url] : [] },
+            unit_amount: Math.round(item.price * 100),
+          },
+          quantity: item.quantity,
+        };
+      }),
       mode: 'payment',
-      // ✨ ===== تعديل الشحن لجميع دول العالم ===== ✨
-      shipping_address_collection: { 
-        allowed_countries: ALL_WORLD_COUNTRIES 
-      },
+      shipping_address_collection: { allowed_countries: ALL_WORLD_COUNTRIES },
       phone_number_collection: { enabled: true },
-      // ==========================================
-      success_url: `${process.env.FRONTEND_URL}/success?method=stripe&amount=${serverTotal}`,
-      cancel_url: `${process.env.FRONTEND_URL}/cart`,
+      discounts: stripeDiscounts,
+      shipping_options: [
+        { shipping_rate_data: { type: 'fixed_amount', fixed_amount: { amount: 0, currency: 'usd' }, display_name: 'Standard Shipping', delivery_estimate: { minimum: { unit: 'business_day', value: 15 }, maximum: { unit: 'business_day', value: 35 } } } },
+        { shipping_rate_data: { type: 'fixed_amount', fixed_amount: { amount: 1500, currency: 'usd' }, display_name: 'Worldwide Express Shipping', delivery_estimate: { minimum: { unit: 'business_day', value: 7 }, maximum: { unit: 'business_day', value: 15 } } } }
+      ],
+      success_url: `${baseUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${baseUrl}/cancel`,
       metadata: { orderId: orderId.toString() },
     });
 
-    // 🚨 حفظ Stripe Session ID لاستخدامه في الـ Cron Job لاحقاً
     await pool.query("UPDATE orders SET stripe_session_id = $1 WHERE id = $2", [session.id, orderId]);
-
     res.json({ url: session.url });
   } catch (error) {
-    console.error('Stripe Error:', error.message);
+    logger.logError('Stripe Checkout Error', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ==========================================
-// 2. Paysera Checkout
-// ✅ المبلغ المرسل لـ Paysera يُحسب من قاعدة البيانات فقط (serverTotal)
+// 2. Paysera Checkout & Callback
 // ==========================================
 router.post('/paysera', async (req, res) => {
   try {
-    const { items: clientItems } = req.body; // ✨ لا نأخذ totalAmount من المتصفح
+    const { items: clientItems } = req.body;
     const optionalUser = getOptionalUser(req);
 
-    // ✨ إعادة حساب الأسعار والإجمالي من قاعدة البيانات
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
     const orderResult = await pool.query(
-      "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
-      ['Pending Paysera', 'pending@neo.com', 'Pending', serverTotal, 'pending', 'Paysera', optionalUser ? optionalUser.id : null]
+      "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, 'Paysera', $6) RETURNING id",
+      ['Pending Paysera', 'pending@laclarc.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null]
     );
     const orderId = orderResult.rows[0].id;
 
@@ -241,16 +239,16 @@ router.post('/paysera', async (req, res) => {
     const data = {
       projectid: process.env.PAYSERA_PROJECT_ID,
       orderid: orderId,
-      amount: Math.round(serverTotal * 100), // ✅ المبلغ الحقيقي وليس المصرح به من المتصفح
+      amount: Math.round(serverTotal * 100),
       currency: 'USD',
       accepturl: `${process.env.FRONTEND_URL}/success?method=paysera`,
       cancelurl: `${process.env.FRONTEND_URL}/cart`,
       callbackurl: `${process.env.BACKEND_URL}/api/payment/paysera/callback`,
-      test: 1, 
+      test: process.env.NODE_ENV === 'production' ? 0 : 1, 
     };
 
     const encodedData = Buffer.from(
-      Object.entries(data).map(([k, v]) => `${k}=${v}`).join('&')
+      Object.entries(data).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&')
     ).toString('base64');
 
     const sign = crypto.createHash('md5')
@@ -259,23 +257,17 @@ router.post('/paysera', async (req, res) => {
 
     const payseraUrl = `https://www.paysera.com/pay/?data=${encodedData}&sign=${sign}`;
     res.json({ url: payseraUrl });
-
   } catch (error) {
-    console.error('Paysera Error:', error.message);
+    logger.logError('Paysera Error', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ✨ Webhook الخاص بـ Paysera
-// ✨ دابا كنردو 'OK' لـ Paysera فوراً بعد التحقق من التوقيع والحالة، ونديرو
-// fulfillCJOrder فالخلفية بلا await — نفس النمط ديال Stripe webhook. السبب:
-// fulfillCJOrder تقدر تدير حتى 8 محاولات شحن (× 1.5 ثانية) وتتضاعف إذا صار
-// split order، وباقي webhooks عندهم غالباً timeout قصير (10-30 ثانية) على
-// الـ callback response — تأخير الرد كان يقدر يخلي Paysera تعتبر الـ callback
-// فشل وتعاود تبعثو (retry)، ممكن يؤدي لمعالجة الطلب مرتين.
 router.get('/paysera/callback', async (req, res) => {
   try {
     const { data, ss1 } = req.query;
+    if (!data || !ss1) return res.status(400).send('Bad parameters');
+
     const expectedSign = crypto.createHash('md5')
       .update(data + process.env.PAYSERA_PASSWORD)
       .digest('hex');
@@ -288,27 +280,28 @@ router.get('/paysera/callback', async (req, res) => {
     const status = params.get('status');
 
     if (status === '1') {
-      // 🚨 تحديث ذري لمنع الـ Race Condition
       const updateRes = await pool.query(
         "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING *", 
         [orderId]
       );
 
       if (updateRes.rows.length > 0) {
-        const order = updateRes.rows[0]; // أمسكنا الطلب، يمكننا المتابعة بأمان
+        const order = updateRes.rows[0];
+        res.send('OK'); // الرد الفوري لمنع مهلة Paysera
 
-        // ✨ الرد فوراً على Paysera بعد تسجيل الدفع كـ 'paid' — قبل معالجة CJ
-        res.send('OK');
-
-        // ✨ باقي المعالجة الثقيلة (CJ + الإيميل) فالخلفية
         (async () => {
           try {
             const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [orderId]);
             const items = itemsRes.rows;
 
-            await fulfillCJOrder(orderId, order.customer_name, {
-              address: { line1: order.shipping_address, country: 'US' }
+            const cjResponse = await fulfillCJOrder(orderId, order.customer_name, {
+              address: { line1: order.shipping_address || 'Online Store Purchase', country: 'US' }
             }, items);
+
+            // ✨ تحديث حالة الطلب إلى completed بعد نجاح الـ Fulfillment
+            if (cjResponse && cjResponse.success) {
+              await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [orderId]);
+            }
 
             if (order.customer_email) {
               await sendOrderConfirmationEmail(order.customer_email, orderId, order.total_amount, items);
@@ -322,26 +315,24 @@ router.get('/paysera/callback', async (req, res) => {
     }
     res.send('OK');
   } catch (error) {
-    console.error('Paysera Callback Error:', error);
+    logger.logError('Paysera Callback Error', error);
     res.status(500).send('Error');
   }
 });
 
 // ==========================================
-// 3. Crypto (NowPayments)
-// ✅ price_amount يُحسب من قاعدة البيانات فقط (serverTotal)
+// 3. Crypto (NowPayments) Checkout & IPN
 // ==========================================
 router.post('/crypto', async (req, res) => {
   try {
-    const { items: clientItems } = req.body; // ✨ لا نأخذ totalAmount من المتصفح
+    const { items: clientItems } = req.body;
     const optionalUser = getOptionalUser(req);
 
-    // ✨ إعادة حساب الأسعار والإجمالي من قاعدة البيانات
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
     const orderResult = await pool.query(
-      "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
-      ['Pending Crypto', 'pending@neo.com', 'Pending', serverTotal, 'pending', 'Crypto', optionalUser ? optionalUser.id : null]
+      "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, 'Crypto', $6) RETURNING id",
+      ['Pending Crypto', 'pending@laclarc.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null]
     );
     const orderId = orderResult.rows[0].id;
 
@@ -352,15 +343,12 @@ router.post('/crypto', async (req, res) => {
       );
     }
 
-    // ✨ تأكدي من استخدام رابط التجربة هنا إذا كنتي تختبرين
-    const apiUrl = 'https://api.nowpayments.io/v1/invoice'; 
-    // للإنتاج الحقيقي استخدمي: 'https://api.nowpayments.io/v1/invoice'
-    
+    const apiUrl = 'https://api.nowpayments.io/v1/invoice';
     const response = await axios.post(apiUrl, {
-      price_amount: serverTotal, // ✅ المبلغ الحقيقي وليس المصرح به من المتصفح
+      price_amount: serverTotal,
       price_currency: 'usd',
       order_id: orderId.toString(), 
-      order_description: 'Laclarc Purchase',
+      order_description: `Laclarc Order #${orderId}`,
       ipn_callback_url: `${process.env.BACKEND_URL}/api/payment/crypto/callback`,
       success_url: `${process.env.FRONTEND_URL}/success?method=crypto`,
       cancel_url: `${process.env.FRONTEND_URL}/cart`,
@@ -372,77 +360,13 @@ router.post('/crypto', async (req, res) => {
     });
     
     res.json({ url: response.data.invoice_url });
-    
   } catch (error) {
-    console.error('Crypto Error:', error.response?.data || error.message);
+    logger.logError('Crypto Checkout Error', error.response?.data || error);
     res.status(500).json({ error: error.response?.data?.message || error.message });
   }
 });
 
-// ==========================================
-// 4. BaridiMob / CCP (Manual Upload)
-// ✅ نحسب الإجمالي الحقيقي من قاعدة البيانات لتخزين price_at_purchase الصحيح،
-//    ونقارنه بالمبلغ المصرح به لتنبيه الأدمن في حال وجود فرق مشبوه قبل الموافقة
-// ==========================================
-router.post('/manual', upload.single('receipt'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'يرجى رفع صورة الإيصال' });
-
-    const { totalAmount, items, customerName, customerPhone, customerAddress, customerEmail } = req.body;
-    const receiptUrl = req.file.path; // ✨ رابط Cloudinary
-    const fullShippingAddress = customerAddress || JSON.stringify({ line1: 'N/A', city: 'N/A', state: 'N/A', postal_code: '00000', country: 'DZ' });
-    
-    const optionalUser = getOptionalUser(req); 
-
-    const parsedItems = JSON.parse(items);
-
-    // ✨ نحسب الإجمالي الحقيقي من قاعدة البيانات لمقارنته بالمبلغ المصرح به
-    const { secureItems, serverTotal } = await prepareSecureItems(pool, parsedItems);
-    // ملاحظة: totalAmount هنا بالدينار الجزائري بينما serverTotal بالدولار —
-    // إذا عندك سعر صرف ثابت مستعمل في الواجهة الأمامية، طبقيه هنا قبل المقارنة.
-    // حالياً نكتفي بتخزين الإجمالي الحقيقي بالدولار في order_items لضمان صحة السجلات.
-
-    const orderResult = await pool.query(
-      `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, payment_status, receipt_url, user_id) 
-       VALUES ($1, $2, $3, $4, $5, 'pending', 'BaridiMob', 'Pending Review', $6, $7) RETURNING id`,
-      [customerName, customerPhone, customerEmail || 'manual@neo.com', fullShippingAddress, totalAmount, receiptUrl, optionalUser ? optionalUser.id : null]
-    );
-
-    const orderId = orderResult.rows[0].id;
-
-    for (const item of secureItems) {
-      await pool.query(
-        "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)",
-        [orderId, item.id, item.quantity, item.price, item.vid] // ✅ السعر الحقيقي من قاعدة البيانات
-      );
-    }
-
-    if (customerEmail && customerEmail !== 'manual@neo.com') {
-      const itemsForEmail = secureItems.map(it => ({ title: it.title, image_url: it.image_url, quantity: it.quantity, price_at_purchase: it.price }));
-      await sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, itemsForEmail);
-    }
-
-    await sendEmail({
-      to: process.env.BREVO_USER, 
-      subject: `🚨 New BaridiMob Order #${orderId} - Action Required`,
-      html: `<h2>New Manual Payment Received</h2>
-             <p>A new order has been placed and requires your verification.</p>
-             <p><strong>Customer:</strong> ${customerName}</p>
-             <p><strong>Phone:</strong> ${customerPhone}</p>
-             <p><strong>Declared total:</strong> ${totalAmount} DZD</p>
-             <p><strong>Calculated total (DB prices, USD):</strong> $${serverTotal}</p>
-             <p><a href="${receiptUrl}" target="_blank" style="background-color: #FF6B9D; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">View Receipt Image</a></p>
-             <p>Please log in to your admin panel to approve or reject this order.</p>`
-    });
-
-    res.json({ success: true, message: 'تم استلام طلبك وجاري مراجعته', orderId: orderId });
-  } catch (error) {
-    console.error('Manual Order Error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// دالة مساعدة لـ NowPayments
+// ترتيب الكائنات المساعدة لمطابقة توقيع NowPayments بدقة
 function sortObject(obj) {
   return Object.keys(obj).sort().reduce((result, key) => {
     if (obj[key] && typeof obj[key] === 'object' && !Array.isArray(obj[key])) {
@@ -454,10 +378,6 @@ function sortObject(obj) {
   }, {});
 }
 
-// ✨ Webhook الخاص بـ Crypto
-// ✨ دابا كنردو 200 لـ NowPayments فوراً بعد التحقق من التوقيع وتسجيل 'paid'،
-// ونديرو fulfillCJOrder فالخلفية — نفس السبب بالضبط ديال Paysera فوق.
-// NowPayments IPN عندها retry policy إذا ماوصلهاش 200 فوقت معقول.
 router.post('/crypto/callback', async (req, res) => {
   try {
     const ipnSecret = process.env.NOWPAYMENTS_IPN_SECRET;
@@ -474,25 +394,20 @@ router.post('/crypto/callback', async (req, res) => {
 
     const paymentData = req.body;
     if (paymentData.payment_status === 'finished' || paymentData.payment_status === 'confirmed') {
-      
       const orderId = paymentData.order_id; 
 
       const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
       if (orderRes.rows.length === 0) return res.status(404).send('Order not found');
 
-      // 🚨 تحديث ذري لمنع الـ Race Condition
       const updateRes = await pool.query(
-        "UPDATE orders SET status='paid', customer_email=$1 WHERE id=$2 AND status='pending' RETURNING *",
-        [paymentData.customer_email || orderRes.rows[0].customer_email, orderId]
+        "UPDATE orders SET status='paid', customer_email=COALESCE($1, customer_email) WHERE id=$2 AND status='pending' RETURNING *",
+        [paymentData.customer_email || null, orderId]
       );
 
       if (updateRes.rows.length > 0) {
         const updatedOrder = updateRes.rows[0];
-
-        // ✨ الرد فوراً على NowPayments بعد تسجيل الدفع
         res.status(200).send('OK');
 
-        // ✨ باقي المعالجة الثقيلة (CJ + الإيميل) فالخلفية
         (async () => {
           try {
             const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [orderId]);
@@ -503,10 +418,14 @@ router.post('/crypto/callback', async (req, res) => {
               phone: updatedOrder.customer_phone || '0000000000'
             };
 
-            await fulfillCJOrder(orderId, updatedOrder.customer_name, customerDetails, items);
+            const cjResponse = await fulfillCJOrder(orderId, updatedOrder.customer_name, customerDetails, items);
+
+            if (cjResponse && cjResponse.success) {
+              await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [orderId]);
+            }
 
             const finalEmail = paymentData.customer_email || updatedOrder.customer_email;
-            if (finalEmail) {
+            if (finalEmail && !finalEmail.includes('@laclarc.com') && !finalEmail.includes('@neo.com')) {
               await sendOrderConfirmationEmail(finalEmail, orderId, updatedOrder.total_amount, items);
             }
           } catch (bgErr) {
@@ -515,14 +434,74 @@ router.post('/crypto/callback', async (req, res) => {
         })();
         return;
       }
-      // إذا لم يتم تحديث أي صف (RETURNING * رجع فارغ)، معناها أنه تمت معالجته مسبقاً
-      res.status(200).send('OK');
-    } else {
-      res.status(200).send('OK');
     }
+    res.status(200).send('OK');
   } catch (error) {
-    console.error('NowPayments IPN Error:', error);
+    logger.logError('NowPayments IPN Error', error);
     res.status(500).send('Error');
+  }
+});
+
+// ==========================================
+// 4. BaridiMob / CCP (Manual Upload - Algeria)
+// ==========================================
+router.post('/manual', upload.single('receipt'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'يرجى رفع صورة الإيصال' });
+
+    const { totalAmount, items, customerName, customerPhone, customerAddress, customerEmail } = req.body;
+    const receiptUrl = req.file.path;
+    const fullShippingAddress = customerAddress || JSON.stringify({ line1: 'N/A', city: 'Algeria', state: 'N/A', postal_code: '00000', country: 'DZ' });
+    
+    const optionalUser = getOptionalUser(req); 
+
+    let parsedItems = [];
+    try {
+      parsedItems = typeof items === 'string' ? JSON.parse(items) : items;
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid items format' });
+    }
+
+    const { secureItems, serverTotal } = await prepareSecureItems(pool, parsedItems);
+
+    const orderResult = await pool.query(
+      `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, payment_status, receipt_url, user_id) 
+       VALUES ($1, $2, $3, $4, $5, 'pending', 'BaridiMob', 'Pending Review', $6, $7) RETURNING id`,
+      [customerName, customerPhone, customerEmail || 'manual@laclarc.com', fullShippingAddress, totalAmount, receiptUrl, optionalUser ? optionalUser.id : null]
+    );
+
+    const orderId = orderResult.rows[0].id;
+
+    for (const item of secureItems) {
+      await pool.query(
+        "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)",
+        [orderId, item.id, item.quantity, item.price, item.vid]
+      );
+    }
+
+    if (customerEmail && !customerEmail.includes('@laclarc.com')) {
+      const itemsForEmail = secureItems.map(it => ({ title: it.title, image_url: it.image_url, quantity: it.quantity, price_at_purchase: it.price }));
+      await sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, itemsForEmail);
+    }
+
+    // إشعار فوري للأدمن
+    await sendEmail({
+      to: process.env.BREVO_USER, 
+      subject: `🚨 New BaridiMob Order #${orderId} - Action Required`,
+      html: `<h2>New Manual Payment Received</h2>
+             <p>A new order has been placed via BaridiMob and requires verification.</p>
+             <p><strong>Customer:</strong> ${customerName}</p>
+             <p><strong>Phone:</strong> ${customerPhone}</p>
+             <p><strong>Declared Total:</strong> ${totalAmount} DZD</p>
+             <p><strong>DB Calculated (USD):</strong> $${serverTotal}</p>
+             <p><a href="${receiptUrl}" target="_blank" style="background-color: #FF6B9D; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">View Receipt Image</a></p>
+             <p>Please log in to your admin panel to approve or reject this order.</p>`
+    });
+
+    res.json({ success: true, message: 'تم استلام طلبك وجاري مراجعته', orderId: orderId });
+  } catch (error) {
+    logger.logError('Manual Order Error', error);
+    res.status(500).json({ error: error.message });
   }
 });
 

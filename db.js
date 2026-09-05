@@ -1,24 +1,49 @@
-// db.js
-// ✨ Pool واحد مشترك لكل التطبيق (server.js + services/*.js).
-// قبل، كل ملف (server.js, services/cjService.js, services/categoryService.js)
-// كان كيدير new Pool() ديالو بوحدو، يعني حتى لـ 50 اتصال (20+10+20) يقدر يتفتحو
-// فنفس الوقت لنفس الداتابيز. هذا يقدر يتجاوز الحد الأقصى ديال اتصالات كتوفرو
-// أغلب خطط Neon/Render، ويخلق أخطاء "too many clients already" تحت الضغط.
-// الحل: pool واحد يتصدر من هنا، وكلشي يستورده.
-
+// db.js - Laclarc Enterprise Database Connection
 require('dotenv').config();
 const { Pool } = require('pg');
 
+if (!process.env.DATABASE_URL) {
+  console.error('❌ FATAL: DATABASE_URL is not set in environment variables!');
+  process.exit(1);
+}
+
+// ✨ إعدادات متقدمة مخصصة لـ Neon Serverless + Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 20, // أقصى عدد اتصالات في نفس اللحظة لكامل التطبيق
-  idleTimeoutMillis: 30000, // إغلاق أي اتصال خامل بعد 30 ثانية
-  connectionTimeoutMillis: 5000 // مهلة الاتصال: إذا لم يتصل خلال 5 ثوانٍ، يرمي خطأ بدل أن يعلق السيرفر
+  ssl: {
+    rejectUnauthorized: false // مطلوب للاتصال السحابي الآمن مع Neon
+  },
+  max: 10, // 10 اتصالات تكفي لمعالجة آلاف الطلبات في Node.js وتمنع استنزاف موارد Neon
+  min: 2,  // إبقاء اتصالين جاهزين دائماً للاستجابة الفورية وتفادي بطء أول طلب
+  idleTimeoutMillis: 30000, // إغلاق الاتصال الخامل بعد 30 ثانية
+  connectionTimeoutMillis: 10000, // مهلة 10 ثوانٍ كافية لاستيقاظ Neon من وضع الـ Compute Suspend بأمان
+  keepAlive: true, // يمنع انقطاع الاتصال المفاجئ من جدار حماية Render
+  keepAliveInitialDelayMillis: 10000
 });
 
+// مراقبة الأخطاء الطارئة على الاتصالات الخاملة
 pool.on('error', (err) => {
-  console.error('❌ Unexpected PostgreSQL pool error:', err);
+  console.error('❌ Unexpected idle PostgreSQL client error:', err.message);
+  // لا نوقف السيرفر هنا، فالمكتبة ستستبدل الاتصال التالف تلقائياً
 });
+
+// فحص أولي عند الإقلاع
+pool.on('connect', () => {
+  // اتصال جديد تم تجهيزه بنجاح
+});
+
+// ✨ Graceful Shutdown: إغلاق اتصالات قاعدة البيانات بأمان تام عند إعادة تشغيل السيرفر أو عمل Deploy
+const cleanUp = async (signal) => {
+  console.log(`\n⏳ Received ${signal}. Draining DB connections gracefully...`);
+  try {
+    await pool.end();
+    console.log('✅ DB Pool closed cleanly.');
+  } catch (err) {
+    console.error('❌ Error closing DB pool:', err);
+  }
+};
+
+process.on('SIGINT', () => cleanUp('SIGINT'));
+process.on('SIGTERM', () => cleanUp('SIGTERM'));
 
 module.exports = pool;

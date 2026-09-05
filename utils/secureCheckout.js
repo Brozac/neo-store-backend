@@ -1,41 +1,70 @@
-// utils/secureCheckout.js
-// ✨ يمنع التلاعب بالأسعار والمتغيرات (variants) عند الدفع: يعيد حساب كل شيء
-// من قاعدة البيانات بدل الوثوق بأي قيمة قادمة من المتصفح (item.price / item.vid / totalAmount).
+// utils/secureCheckout.js - Laclarc Bank-Grade Secure Checkout
+// ✨ درع مالي محصن ضد: التلاعب بالأسعار، تفاوت أسعار المتغيرات، واستنزاف اتصالات قاعدة البيانات.
+
+const MAX_ITEM_QUANTITY = 50; // أقصى كمية مسموح بها للمنتج الواحد في الطلب الفردي
+
+// معادلة احتساب السعر الموحدة المطابقة لسياسة تسعير المتجر
+function calculateSellPrice(cost) {
+  const costNum = Number(cost) || 0;
+  if (costNum <= 0) return 9.99;
+  let sellingPrice = costNum <= 5 ? costNum * 3.5 : costNum <= 15 ? costNum * 2.8 : costNum <= 30 ? costNum * 2.2 : costNum * 1.8;
+  sellingPrice = Math.max(9.99, Math.floor(sellingPrice) - 0.01);
+  return parseFloat(sellingPrice.toFixed(2));
+}
 
 async function prepareSecureItems(pool, clientItems) {
   if (!clientItems || !Array.isArray(clientItems) || clientItems.length === 0) {
     throw new Error('Cart is empty');
   }
 
+  // 1. تنظيف ودمج المنتجات المكررة في السلة (Consolidation)
+  const consolidatedMap = new Map();
+  for (const item of clientItems) {
+    const rawId = parseInt(item.id, 10);
+    if (!rawId || isNaN(rawId) || rawId <= 0) continue;
+
+    const rawVid = item.vid ? String(item.vid).trim() : 'DEFAULT';
+    const rawQty = Math.min(MAX_ITEM_QUANTITY, Math.max(1, parseInt(item.quantity, 10) || 1));
+    const itemKey = `${rawId}_${rawVid}`;
+
+    if (consolidatedMap.has(itemKey)) {
+      const existing = consolidatedMap.get(itemKey);
+      existing.quantity = Math.min(MAX_ITEM_QUANTITY, existing.quantity + rawQty);
+    } else {
+      consolidatedMap.set(itemKey, { id: rawId, vid: item.vid || null, quantity: rawQty });
+    }
+  }
+
+  if (consolidatedMap.size === 0) {
+    throw new Error('No valid items found in the cart');
+  }
+
+  const itemsToProcess = Array.from(consolidatedMap.values());
+  const productIds = [...new Set(itemsToProcess.map(i => i.id))];
+
+  // 2. استعلام ذري سريع يحل مشكلة N+1 ويجلب كل المنتجات دفعة واحدة
+  const productRes = await pool.query(
+    `SELECT id, title, price, image_url, variants 
+     FROM products 
+     WHERE id = ANY($1::int[]) AND stock_status = true`,
+    [productIds]
+  );
+
+  if (productRes.rows.length === 0) {
+    throw new Error('Requested products are currently unavailable');
+  }
+
+  const productMap = new Map(productRes.rows.map(p => [p.id, p]));
   const secureItems = [];
   let serverTotal = 0;
 
-  for (const item of clientItems) {
-    // 1. نبحث عن المنتج في قاعدة البيانات باستخدام الـ ID فقط، ونجيب variants زادة
-    const productRes = await pool.query(
-      'SELECT id, title, price, image_url, variants FROM products WHERE id = $1 AND stock_status = true',
-      [item.id]
-    );
-
-    if (productRes.rows.length === 0) {
-      throw new Error(`Product ID ${item.id} not found or unavailable`);
+  // 3. التحقق من كل عنصر ومطابقة المتغيرات والتسعير
+  for (const item of itemsToProcess) {
+    const dbProduct = productMap.get(item.id);
+    if (!dbProduct) {
+      throw new Error(`Product #${item.id} is out of stock or does not exist`);
     }
 
-    const dbProduct = productRes.rows[0];
-
-    // 2. نأخذ السعر الحقيقي من قاعدة البيانات وليس من المتصفح
-    const realPrice = parseFloat(dbProduct.price);
-    const quantity = Math.max(1, parseInt(item.quantity) || 1);
-
-    // 3. ✨ إصلاح ثغرة أمنية حقيقية: نتحقق أن الـ vid (متغير المنتج: لون/مقاس) اللي
-    //    بعثو المتصفح ينتمي فعلاً لهاذ المنتج بالذات (item.id)، وماشي لمنتج آخر.
-    //
-    //    قبل هاذ الإصلاح: الكود كان كياخذ item.vid مباشرة من المتصفح بلا أي تحقق.
-    //    وحيت الطلب اللي كيتبعث لـ CJ (فـ fulfillCJOrder) فيه غير الـ vid بلا رقم
-    //    المنتج، زبون خبيث كان يقدر يخلص على منتج رخيص (item.id = منتج بـ $9.99)
-    //    ويبعث vid يخص منتج غالي بزاف عند CJ (بحال $80) — CJ توصل تشحن المنتج الغالي
-    //    والزبون خلص غير ثمن الرخيص. دابا: الـ vid لازم يكون موجود فعلاً فقائمة
-    //    variants ديال نفس المنتج المطلوب، وإلا كنرجعو لأول variant صالح فيه.
     let productVariants = [];
     if (dbProduct.variants) {
       try {
@@ -48,30 +77,50 @@ async function prepareSecureItems(pool, clientItems) {
     }
 
     let safeVid = null;
+    let finalItemPrice = parseFloat(dbProduct.price);
+
     if (Array.isArray(productVariants) && productVariants.length > 0) {
-      const requestedVid = item.vid;
-      const matchedVariant = requestedVid
-        ? productVariants.find((v) => String(v.vid) === String(requestedVid))
-        : null;
-      // إذا الـ vid المبعوث ماكانش صالح لهاذ المنتج، نرجعو لأول variant حقيقي فيه
-      safeVid = matchedVariant ? matchedVariant.vid : productVariants[0].vid;
+      const requestedVid = item.vid ? String(item.vid) : null;
+      let matchedVariant = null;
+
+      if (requestedVid) {
+        matchedVariant = productVariants.find(v => String(v.vid) === requestedVid);
+      }
+
+      // إذا لم يتطابق الـ vid الممرر، نعتمد أول variant شرعي للمنتج
+      if (!matchedVariant) {
+        matchedVariant = productVariants[0];
+      }
+
+      safeVid = matchedVariant.vid || null;
+
+      // ✨ حماية أرباح المتجر: إذا كان للمتغير سعر تكلفة أعلى في CJ، يتم اعتماد سعره الفعلي
+      if (matchedVariant.variantSellPrice) {
+        const variantCalculated = calculateSellPrice(matchedVariant.variantSellPrice);
+        if (variantCalculated > finalItemPrice) {
+          finalItemPrice = variantCalculated;
+        }
+      }
     }
 
-    // 4. نضرب السعر في الكمية لحساب الإجمالي الحقيقي
-    serverTotal += realPrice * quantity;
+    finalItemPrice = parseFloat(finalItemPrice.toFixed(2));
+    const lineTotal = finalItemPrice * item.quantity;
+    serverTotal += lineTotal;
 
-    // 5. نحفظ المنتج بالسعر والـ vid الحقيقيين (الاتنين من الداتابيز، ماشي من المتصفح)
     secureItems.push({
       id: dbProduct.id,
       title: dbProduct.title,
       image_url: dbProduct.image_url,
-      price: realPrice,
-      quantity,
+      price: finalItemPrice,
+      quantity: item.quantity,
       vid: safeVid
     });
   }
 
-  return { secureItems, serverTotal: parseFloat(serverTotal.toFixed(2)) };
+  return {
+    secureItems,
+    serverTotal: parseFloat(serverTotal.toFixed(2))
+  };
 }
 
 module.exports = { prepareSecureItems };

@@ -1,27 +1,29 @@
+// updatePrices.js - Laclarc Enterprise Price & Stock Synchronizer
 require('dotenv').config();
-const { Pool } = require('pg');
 const axios = require('axios');
+const pool = require('./db'); // ✨ استخدام الـ Pool الموحد (يحل مشكلة غياب SSL)
 const { cjRequest, parseNumeric } = require('./services/cjService');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+const { calculateSellingPrice } = require('./services/productImportService');
 
 async function updateProductPrices() {
-  console.log('🚀 Starting Price Update Process...');
+  console.log('\n==================================================');
+  console.log('🚀 Starting Enterprise Price & Stock Update...');
+  console.log('==================================================\n');
 
   try {
-    // 1. جلب جميع منتجات CJ الموجودة في قاعدة بياناتنا (باستثناء المنتجات اليدوية)
-    const dbProducts = await pool.query("SELECT id, cj_product_id, title FROM products WHERE cj_product_id NOT LIKE 'MANUAL_%'");
+    // 1. جلب المنتجات غير اليدوية النشطة
+    const dbProducts = await pool.query(
+      "SELECT id, cj_product_id, title, price FROM products WHERE cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%' ORDER BY id ASC"
+    );
+
+    console.log(`📊 Found ${dbProducts.rows.length} products to verify.\n`);
     let updatedCount = 0;
+    let outOfStockCount = 0;
 
-    console.log(`Found ${dbProducts.rows.length} products to check.`);
-
-    for (const dbProduct of dbProducts.rows) {
-      await new Promise(r => setTimeout(r, 1000)); // تأخير 1 ثانية لتجنب حظر CJ API
+    for (const [index, dbProduct] of dbProducts.rows.entries()) {
+      await new Promise(r => setTimeout(r, 1200)); // تأخير 1.2 ثانية لتفادي الـ QPS Limit
 
       try {
-        // 2. جلب السعر الحالي من CJ
         const detailRes = await cjRequest((token, config) =>
           axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', {
             ...config,
@@ -31,43 +33,45 @@ async function updateProductPrices() {
         );
 
         const details = detailRes.data?.data;
-        if (!details) continue;
 
-        const currentCJPrice = parseNumeric(details.sellPrice);
-        if (currentCJPrice <= 0) continue;
+        // ✨ فحص المخزون وتوفر الشحن العالمي
+        if (!details || details.isGlobalShipping === false) {
+          await pool.query("UPDATE products SET stock_status = false WHERE id = $1", [dbProduct.id]);
+          outOfStockCount++;
+          console.log(`🔻 [${index + 1}/${dbProducts.rows.length}] Marked Out of Stock: ${dbProduct.title.substring(0, 30)}`);
+          continue;
+        }
 
-        // 3. إعادة تطبيق خوارزمية التسعير التلقائي
-        let sellingPrice = 0;
-        if (currentCJPrice <= 5) sellingPrice = currentCJPrice * 3.5;
-        else if (currentCJPrice <= 15) sellingPrice = currentCJPrice * 2.8;
-        else if (currentCJPrice <= 30) sellingPrice = currentCJPrice * 2.2;
-        else sellingPrice = currentCJPrice * 1.8;
-        
-        sellingPrice = Math.floor(sellingPrice) - 0.01;
-        if (sellingPrice < 9.99) sellingPrice = 9.99;
-        
-        const safePrice = parseFloat(sellingPrice.toFixed(2));
-        const safeOriginalPrice = parseFloat((safePrice * 1.5).toFixed(2));
+        const cjCostPrice = parseNumeric(details.sellPrice);
+        if (cjCostPrice <= 0) continue;
 
-        // 4. تحديث السعر في قاعدة البيانات
+        // استخدام معادلة التسعير الموحدة
+        const { safePrice, safeOriginalPrice } = calculateSellingPrice(cjCostPrice);
+
+        // تحديث السعر والمخزون
         await pool.query(
-          "UPDATE products SET price = $1, original_price = $2 WHERE id = $3",
+          "UPDATE products SET price = $1, original_price = $2, stock_status = true WHERE id = $3",
           [safePrice, safeOriginalPrice, dbProduct.id]
         );
 
         updatedCount++;
-        console.log(`✅ Updated: ${dbProduct.title.substring(0, 30)} -> $${safePrice}`);
+        console.log(`✅ [${index + 1}/${dbProducts.rows.length}] Updated: ${dbProduct.title.substring(0, 30)} -> $${safePrice}`);
 
-      } catch (productErr) {
-        console.log(`⚠️ Failed to update product ${dbProduct.cj_product_id}`);
+      } catch (err) {
+        console.log(`⚠️ Skipped PID ${dbProduct.cj_product_id}: ${err.message}`);
       }
     }
 
-    console.log(`\n🎉 Price Update Complete! Successfully updated ${updatedCount} products.`);
-    process.exit(0);
+    console.log('\n==================================================');
+    console.log(`🎉 Sync Finished Successfully!`);
+    console.log(`Updated Prices: ${updatedCount}`);
+    console.log(`Marked Out-of-Stock: ${outOfStockCount}`);
+    console.log('==================================================\n');
   } catch (error) {
-    console.error('❌ Update Prices Error:', error.message);
-    process.exit(1);
+    console.error('❌ Fatal error in Update Prices:', error.message);
+  } finally {
+    await pool.end();
+    process.exit(0);
   }
 }
 
