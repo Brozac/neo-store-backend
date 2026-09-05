@@ -1730,6 +1730,14 @@ cron.schedule('0 * * * *', async () => {
     isSweeping = false;
   }
 });
+// ✨ كرون يمنع Neon من النوم (Scale to Zero) كل 4 دقائق
+cron.schedule('*/4 * * * *', async () => {
+  try {
+    await pool.query('SELECT 1');
+  } catch (err) {
+    console.error('Neon keep-alive error:', err.message);
+  }
+});
 
 // ==========================================
 // 404 ومعالجة الأخطاء
