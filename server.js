@@ -1747,7 +1747,95 @@ cron.schedule('*/4 * * * *', async () => {
     console.error('Neon keep-alive error:', err.message);
   }
 });
+// ==========================================
+// 🛒 8. كرون استرجاع السلات المتروكة (Abandoned Cart Recovery)
+// يعمل كل ساعتين لإرسال إيميل تذكيري مع كوبون خصم للزبائن المترددين
+// ==========================================
+cron.schedule('0 */2 * * *', async () => {
+  console.log('⏳ [Abandoned Cart] Checking for abandoned checkouts...');
+  try {
+    const { rows: abandonedOrders } = await pool.query(`
+      SELECT id, customer_name, customer_email, total_amount, created_at 
+      FROM orders 
+      WHERE status = 'pending' 
+        AND customer_email IS NOT NULL 
+        AND customer_email NOT LIKE '%@neo.com' 
+        AND customer_email NOT LIKE '%@laclarc.com'
+        AND created_at BETWEEN NOW() - INTERVAL '6 hours' AND NOW() - INTERVAL '2 hours'
+        AND receipt_url IS NULL
+      LIMIT 10;
+    `);
 
+    if (abandonedOrders.length === 0) return;
+
+    for (const order of abandonedOrders) {
+      // جلب صور وعناوين المنتجات المتروكة
+      const itemsRes = await pool.query(`
+        SELECT p.title, p.image_url, oi.price_at_purchase, oi.quantity 
+        FROM order_items oi 
+        JOIN products p ON oi.product_id = p.id 
+        WHERE oi.order_id = $1
+      `, [order.id]);
+
+      const items = itemsRes.rows;
+      if (items.length === 0) continue;
+
+      const itemsListHtml = items.map(item => `
+        <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 12px; padding: 10px; background: #fff; border-radius: 8px;">
+          <img src="${item.image_url || 'https://laclarc.com/icon-192.png'}" style="width: 55px; height: 55px; object-fit: cover; border-radius: 6px;" />
+          <div>
+            <p style="margin: 0; font-weight: bold; color: #1D1E3C; font-size: 13px;">${item.title}</p>
+            <p style="margin: 2px 0 0; color: #FF6B9D; font-weight: bold; font-size: 12px;">Qty: ${item.quantity} &bull; $${Number(item.price_at_purchase).toFixed(2)}</p>
+          </div>
+        </div>
+      `).join('');
+
+      const recoveryHtml = `
+        <div style="font-family: Arial, sans-serif; max-width: 550px; margin: 0 auto; background: #F9F8FC; padding: 25px; border-radius: 16px; border: 1px solid #E5E7EB;">
+          <div style="text-align: center; margin-bottom: 20px;">
+            <h1 style="color: #1D1E3C; margin: 0; font-size: 26px;">Laclarc</h1>
+            <p style="color: #8B78C6; font-weight: bold; font-size: 13px; margin: 4px 0 0;">Did you leave something behind?</p>
+          </div>
+          
+          <p style="color: #4B5563; font-size: 14px; line-height: 1.6;">
+            Hello <strong>${order.customer_name || 'there'}</strong>,<br>
+            Your curated items are still safely reserved in your bag, but limited flash inventory is selling out fast!
+          </p>
+
+          <div style="margin: 20px 0;">
+            ${itemsListHtml}
+          </div>
+
+          <div style="background: #FFF; border: 2px dashed #8B78C6; padding: 15px; border-radius: 12px; text-align: center; margin-bottom: 25px;">
+            <p style="margin: 0 0 5px; color: #1D1E3C; font-size: 12px; font-weight: bold;">USE THIS EXCLUSIVE 10% RECOVERY DISCOUNT:</p>
+            <span style="display: inline-block; background: #8B78C6; color: #fff; padding: 6px 16px; border-radius: 6px; font-weight: bold; font-size: 15px; letter-spacing: 1px;">RECOVER10</span>
+          </div>
+
+          <div style="text-align: center;">
+            <a href="${process.env.FRONTEND_URL || 'https://laclarc.com'}/cart" style="display: inline-block; background: #1D1E3C; color: #fff; padding: 14px 32px; border-radius: 30px; font-weight: bold; text-decoration: none; font-size: 14px;">
+              Complete My Order Now &rarr;
+            </a>
+          </div>
+
+          <p style="text-align: center; color: #9CA3AF; font-size: 11px; margin-top: 25px;">
+            Free Worldwide Insured Shipping &bull; 30-Day Money Back Guarantee
+          </p>
+        </div>
+      `;
+
+      await sendEmail({
+        to: order.customer_email,
+        subject: `Exclusive 10% OFF: Complete your order #${order.id} at Laclarc`,
+        html: recoveryHtml
+      });
+
+      console.log(`📧 [Abandoned Cart] Recovery email dispatched to ${order.customer_email} for Order #${order.id}`);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  } catch (err) {
+    console.error('❌ [Abandoned Cart] Error:', err.message);
+  }
+});
 // ==========================================
 // 404 ومعالجة الأخطاء
 // ==========================================
