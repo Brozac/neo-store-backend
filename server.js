@@ -31,7 +31,7 @@ const cookieParser = require('cookie-parser');
 app.set('trust proxy', 1);
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
 app.use(cookieParser());
-
+app.use(require('./routes/paymentGateways'));
 // Rate Limiters
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { message: 'Too many attempts, please try again after 15 minutes.' } });
 const couponLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts, please try again later.' } });
