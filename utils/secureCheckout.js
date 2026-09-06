@@ -11,19 +11,16 @@ function calculateSellPrice(cost) {
   sellingPrice = Math.max(9.99, Math.floor(sellingPrice) - 0.01);
   return parseFloat(sellingPrice.toFixed(2));
 }
-// دالة خصم الكمية التلقائي للباقات (Tiered Pricing)
+
+// ✨ دالة خصم الكمية التلقائي للباقات (Tiered Pricing)
 function applyTieredDiscount(price, quantity) {
   if (quantity >= 3) {
     return price * 0.75; // خصم 25% لـ 3 قطع فما فوق
   } else if (quantity >= 2) {
     return price * 0.85; // خصم 15% لقطعتين
   }
-  return price;
+  return price; // بدون خصم لقطعة واحدة
 }
-// استبدال حساب السعر النهائي لدعم خصم الكمية:
-const discountedUnitPrice = applyTieredDiscount(finalItemPrice, item.quantity);
-const lineTotal = discountedUnitPrice * item.quantity;
-serverTotal += lineTotal;
 
 async function prepareSecureItems(pool, clientItems) {
   if (!clientItems || !Array.isArray(clientItems) || clientItems.length === 0) {
@@ -117,14 +114,17 @@ async function prepareSecureItems(pool, clientItems) {
     }
 
     finalItemPrice = parseFloat(finalItemPrice.toFixed(2));
-    const lineTotal = finalItemPrice * item.quantity;
+
+    // ✨ تطبيق خصم الكمية (Tiered Discount) داخل الحلقة
+    const discountedUnitPrice = applyTieredDiscount(finalItemPrice, item.quantity);
+    const lineTotal = discountedUnitPrice * item.quantity;
     serverTotal += lineTotal;
 
     secureItems.push({
       id: dbProduct.id,
       title: dbProduct.title,
       image_url: dbProduct.image_url,
-      price: finalItemPrice,
+      price: parseFloat(discountedUnitPrice.toFixed(2)), // ✨ نمرر السعر المخفض للقطعة الواحدة
       quantity: item.quantity,
       vid: safeVid
     });
