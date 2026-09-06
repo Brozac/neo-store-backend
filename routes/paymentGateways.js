@@ -1,49 +1,44 @@
 const express = require('express');
 const router = express.Router();
-const pool = require('../db'); // adapte le chemin vers ton pool pg existant
+const pool = require('../db');
 const requireAdmin = require('../middleware/requireAdmin');
 
-// Cache mémoire simple pour éviter de taper la DB à chaque ouverture du modal checkout
 let gatewaysCache = null;
 let cacheExpiry = 0;
-const CACHE_TTL_MS = 30_000;
 
 async function getGatewaysFromDb() {
-  const { rows } = await pool.query(
-    'SELECT gateway_key, display_name, enabled FROM payment_gateways ORDER BY id ASC'
-  );
+  const { rows } = await pool.query('SELECT gateway_key, display_name, enabled FROM payment_gateways ORDER BY id ASC');
   return rows;
 }
 
-// GET public — consommé par PaymentModal.tsx côté storefront
+// GET public
 router.get('/api/payment/gateways', async (req, res) => {
   try {
     const now = Date.now();
     if (!gatewaysCache || now > cacheExpiry) {
       gatewaysCache = await getGatewaysFromDb();
-      cacheExpiry = now + CACHE_TTL_MS;
+      cacheExpiry = now + 30000;
     }
     const enabledKeys = gatewaysCache.filter(g => g.enabled).map(g => g.gateway_key);
     res.json({ enabled: enabledKeys });
   } catch (err) {
-    console.error('Error fetching payment gateways:', err);
-    // Fail-open : si la DB tombe, on affiche tout plutôt que de bloquer le checkout
     res.json({ enabled: ['stripe', 'paysera', 'crypto', 'baridimob'] });
   }
 });
 
-// GET admin — liste complète avec statut, pour la page settings
+// GET admin
 router.get('/api/admin/payment-gateways', requireAdmin, async (req, res) => {
   try {
     const rows = await getGatewaysFromDb();
-    res.json({ gateways: rows });
+    // ✨ نرجع المصفوفة مباشرة لتتطابق مع الواجهة الأمامية
+    res.json(rows); 
   } catch (err) {
     console.error('Error fetching admin payment gateways:', err);
     res.status(500).json({ error: 'Failed to fetch payment gateways.' });
   }
 });
 
-// PATCH admin — toggle une gateway
+// PATCH admin
 router.patch('/api/admin/payment-gateways/:key', requireAdmin, async (req, res) => {
   const { key } = req.params;
   const { enabled } = req.body;
@@ -62,9 +57,8 @@ router.patch('/api/admin/payment-gateways/:key', requireAdmin, async (req, res) 
       return res.status(404).json({ error: 'Payment gateway not found.' });
     }
 
-    gatewaysCache = null; // invalide le cache public direct
-
-    res.json({ success: true, gateway: rows[0] });
+    gatewaysCache = null;
+    res.json(rows[0]);
   } catch (err) {
     console.error('Error updating payment gateway:', err);
     res.status(500).json({ error: 'Failed to update payment gateway.' });
