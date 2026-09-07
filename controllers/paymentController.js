@@ -344,13 +344,14 @@ router.post('/crypto', async (req, res) => {
     }
 
     const apiUrl = 'https://api.nowpayments.io/v1/invoice';
-    const response = await axios.post(apiUrl, {
+    // نمرر order_id في رابط النجاح لكي تقرأه صفحة /success لحظياً
+    const response = await axios.post('https://api.nowpayments.io/v1/invoice', {
       price_amount: serverTotal,
       price_currency: 'usd',
       order_id: orderId.toString(), 
       order_description: `Laclarc Order #${orderId}`,
       ipn_callback_url: `${process.env.BACKEND_URL}/api/payment/crypto/callback`,
-      success_url: `${process.env.FRONTEND_URL}/success?method=crypto`,
+      success_url: `${process.env.FRONTEND_URL}/success?method=crypto&order_id=${orderId}`,
       cancel_url: `${process.env.FRONTEND_URL}/cart`,
     }, {
       headers: { 
@@ -358,6 +359,13 @@ router.post('/crypto', async (req, res) => {
         'Content-Type': 'application/json' 
       }
     });
+    
+    // حفظ معرف الجلسة/الفاتورة
+    if (response.data.id) {
+      await pool.query("UPDATE orders SET receipt_url = $1 WHERE id = $2", [response.data.id.toString(), orderId]);
+    }
+    
+    res.json({ url: response.data.invoice_url });
     
     res.json({ url: response.data.invoice_url });
   } catch (error) {
@@ -504,5 +512,112 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+// ==========================================
+// ⚡ مسار التحقق المالي اللحظي للكريبتو (JIT NowPayments Verifier)
+// يستجوب خوادم NowPayments مباشرة لمعرفة حالة تأكيد البلوكتشين فوراً
+// ==========================================
+router.post('/crypto/verify', async (req, res) => {
+  const { order_id } = req.body;
 
+  if (!order_id) {
+    return res.status(400).json({ success: false, error: 'Order ID is required' });
+  }
+
+  try {
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [order_id]);
+    if (orderRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
+    }
+
+    const order = orderRes.rows[0];
+
+    // إذا كان الطلب قد تمت معالجته بالفعل مسبقاً
+    if (order.status === 'paid' || order.status === 'completed' || order.status === 'fulfilled') {
+      return res.json({
+        success: true,
+        verified: true,
+        orderId: order.id,
+        amount: order.total_amount,
+        status: order.status
+      });
+    }
+
+    // 1. استجواب NowPayments مباشرة عبر الـ API بالـ order_id
+    // نجلب قائمة المدفوعات التابعة لهذا الطلب
+    const npRes = await axios.get(`https://api.nowpayments.io/v1/payment/?order_id=${order_id}&limit=1`, {
+      headers: { 'x-api-key': process.env.NOWPAYMENTS_API_KEY }
+    });
+
+    const paymentData = npRes.data?.data?.[0];
+
+    // 2. فحص حالة الدفع في البلوكتشين
+    const isPaid = paymentData && (
+      paymentData.payment_status === 'finished' || 
+      paymentData.payment_status === 'confirmed' || 
+      paymentData.payment_status === 'sending'
+    );
+
+    if (isPaid) {
+      // 3. قفل ذري فوري للطلب
+      const updateRes = await pool.query(
+        "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING id",
+        [order_id]
+      );
+
+      // 4. إرسال الطلب لـ CJ Dropshipping في نفس اللحظة
+      if (updateRes.rows.length > 0) {
+        console.log(`⚡ [Crypto JIT] Order #${order_id} verified via Blockchain! Fulfilling to CJ...`);
+
+        (async () => {
+          try {
+            const itemsRes = await pool.query(`
+              SELECT oi.*, p.title, p.image_url 
+              FROM order_items oi 
+              LEFT JOIN products p ON oi.product_id = p.id 
+              WHERE oi.order_id = $1
+            `, [order_id]);
+
+            const customerDetails = {
+              address: { line1: order.shipping_address || 'Online Purchase', country: 'US' },
+              phone: order.customer_phone || '1234567890'
+            };
+
+            const cjResponse = await fulfillCJOrder(order.id, order.customer_name, customerDetails, itemsRes.rows);
+            if (cjResponse && cjResponse.success) {
+              await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [order.id]);
+            }
+
+            if (order.customer_email && !order.customer_email.includes('@laclarc.com')) {
+              await sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, itemsRes.rows);
+            }
+          } catch (bgErr) {
+            logger.logError('Crypto JIT Fulfillment Error', bgErr);
+          }
+        })();
+      }
+
+      return res.json({
+        success: true,
+        verified: true,
+        orderId: order.id,
+        amount: order.total_amount,
+        status: 'paid'
+      });
+    } else {
+      // الدفع ما زال قيد انتظار تأكيدات الشبكة (Confirming)
+      return res.json({
+        success: true,
+        verified: false,
+        orderId: order.id,
+        amount: order.total_amount,
+        status: paymentData?.payment_status || 'waiting',
+        message: 'Transaction detected on blockchain, awaiting network confirmations.'
+      });
+    }
+
+  } catch (error) {
+    logger.logError('Crypto JIT Error', error.response?.data || error.message);
+    res.status(500).json({ success: false, error: 'Failed to verify crypto payment' });
+  }
+});
 module.exports = router;
