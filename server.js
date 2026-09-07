@@ -1213,6 +1213,106 @@ app.post('/api/create-checkout-session', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// ==========================================
+// ⚡ مسار التحقق المالي اللحظي JIT (Just-In-Time Stripe Verifier)
+// يستجوب خوادم Stripe مباشرة في الوقت الفعلي قبل إطلاق أي شحنة لـ CJ
+// ==========================================
+app.post('/api/payment/verify-session', async (req, res) => {
+  const { session_id } = req.body;
+
+  if (!session_id || typeof session_id !== 'string') {
+    return res.status(400).json({ success: false, error: 'Session ID is required' });
+  }
+
+  try {
+    // 1. استجواب مباشر وفوري لخوادم Stripe (JIT API Call)
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+
+    if (!session || !session.metadata?.orderId) {
+      return res.status(404).json({ success: false, error: 'Invalid checkout session' });
+    }
+
+    const orderId = parseInt(session.metadata.orderId, 10);
+
+    // 2. التحقق الجازم: هل تم الدفع بنجاح 100% في Stripe؟
+    if (session.payment_status !== 'paid') {
+      return res.status(400).json({ 
+        success: false, 
+        status: 'unpaid', 
+        message: 'Payment has not been completed or was declined by the bank.' 
+      });
+    }
+
+    const customerName = session.customer_details?.name || 'Valued Customer';
+    const customerEmail = session.customer_details?.email || '';
+    const customerPhone = session.customer_details?.phone || '';
+    const addr = session.customer_details?.address;
+    const shippingAddress = addr 
+      ? JSON.stringify(addr) 
+      : JSON.stringify({ line1: 'Online Store Purchase', country: 'US' });
+    const paidAmount = session.amount_total / 100;
+
+    // 3. قفل ذري (Atomic Lock): إذا كان الطلب ما زال pending يتم تحويله لـ paid فوراً
+    const updateRes = await pool.query(
+      `UPDATE orders 
+       SET customer_name = $1, customer_email = $2, customer_phone = $3, 
+           shipping_address = $4, total_amount = $5, payment_method = 'Stripe', 
+           status = 'paid' 
+       WHERE id = $6 AND status = 'pending' 
+       RETURNING id`,
+      [customerName, customerEmail, customerPhone, shippingAddress, paidAmount, orderId]
+    );
+
+    // جلب بيانات وعناصر الطلب
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    const fullOrder = orderRes.rows[0];
+
+    const itemsRes = await pool.query(`
+      SELECT oi.*, p.title, p.image_url 
+      FROM order_items oi 
+      LEFT JOIN products p ON oi.product_id = p.id 
+      WHERE oi.order_id = $1
+    `, [orderId]);
+    const items = itemsRes.rows;
+
+    // 4. إذا أمسكنا بالطلب (لم يسبقنا الـ Webhook)، نرسله لـ CJ فوراً في الخلفية
+    if (updateRes.rows.length > 0) {
+      console.log(`⚡ [JIT Verification] Order #${orderId} verified with Stripe! Fulfilling to CJ immediately...`);
+
+      (async () => {
+        try {
+          const cjResponse = await fulfillCJOrder(orderId, customerName, session.customer_details, items);
+          if (cjResponse && cjResponse.success) {
+            await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [orderId]);
+          }
+          if (customerEmail) {
+            sendOrderConfirmationEmail(customerEmail, orderId, paidAmount, items)
+              .catch(err => logger.logError('JIT Email Dispatch', err));
+          }
+        } catch (bgErr) {
+          logger.logError('JIT Background CJ Fulfillment', bgErr);
+        }
+      })();
+    } else {
+      console.log(`ℹ️ [JIT Verification] Order #${orderId} was already locked/processed by Webhook.`);
+    }
+
+    // 5. إرجاع النتيجة الفورية للواجهة لتأكيد الدفع والمبلغ الحقيقي
+    res.json({
+      success: true,
+      verified: true,
+      orderId: fullOrder.id,
+      amount: paidAmount,
+      currency: session.currency?.toUpperCase() || 'USD',
+      customerEmail: fullOrder.customer_email,
+      status: fullOrder.status
+    });
+
+  } catch (error) {
+    logger.logError('JIT Stripe Verification Error', error);
+    res.status(500).json({ success: false, error: 'Failed to verify payment with Stripe' });
+  }
+});
 
 // ==========================================
 // مسارات تفاصيل وتتبع الطلبات (محمية من IDOR)
