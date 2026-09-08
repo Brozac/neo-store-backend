@@ -1536,6 +1536,52 @@ app.put('/api/admin/update-category/:id', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+// ==========================================
+// ✨ مسارات إدارة الإعدادات والريلز
+// ==========================================
+
+// GET: جلب الإعدادات
+app.get('/api/settings', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT key, value FROM store_settings');
+    // تحويل المصفوفة إلى كائن (Object) لسهولة الاستخدام في الواجهة
+    const settings = rows.reduce((acc, row) => {
+      acc[row.key] = row.value === 'true';
+      return acc;
+    }, {});
+    res.json(settings);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PUT: تحديث إعداد معين (مثل إظهار/إخفاء الريلز)
+app.put('/api/admin/settings/:key', async (req, res) => {
+  const { key } = req.params;
+  const { value } = req.body; // true أو false
+
+  try {
+    await pool.query(
+      'INSERT INTO store_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2',
+      [key, String(value)]
+    );
+    res.json({ success: true, message: 'Setting updated successfully' });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE: حذف فيديو منتج معين (تحويل video_url إلى فارغ)
+app.delete('/api/admin/videos/:productId', async (req, res) => {
+  try {
+    const { productId } = req.params;
+    await pool.query('UPDATE products SET video_url = NULL WHERE id = $1', [productId]);
+    clearProductsCache();
+    res.json({ success: true, message: 'Video deleted successfully. Product remains in store.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 app.put('/api/admin/update-product/:id', async (req, res) => {
   try {
