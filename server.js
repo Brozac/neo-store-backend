@@ -658,60 +658,60 @@ app.post('/api/admin/sync-videos', requireAdmin, async (req, res) => {
 });
 
 async function runCjVideoSync() {
-  const pagesToFetch = 5;
+  const pagesToFetch = 15; // زيادة الصفحات إلى 15 (300 منتج) للبحث الشامل
   const pageSize = 20;
   let importedCount = 0;
   let checkedCount = 0;
 
-  const keywordsToSearch = ['shaver', 'clipper', 'trimmer', 'grooming'];
+  console.log('⏳ [CJ Video Sync] Starting comprehensive search for video products...');
 
-  console.log('⏳ [CJ Video Sync] Starting search using productImportService...');
+  for (let pageNum = 1; pageNum <= pagesToFetch; pageNum++) {
+    // ✨ البحث الشامل (Trending) بدون كلمات مفتاحية
+    const params = { pageNum, pageSize, searchType: 2 };
 
-  for (const keyword of keywordsToSearch) {
-    console.log(`🔍 [CJ Video Sync] Searching keyword: ${keyword}...`);
-    
-    for (let pageNum = 1; pageNum <= pagesToFetch; pageNum++) {
-      const params = { pageNum, pageSize, productNameEn: keyword };
+    const listRes = await cjRequest((token, config) =>
+      axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list', { ...config, headers: { 'CJ-Access-Token': token }, params })
+    );
 
-      const listRes = await cjRequest((token, config) =>
-        axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list', { ...config, headers: { 'CJ-Access-Token': token }, params })
-      );
+    const cjProducts = listRes.data?.data?.list || [];
+    if (cjProducts.length === 0) {
+      console.log('🏁 [CJ Video Sync] No more products found on CJ.');
+      break;
+    }
 
-      const cjProducts = listRes.data?.data?.list || [];
-      if (cjProducts.length === 0) break;
+    console.log(`📄 [CJ Video Sync] Scanning page ${pageNum}/${pagesToFetch}...`);
 
-      for (const cjItem of cjProducts) {
-        await new Promise(r => setTimeout(r, 1000)); // احترام Rate Limit
-        const productId = cjItem.pid ? String(cjItem.pid) : null;
-        if (!productId) continue;
+    for (const cjItem of cjProducts) {
+      await new Promise(r => setTimeout(r, 1000)); // احترام Rate Limit
+      const productId = cjItem.pid ? String(cjItem.pid) : null;
+      if (!productId) continue;
 
-        checkedCount++;
-        try {
-          // 1. جلب تفاصيل المنتج أولاً
-          const detailRes = await cjRequest((token, config) =>
-            axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { ...config, headers: { 'CJ-Access-Token': token }, params: { pid: productId } })
-          );
+      checkedCount++;
+      try {
+        // 1. جلب تفاصيل المنتج (مع تفعيل خيار الفيديو)
+        const detailRes = await cjRequest((token, config) =>
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { 
+            ...config, 
+            headers: { 'CJ-Access-Token': token }, 
+            params: { pid: productId, features: 'enable_video' } 
+          })
+        );
 
-          const details = detailRes.data?.data;
-          if (!details) continue;
+        const details = detailRes.data?.data;
+        if (!details) continue;
 
-          // 2. بناء صف المنتج باستخدام الخدمة الموحدة (مع تفعيل خيار جلب الفيديو)
-          const productRow = await buildProductRow(details, { fetchVideo: true, isSourced: false });
+        // 2. بناء صف المنتج باستخدام الخدمة الموحدة
+        const productRow = await buildProductRow(details, { fetchVideo: true, isSourced: false });
 
-          // 3. إذا لم ينجح في بناء الصف (لأنه غير مؤهل أو لم يجد فيديو)، يتخطاه
-          if (!productRow || !productRow.video_url) {
-            continue;
-          }
-
-          // 4. إدخال المنتج في قاعدة البيانات باستخدام الخدمة الموحدة
+        // 3. إذا نجح في بناء الصف ووجد فيديو، يقوم بإدخاله
+        if (productRow && productRow.video_url) {
           await upsertProductRow(pool, productRow);
-
           importedCount++;
           console.log(`🎥 [Video Sync] Imported video product: ${productRow.title}`);
-          
-        } catch (productErr) {
-          console.log(`⚠️ [Video Sync] Skipped ${productId} due to error.`);
         }
+        
+      } catch (productErr) {
+        // تجاهل الأخطاء الفردية
       }
     }
   }
@@ -1751,6 +1751,57 @@ cron.schedule('0 3 * * *', async () => {
     console.log('✅ [Auto-Cron] Daily product update completed!');
   } catch (err) {
     console.error('❌ [Auto-Cron] Error updating products:', err.message);
+  }
+});
+// ==========================================
+// 🔄 10. كرون تحديث أسعار ومقاسات المتغيرات (Variant Price Sync)
+// يعمل يومياً الساعة 2:30 صباحاً (قبل كرون تحديث المنتجات الرئيسي)
+// يستخدم نقطة variant/query السريعة لتوفير طلبات API
+// ==========================================
+cron.schedule('30 2 * * *', async () => {
+  console.log('⏳ [Variant Sync] Starting daily variant price update...');
+  try {
+    // جلب 100 منتج عشوائي لتحديث متغيراتها
+    const { rows } = await pool.query("SELECT id, cj_product_id, variants FROM products WHERE cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%' ORDER BY random() LIMIT 100");
+    
+    let updatedCount = 0;
+
+    for (const p of rows) {
+      try {
+        await new Promise(r => setTimeout(r, 1200)); // احترام Rate Limit (QPS=1)
+
+        // 1. استدعاء نقطة variant/query السريعة
+        const variantRes = await cjRequest((token, config) =>
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/variant/query', { 
+            ...config, 
+            headers: { 'CJ-Access-Token': token }, 
+            params: { pid: p.cj_product_id } 
+          })
+        );
+
+        const cjVariants = variantRes.data?.data;
+        
+        // 2. التحقق من وجود متغيرات صالحة
+        if (Array.isArray(cjVariants) && cjVariants.length > 0) {
+          
+          // 3. تحديث حقل variants في قاعدة البيانات بالبيانات الجديدة (الأسعار والمقاسات)
+          // ملاحظة: نحتفظ بنفس الهيكل الذي تتوقعه دالة prepareSecureItems
+          await pool.query(
+            "UPDATE products SET variants = $1 WHERE id = $2",
+            [JSON.stringify(cjVariants), p.id]
+          );
+          
+          updatedCount++;
+        }
+      } catch (e) {
+        // تجاهل الأخطاء الفردية لمنع توقف الكرون بالكامل
+      }
+    }
+
+    clearProductsCache();
+    console.log(`✅ [Variant Sync] Daily variant update completed! Updated variants for ${updatedCount} products.`);
+  } catch (err) {
+    console.error('❌ [Variant Sync] Error updating variants:', err.message);
   }
 });
 
