@@ -61,7 +61,9 @@ async function fetchProductVideoUrl(productId) {
         { ...config, headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' }, timeout: 8000 }
       )
     );
-    if (videoRes.data?.code === 200 && Array.isArray(videoRes.data?.data) && videoRes.data.data.length > 0) {
+    // ✨ CJ API ترجع code: 0 عند النجاح لهذه النقطة بالذات (وليس 200)
+    const isSuccess = videoRes.data?.code === 0 || videoRes.data?.code === 200 || videoRes.data?.success === true;
+    if (isSuccess && Array.isArray(videoRes.data?.data) && videoRes.data.data.length > 0) {
       return videoRes.data.data[0].videoUrl || '';
     }
   } catch (e) {
@@ -111,8 +113,25 @@ async function buildProductRow(details, options = {}) {
     safeImages = [details.bigImage];
   }
 
-  // جلب الفيديو عند الحاجة فقط
-  const videoUrl = fetchVideo ? await fetchProductVideoUrl(details.pid) : '';
+  // جلب الفيديو عند الحاجة فقط بناءً على وثيقة CJ الرسمية
+  let videoUrl = '';
+  if (fetchVideo) {
+    // ✨ حقل productVideo يرجع فقط إذا مررنا features=enable_video في الاستعلام
+    if (Array.isArray(details.productVideo) && details.productVideo.length > 0) {
+      // نأخذ أول فيديو من القائمة (قد يكون رابطاً أو كائناً يحتوي على الرابط)
+      const firstVideo = details.productVideo[0];
+      if (typeof firstVideo === 'string' && firstVideo.startsWith('http')) {
+        videoUrl = firstVideo;
+      } else if (firstVideo && typeof firstVideo === 'object' && firstVideo.videoUrl) {
+        videoUrl = firstVideo.videoUrl;
+      }
+    }
+    
+    // كخطة بديلة: إذا لم نجد الرابط في productVideo، نبحث في نقطة الفيديوهات المخصصة
+    if (!videoUrl) {
+      videoUrl = await fetchProductVideoUrl(details.pid);
+    }
+  }
 
   // ✨ تأمين طول العنوان لمنع تجاوز VARCHAR(255)
   const safeTitle = (details.productNameEn || 'Premium Product').trim().slice(0, 250);

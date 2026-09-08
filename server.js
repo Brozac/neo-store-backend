@@ -605,8 +605,13 @@ app.post('/api/admin/backfill-categories', async (req, res) => {
       for (const p of rows) {
         try {
           await new Promise((r) => setTimeout(r, 1200));
+        // 1. جلب تفاصيل المنتج أولاً (مع تفعيل جلب الفيديو حسب وثيقة CJ الرسمية)
           const detailRes = await cjRequest((token, config) =>
-            axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { ...config, headers: { 'CJ-Access-Token': token }, params: { pid: p.cj_product_id } })
+            axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { 
+              ...config, 
+              headers: { 'CJ-Access-Token': token }, 
+              params: { pid: productId, features: 'enable_video' } 
+            })
           );
 
           const details = detailRes.data?.data;
