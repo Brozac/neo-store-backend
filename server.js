@@ -16,7 +16,7 @@ const rateLimit = require('express-rate-limit');
 const { fulfillCJOrder, getCJToken, cjRequest, parseNumeric } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const logger = require('./logger');
-
+const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
 const multer = require('multer');
 const path = require('path');
 const cloudinary = require('cloudinary').v2;
@@ -381,20 +381,42 @@ app.post('/api/admin/add-review', async (req, res) => {
   }
 });
 
+// ==========================================
+// مسار إضافة تقييم معتمد من مستخدم مسجل (مع دعم رفع الصور)
+// ==========================================
 app.post('/api/reviews/add', authenticateToken, async (req, res) => {
   try {
-    const { product_id, rating, content, country } = req.body;
-    if (!product_id || !content) return res.status(400).json({ error: 'Product ID and content are required' });
+    const { product_id, rating, content, country, images } = req.body;
+    const userId = req.user.id;
+    const userName = req.user.name;
+
+    if (!product_id || !content) {
+      return res.status(400).json({ error: 'Product ID and content are required' });
+    }
+
+    // تنقية وتأمين مصفوفة صور Cloudinary المرفوعة
+    const safeImages = Array.isArray(images) 
+      ? images.filter(url => typeof url === 'string' && url.startsWith('http')) 
+      : [];
 
     await pool.query(
-      'INSERT INTO reviews (product_id, author, user_id, rating, content, country) VALUES ($1, $2, $3, $4, $5, $6)',
-      [product_id, req.user.name, req.user.id, rating || 5, content, country || 'United States']
+      `INSERT INTO reviews (product_id, author, user_id, rating, content, country, images) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        product_id, 
+        userName, 
+        userId, 
+        rating || 5, 
+        content.trim(), 
+        country || 'United States',
+        safeImages
+      ]
     );
 
-    res.status(201).json({ message: 'Review added successfully!' });
+    res.status(201).json({ message: 'Verified review with photos added successfully!' });
   } catch (err) {
-    logger.logError('Add Review (Authenticated)', err);
-    res.status(500).json({ error: 'Server error' });
+    logger.logError('Add Review with Photos Error', err);
+    res.status(500).json({ error: 'Server error saving review' });
   }
 });
 
@@ -1018,17 +1040,21 @@ app.get('/api/products', async (req, res) => {
     const search = req.query.search || '';
     const category = req.query.category || 'All';
     
+    // 1. الطلب العام بدون بحث (يستخدم الكاش مع جلب video_url)
     if (search === '' && category === 'All') {
       if (productsCache && (Date.now() - cacheTime < CACHE_TTL)) {
         return res.json(productsCache);
       }
-      const result = await pool.query('SELECT id, title, price, original_price, image_url, category FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC');
+      const result = await pool.query(
+        'SELECT id, title, price, original_price, image_url, category, video_url FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC'
+      );
       productsCache = result.rows;
       cacheTime = Date.now();
       return res.json(result.rows);
     }
 
-    let query = 'SELECT id, title, price, original_price, image_url, category FROM products WHERE stock_status = true';
+    // 2. استعلام البحث والتصنيف (تمت إضافة video_url)
+    let query = 'SELECT id, title, price, original_price, image_url, category, video_url FROM products WHERE stock_status = true';
     let params = [];
     let paramIndex = 1;
 
@@ -1934,6 +1960,92 @@ cron.schedule('0 */2 * * *', async () => {
     }
   } catch (err) {
     console.error('❌ [Abandoned Cart] Error:', err.message);
+  }
+});
+// ==========================================
+// 📦 9. كرون تتبع شحنات CJ وإرسال إشعارات WhatsApp التلقائية
+// يفحص الطلبات المشحونة حديثاً، يستخرج رقم التتبع، ويرسله للزبون عبر واتساب
+// ==========================================
+cron.schedule('30 * * * *', async () => {
+  console.log('⏳ [CJ Logistics] Checking for newly dispatched tracking numbers...');
+  try {
+    // جلب الطلبات المدفوعة التي لا تملك رقم تتبع بعد ومر عليها أقل من 15 يوماً
+    const { rows: pendingTrackingOrders } = await pool.query(`
+      SELECT id, customer_name, customer_email, customer_phone, shipping_address, total_amount 
+      FROM orders 
+      WHERE (status = 'paid' OR status = 'completed') 
+        AND (tracking_number IS NULL OR tracking_number = '')
+        AND created_at >= NOW() - INTERVAL '15 days'
+      LIMIT 10;
+    `);
+
+    if (pendingTrackingOrders.length === 0) return;
+
+    for (const order of pendingTrackingOrders) {
+      try {
+        await new Promise(r => setTimeout(r, 1200)); // احترام QPS
+
+        // استعلام حالة الطلب وتفاصيل الشحنة من CJ
+        const orderInfoRes = await cjRequest((token) =>
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail', {
+            headers: { 'CJ-Access-Token': token },
+            params: { orderNumber: `STORE-${order.id}` }
+          })
+        );
+
+        const cjData = orderInfoRes.data?.data;
+        const trackNumber = cjData?.trackNumber || cjData?.trackingNumber;
+
+        // ✨ إذا أصدرت CJ رقم التتبع للشحنة:
+        if (trackNumber && typeof trackNumber === 'string' && trackNumber.trim().length > 3) {
+          console.log(`🚀 [CJ Dispatched] Found tracking number for Order #${order.id}: ${trackNumber}`);
+
+          // 1. تحديث قاعدة البيانات
+          await pool.query(
+            "UPDATE orders SET tracking_number = $1, status = 'fulfilled' WHERE id = $2",
+            [trackNumber.trim(), order.id]
+          );
+
+          // 2. إرسال رسالة الواتساب التلقائية لهاتف الزبون
+          if (order.customer_phone) {
+            await sendOrderTrackingWhatsApp({
+              phone: order.customer_phone,
+              customerName: order.customer_name,
+              orderId: order.id,
+              trackingNumber: trackNumber.trim(),
+              email: order.customer_email
+            });
+          }
+
+          // 3. إرسال إيميل التتبع للزبون
+          if (order.customer_email) {
+            await sendEmail({
+              to: order.customer_email,
+              subject: `Your Laclarc Order #${order.id} Has Shipped! ✈️`,
+              html: `
+                <div style="font-family: Arial, sans-serif; max-width: 550px; margin: 0 auto; background: #F9F8FC; padding: 25px; border-radius: 16px; border: 1px solid #E5E7EB;">
+                  <h2 style="color: #1D1E3C; margin-top: 0;">Your Package is on the Way! 📦</h2>
+                  <p style="color: #4B5563; font-size: 14px;">Great news! Your order <strong>#${order.id}</strong> has been shipped via official air logistics.</p>
+                  <div style="background: #fff; padding: 15px; border-radius: 10px; margin: 20px 0; border: 1px solid #E5E7EB;">
+                    <p style="margin: 0; font-size: 12px; color: #888; text-transform: uppercase;">Tracking Number:</p>
+                    <p style="margin: 4px 0 0; font-size: 16px; font-weight: bold; color: #8B78C6; font-family: monospace;">${trackNumber.trim()}</p>
+                  </div>
+                  <div style="text-align: center; margin-top: 25px;">
+                    <a href="${process.env.FRONTEND_URL || 'https://laclarc.com'}/track-order?orderId=${order.id}&email=${encodeURIComponent(order.customer_email)}" style="background: #1D1E3C; color: #fff; padding: 12px 28px; border-radius: 25px; text-decoration: none; font-weight: bold; font-size: 13px; display: inline-block;">
+                      Track Shipment Live &rarr;
+                    </a>
+                  </div>
+                </div>
+              `
+            });
+          }
+        }
+      } catch (itemErr) {
+        // إذا كان الطلب ما زال قيد التجهيز في CJ يتخطاه ليفحصه في الدورة القادمة
+      }
+    }
+  } catch (err) {
+    console.error('❌ [Logistics Tracker Error]:', err.message);
   }
 });
 // ==========================================
