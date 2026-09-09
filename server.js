@@ -22,6 +22,8 @@ const multer = require('multer');
 const path = require('path');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
 const cron = require('node-cron');
 
 // ✨ Pool واحد مشترك من db.js
@@ -2217,6 +2219,95 @@ cron.schedule('30 * * * *', async () => {
     }
   } catch (err) {
     console.error('❌ [Logistics Tracker Error]:', err.message);
+  }
+});
+// ==========================================
+// 🤖 مسار الشات المباشر بالذكاء الاصطناعي لزوار المتجر (On-Site AI Sales Agent)
+// ==========================================
+const chatLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 30, // حماية رصيد الـ API
+  message: { reply: "لقد تجاوزت الحد المسموح من الأسئلة مؤقتاً. يرجى الانتظار قليلاً أو التواصل معنا عبر واتساب!" }
+});
+
+const ON_SITE_AI_PROMPT = `
+أنت "Laclarc AI"، المساعد الذكي والدعم الفني المباشر لمتجر "Laclarc" (laclarc.com).
+مهمتك: مساعدة الزائر بلباقة ولطف، الإجابة على استفساراته باختصار ودقة، وتشجيعه على الشراء.
+
+قواعد الرد:
+1. الإيجاز: أجب باختصار (جملتين أو 3 جمل كحد أقصى) لتناسب شاشة الشات الصغيرة.
+2. اللهجة: إذا سأل بالدارجة الجزائرية رد بدارجة لطيفة ومحترمة. إذا سأل بالفرنسية أو الإنجليزية رد بنفس لغته.
+3. المتجر: شحن سريع ومؤمن لجميع دول العالم ولـ 58 ولاية جزائرية (7 إلى 14 يوم عمل).
+4. الدفع: بطاقات بنكية عالمية (Stripe)، عملات رقمية (Crypto)، وللجزائر بريدي موب BaridiMob / CCP.
+5. الإرجاع: ضمان 30 يوماً.
+`;
+
+app.post('/api/chat', chatLimiter, async (req, res) => {
+  const { message, history } = req.body;
+
+  if (!message || typeof message !== 'string' || message.trim().length === 0) {
+    return res.status(400).json({ error: 'Message is required' });
+  }
+
+  // فحص إذا كان الزبون يسأل عن رقم طلبه
+  let orderContext = '';
+  const orderMatch = message.match(/(?:#|order|طلب)\s*[:#]?\s*(\d{2,8})/i);
+  
+  if (orderMatch) {
+    try {
+      const orderId = orderMatch[1];
+      const orderRes = await pool.query(
+        'SELECT id, status, total_amount, tracking_number FROM orders WHERE id = $1',
+        [orderId]
+      );
+      if (orderRes.rows.length > 0) {
+        const o = orderRes.rows[0];
+        orderContext = `\n[بيانات حقيقية: الطلب رقم #${o.id} حالته: "${o.status}". القيمة: $${o.total_amount}. التتبع: "${o.tracking_number || 'جاري إصداره قريباً'}". طمئن الزبون باختصار.]`;
+      } else {
+        orderContext = `\n[بيانات: لم يتم العثور على الطلب #${orderId}. اطلب منه التأكد من الرقم.]`;
+      }
+    } catch (dbErr) {
+      console.error('Chat DB check error:', dbErr.message);
+    }
+  }
+
+  try {
+    if (!genAI) {
+      return res.json({ 
+        reply: "مرحباً بك في Laclarc! نوفر شحناً سريعاً لجميع دول العالم ولـ 58 ولاية، ودفعاً بالبطاقة وبريدي موب. كيف يمكنني مساعدتك؟" 
+      });
+    }
+
+    const model = genAI.getGenerativeModel({
+      model: process.env.GEMINI_MODEL || "gemini-1.5-flash",
+      systemInstruction: ON_SITE_AI_PROMPT + orderContext
+    });
+
+    const formattedHistory = Array.isArray(history) 
+      ? history.slice(-4).map(h => ({
+          role: h.sender === 'user' ? 'user' : 'model',
+          parts: [{ text: h.text }]
+        }))
+      : [];
+
+    const chat = model.startChat({
+      history: formattedHistory,
+      generationConfig: {
+        maxOutputTokens: 250,
+        temperature: 0.6,
+      },
+    });
+
+    const result = await chat.sendMessage(message.trim().slice(0, 400));
+    const replyText = result.response.text().trim();
+
+    res.json({ reply: replyText });
+
+  } catch (err) {
+    console.error('AI Chat Error:', err.message);
+    res.json({ 
+      reply: "مرحباً بك! يسعدنا تواصلك مع Laclarc. فريق دعمنا متاح دائماً لمساعدتك عبر الموقع أو مباشرة عبر واتساب!" 
+    });
   }
 });
 // ==========================================
