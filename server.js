@@ -38,6 +38,11 @@ app.use(cookieParser());
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { message: 'Too many attempts, please try again after 15 minutes.' } });
 const couponLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts, please try again later.' } });
 const scraperLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 15, message: { error: 'Scraper rate limit exceeded.' } });
+const checkoutLimiter = rateLimit({ 
+  windowMs: 15 * 60 * 1000, 
+  max: 25, // 25 محاولة فتح جلسة دفع لكل زائر كل 15 دقيقة (كافية للزبون الطبيعي وتمنع البوتات)
+  message: { error: 'Too many checkout attempts, please try again in a few minutes.' } 
+});
 
 const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
 
@@ -578,8 +583,10 @@ app.post('/api/admin/sync-categories', async (req, res) => {
   })();
 });
 
+
 app.get('/api/categories', async (req, res) => {
   try {
+    res.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600');
     if (categoryTreeCache && (Date.now() - categoryTreeCacheTime < CATEGORY_TREE_CACHE_TTL)) {
       return res.json(categoryTreeCache);
     }
@@ -1111,12 +1118,19 @@ app.post('/api/admin/auto-categorize', async (req, res) => {
 // ==========================================
 app.get('/', (req, res) => res.send('Laclarc Dropshipping API is running on point!'));
 
+// ==========================================
+// مسار جلب المنتجات المحصن ضد ضغط ملايين الزوار (High-Concurrency Edge Shield)
+// ==========================================
 app.get('/api/products', async (req, res) => {
   try {
     const search = req.query.search || '';
     const category = req.query.category || 'All';
     
-    // 1. الطلب العام بدون بحث (يستخدم الكاش مع جلب video_url)
+    // ✨ تفعيل التخزين المؤقت على شبكات CDN العالمية (Vercel & Cloudflare Edge)
+    // 60 ثانية كاش طازج + 300 ثانية استجابة فورية أثناء التحديث في الخلفية
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+
+    // 1. الطلب العام بدون بحث (يخدم ملايين الزوار من الذاكرة اللحظية)
     if (search === '' && category === 'All') {
       if (productsCache && (Date.now() - cacheTime < CACHE_TTL)) {
         return res.json(productsCache);
@@ -1129,7 +1143,7 @@ app.get('/api/products', async (req, res) => {
       return res.json(result.rows);
     }
 
-    // 2. استعلام البحث والتصنيف (تمت إضافة video_url)
+    // 2. استعلام البحث والتصنيف (سريع جداً بفضل فهارس GIN و B-Tree)
     let query = 'SELECT id, title, price, original_price, image_url, category, video_url FROM products WHERE stock_status = true';
     let params = [];
     let paramIndex = 1;
@@ -1244,7 +1258,7 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
 // ==========================================
 // مسار الدفع المحصن (Bank-Grade Checkout)
 // ==========================================
-app.post('/api/create-checkout-session', async (req, res) => {
+app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
   try {
     const { items: clientItems, origin, couponCode } = req.body;
     let baseUrl = origin && origin.startsWith('http') ? origin : (process.env.FRONTEND_URL || 'http://localhost:3000');
