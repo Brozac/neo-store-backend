@@ -2242,12 +2242,67 @@ cron.schedule('30 * * * *', async () => {
   }
 });
 // ==========================================
-// 🤖 مسار الشات المباشر بالذكاء الاصطناعي لزوار المتجر (On-Site AI Sales Agent)
+// 🤖 On-Site AI Sales Agent (Live Chat)
 // ==========================================
+
+// ✨ كشف اللغة تلقائياً — عشان الردود الاحتياطية تكون بنفس لغة الزبون
+function detectLanguage(text) {
+  const t = String(text || '').toLowerCase();
+
+  // 1) حروف عربية → دارجة (المتجر جزائري: من يكتب بحروف عربية غالباً دارجي)
+  if (/[\u0600-\u06FF]/.test(t)) return 'ar';
+
+  // 2) Arabizi — دارجة مكتوبة بحروف لاتينية/أرقام (wach, bghit, 3lach, chhal...)
+  const arabiziMarkers = [
+    'wach', 'wesh', 'kifash', 'kifach', 'kifch', '3lach', '3lah', 'bghit', 'nbghi',
+    'chhal', 'ch7al', 'chhal ', 'sahbi', 'khoya', 'khouya', 'bzaf', 'bzzaf', 'chouia',
+    'daba', 'dyal', 'zaama', 'walah', 'smahli', 'fhamt', 'weldi', 'hadchi', 'mezyan',
+    'mzyan', '3ndk', '3andek', '3lik', '3liya', 'ghadi', 'salam', 'nchoufo', '3tini',
+    'wfin', 'fin kayn', 'bghit n'
+  ];
+  if (arabiziMarkers.some(w => t.includes(w))) return 'ar';
+
+  // 3) الفرنسية — حروف متشكلة ولا كلمات قوية
+  if (/[éèêàçùôîïû]/.test(t)) return 'fr';
+  const frenchMarkers = [
+    'livraison', 'commande', 'combien', 'merci', 'bonjour', 'salut', 'quand',
+    'prix', 'acheter', 'payer', 'paiement', 'retour', 'remboursement', 'colis',
+    'suivi', 'je veux', 'je voudrais', 'c\'est quoi', 'qu\'est-ce', 'est-ce que',
+    'où est', 'ou est', 'votre', 'mon colis', 'ma commande'
+  ];
+  if (frenchMarkers.some(w => t.includes(w))) return 'fr';
+
+  // 4) الافتراضي: الإنجليزية
+  return 'en';
+}
+
+// ✨ الردود الاحتياطية الثلاثية — بنفس اللغة ديال الزبون
+const FALLBACK_REPLIES = {
+  en: {
+    limit: "You've reached the message limit for now. Please wait a few minutes, or reach us instantly on WhatsApp!",
+    noAI: "Welcome to Laclarc! We offer fast, insured worldwide shipping and multiple payment options including cards and BaridiMob. How can I help you today?",
+    error: "Thanks for reaching out to Laclarc! Our support team is always happy to help via the website or directly on WhatsApp!"
+  },
+  fr: {
+    limit: "Vous avez atteint la limite de messages pour le moment. Patientez quelques minutes, ou contactez-nous directement sur WhatsApp !",
+    noAI: "Bienvenue chez Laclarc ! Nous offrons une livraison rapide et assurée dans le monde entier, avec plusieurs moyens de paiement : carte bancaire et BaridiMob. Comment puis-je vous aider ?",
+    error: "Merci de nous avoir contactés chez Laclarc ! Notre équipe support est toujours là pour vous aider via le site ou directement sur WhatsApp !"
+  },
+  ar: {
+    limit: "وصلتي للحد ديال الرسائل حالياً. تسنى شي دقائق ولا تواصل معانا مباشرة عبر واتساب!",
+    noAI: "مرحبا بيك في Laclarc! عننا شحن سريع ومؤمن لجميع دول العالم و58 ولاية، والدفع بالبطاقة ولا بريدي موب. واش نقدر نعاونك؟",
+    error: "مرحبا بيك! يسعدنا تواصلك مع Laclarc. فريق الدعم ديالنا متاح ديما يعاونك عبر الموقع ولا مباشرة عبر واتساب!"
+  }
+};
+
+// ✨ Rate Limiter بلغة الزبون — handler كيقرا الرسالة قبل الرفض
 const chatLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 30, // حماية رصيد الـ API
-  message: { reply: "لقد تجاوزت الحد المسموح من الأسئلة مؤقتاً. يرجى الانتظار قليلاً أو التواصل معنا عبر واتساب!" }
+  handler: (req, res) => {
+    const lang = detectLanguage(req.body?.message);
+    res.status(429).json({ reply: FALLBACK_REPLIES[lang].limit });
+  }
 });
 
 const ON_SITE_AI_PROMPT = `
@@ -2269,33 +2324,58 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Message is required' });
   }
 
-  // فحص إذا كان الزبون يسأل عن رقم طلبه
+  const lang = detectLanguage(message); // ✨ لغة الزبون للردود الاحتياطية
+
+  // 🛡️ IDOR Defense (Section 3.4 — same rule as the Track My Order page):
+  // Real order data is injected into the prompt ONLY after matching
+  // BOTH order_id AND customer_email.
+  //
+  // ✨ We scan the current message + previous user messages, so the flow works:
+  // "Where is my order #123?" → bot asks for email → customer sends email alone → verified
+  const recentUserTexts = [
+    message,
+    ...(Array.isArray(history) ? history.filter(h => h?.sender === 'user').map(h => String(h.text || '')) : [])
+  ].join(' ');
+
   let orderContext = '';
-  const orderMatch = message.match(/(?:#|order|طلب)\s*[:#]?\s*(\d{2,8})/i);
-  
+  const orderMatch = recentUserTexts.match(/(?:#|order|طلب|commande)\s*[:#]?\s*(\d{1,8})/i);
+  const emailMatch = recentUserTexts.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+
   if (orderMatch) {
     try {
       const orderId = orderMatch[1];
-      const orderRes = await pool.query(
-        'SELECT id, status, total_amount, tracking_number FROM orders WHERE id = $1',
-        [orderId]
-      );
-      if (orderRes.rows.length > 0) {
-        const o = orderRes.rows[0];
-        orderContext = `\n[بيانات حقيقية: الطلب رقم #${o.id} حالته: "${o.status}". القيمة: $${o.total_amount}. التتبع: "${o.tracking_number || 'جاري إصداره قريباً'}". طمئن الزبون باختصار.]`;
+
+      if (!emailMatch) {
+        // Defense-in-depth: حتى لو خالف الـ LLM التعليمات، لا توجد بيانات حقيقية في الـ prompt يمكن تسريبها
+        orderContext = `\n[The customer asked about order #${orderId} but hasn't provided their email yet. Politely ask them to write the email address used in the order for verification, in the customer's language. Do NOT reveal any order information before verification.]`;
       } else {
-        orderContext = `\n[بيانات: لم يتم العثور على الطلب #${orderId}. اطلب منه التأكد من الرقم.]`;
+        const orderRes = await pool.query(
+          'SELECT id, status, total_amount, tracking_number, customer_email FROM orders WHERE id = $1',
+          [orderId]
+        );
+
+        if (orderRes.rows.length === 0) {
+          orderContext = `\n[No order found matching #${orderId}. Politely ask the customer to double-check the number, in the customer's language.]`;
+        } else if (
+          orderRes.rows[0].customer_email &&
+          orderRes.rows[0].customer_email.toLowerCase() === emailMatch[0].toLowerCase()
+        ) {
+          // ✅ تطابق مزدوج (ID + Email) — الآن فقط نحقن البيانات الحقيقية
+          const o = orderRes.rows[0];
+          orderContext = `\n[Verified real order data: Order #${o.id}, status: "${o.status}". Amount: $${o.total_amount}. Tracking: "${o.tracking_number || 'being issued soon'}". Reassure the customer briefly, in the customer's language.]`;
+        } else {
+          // ❌ الإيميل غير مطابق — رد محايد، لا تأكيد حتى بوجود الطلب
+          orderContext = `\n[Security: ownership of order #${orderId} could not be verified with this email. Politely apologize and suggest using the "Track My Order" page on the website with the correct email, in the customer's language. Do NOT reveal any order details and do NOT confirm whether the order exists.]`;
+        }
       }
     } catch (dbErr) {
-      console.error('Chat DB check error:', dbErr.message);
+      logger.logError('Chat DB Check', dbErr);
     }
   }
 
   try {
     if (!genAI) {
-      return res.json({ 
-        reply: "مرحباً بك في Laclarc! نوفر شحناً سريعاً لجميع دول العالم ولـ 58 ولاية، ودفعاً بالبطاقة وبريدي موب. كيف يمكنني مساعدتك؟" 
-      });
+      return res.json({ reply: FALLBACK_REPLIES[lang].noAI });
     }
 
     const model = genAI.getGenerativeModel({
@@ -2324,10 +2404,8 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
     res.json({ reply: replyText });
 
   } catch (err) {
-    console.error('AI Chat Error:', err.message);
-    res.json({ 
-      reply: "مرحباً بك! يسعدنا تواصلك مع Laclarc. فريق دعمنا متاح دائماً لمساعدتك عبر الموقع أو مباشرة عبر واتساب!" 
-    });
+    logger.logError('AI Chat Error', err);
+    res.json({ reply: FALLBACK_REPLIES[lang].error });
   }
 });
 
@@ -2344,22 +2422,67 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// ==========================================
+// 🛡️ حماية مستوى العملية (Process-Level Safety Nets)
+// ==========================================
+
+// 1. عدم إسقاط السيرفر بسبب مهام الخلفية (الـ IIFEs)
+// الطلبات الفاشلة بعد 200 OK كيتصاوبهم كرون الـ Reconcile — Self-Healing
 process.on('unhandledRejection', (reason) => {
   logger.logError('Unhandled Rejection', reason);
 });
 
-// ==========================================
-// 🚀 الإغلاق الآمن + تشغيل السيرفر
-// ==========================================
-process.on('SIGTERM', async () => {
-  console.log('🛑 SIGTERM received — draining pool...');
-  try { await pool.end(); } catch (e) {}
-  process.exit(0);
-});
-process.on('SIGINT', async () => {
-  try { await pool.end(); } catch (e) {}
-  process.exit(0);
+// 2. خط الدفاع الأخير: حالة العملية فاسدة بعد uncaught exception
+// → خروج نظيف وRender يعاود يشغل نسخة سليمة أوتوماتيكياً
+process.on('uncaughtException', async (err) => {
+  logger.logError('Fatal Uncaught Exception', err);
+  console.error('💥 Fatal Uncaught Exception! Draining connections and exiting for clean restart...', err);
+
+  // ✨ شبكة أمان: إلا pool.end() علق (DB واصلة ماكاش) — مانخليوش العملية معلقة
+  const forceExit = setTimeout(() => process.exit(1), 5000);
+
+  try {
+    await pool.end();
+  } catch (e) {}
+
+  clearTimeout(forceExit);
+  process.exit(1);
 });
 
+// ==========================================
+// 🚀 تشغيل خادم HTTP (مرة واحدة فقط)
+// ==========================================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Laclarc Backend running on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`🚀 Laclarc Backend running on port ${PORT}`));
+
+// ==========================================
+// 🛑 الإغلاق الآمن الشامل (Zero-Downtime Graceful Shutdown)
+// ملكية حصرية هنا — db.js ما عندوش حتى handler (توزيع نظيف)
+// ==========================================
+const handleShutdown = async (signal) => {
+  console.log(`🛑 ${signal} received — closing HTTP server and draining DB pool...`);
+
+  // ✨ سد فوري للاتصالات keep-alive الخاملة (Cloudflare/Vercel proxy)
+  // بلا هاد السطر: close() كيتسنى حتى 5 ثواني (keepAliveTimeout) فكل deploy
+  // الطلبات النشطة كتتكمل عادي — غير الخاملة اللي كيتسدو
+  if (typeof server.closeIdleConnections === 'function') {
+    server.closeIdleConnections();
+  }
+
+  server.close(async () => {
+    console.log('✅ HTTP server closed.');
+    try {
+      await pool.end();
+      console.log('✅ DB Pool drained.');
+    } catch (e) {}
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error('⚠️ Forcefully exiting after 10s shutdown timeout.');
+    process.exit(1);
+  }, 10000);
+};
+
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('SIGINT', () => handleShutdown('SIGINT'));
