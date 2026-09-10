@@ -11,6 +11,7 @@ const jwt = require('jsonwebtoken');
 const pool = require('../db'); // ✨ استخدام الـ Pool الموحد حصراً
 const { fulfillCJOrder } = require('../services/cjService');
 const { prepareSecureItems } = require('../utils/secureCheckout');
+const { applyCouponToTotal } = require('../utils/couponHelper'); // ✨ زدنا: Helper الكوبون الموحد
 const logger = require('../logger'); 
 
 // إعداد Cloudinary لتخزين إيصالات بريدي موب
@@ -31,6 +32,22 @@ const upload = multer({ storage: storage, limits: { fileSize: 5 * 1024 * 1024 } 
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const JWT_SECRET = process.env.JWT_SECRET;
+
+// ✨ زدنا: كاش ديال Stripe Coupons — مانصاوبوش كوبون جديد فكل checkout (Litter فالـ Dashboard)
+const stripeCouponCache = new Map();
+async function getOrCreateStripeCoupon(couponData) {
+  const key = JSON.stringify(couponData);
+  if (stripeCouponCache.has(key)) return stripeCouponCache.get(key);
+  const sc = await stripe.coupons.create(couponData);
+  stripeCouponCache.set(key, sc.id);
+  if (stripeCouponCache.size > 200) {
+    stripeCouponCache.delete(stripeCouponCache.keys().next().value);
+  }
+  return sc.id;
+}
+
+// ✨ زدنا: سعر الصرف الرسمي (Configurable من Render Env بدون Redeploy)
+const USD_TO_DZD = Number(process.env.USD_TO_DZD_RATE) || 255;
 
 const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
 
@@ -153,9 +170,14 @@ router.post('/stripe', async (req, res) => {
     const optionalUser = getOptionalUser(req);
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
+    // ✨ تصادق وتطبيق الكوبون server-side أولاً
+    const { total: chargeTotal, applied: couponApplied, discount: couponDiscount, clamped, coupon: couponRow } =
+      await applyCouponToTotal(pool, couponCode, serverTotal);
+
+    // ✨ تسجيل chargeTotal (المبلغ بعد الكوبون) ليتطابق مع Paysera و Crypto
     const orderResult = await pool.query(
       "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, 'Stripe', $6) RETURNING id",
-      ['Pending Customer', 'pending@laclarc.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null]
+      ['Pending Customer', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null]
     );
     const orderId = orderResult.rows[0].id;
 
@@ -167,16 +189,12 @@ router.post('/stripe', async (req, res) => {
     }
 
     let stripeDiscounts = [];
-    if (couponCode) {
-      const couponRes = await pool.query('SELECT * FROM coupons WHERE code = $1 AND is_active = true', [couponCode.toUpperCase()]);
-      if (couponRes.rows.length > 0) {
-        const coupon = couponRes.rows[0];
-        const stripeCouponData = coupon.discount_type === 'percentage' 
-          ? { percent_off: parseFloat(coupon.discount_value), duration: 'once' } 
-          : { amount_off: Math.round(parseFloat(coupon.discount_value) * 100), currency: 'usd', duration: 'once' };
-        const stripeCoupon = await stripe.coupons.create(stripeCouponData);
-        stripeDiscounts = [{ coupon: stripeCoupon.id }];
-      }
+    if (couponApplied) {
+      const useNativePercent = couponRow.discount_type === 'percentage' && !clamped && Number(couponRow.discount_value) < 100;
+      const couponData = useNativePercent
+        ? { percent_off: parseFloat(couponRow.discount_value), duration: 'once' }
+        : { amount_off: Math.round(couponDiscount * 100), currency: 'usd', duration: 'once' };
+      stripeDiscounts = [{ coupon: await getOrCreateStripeCoupon(couponData) }];
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -202,7 +220,10 @@ router.post('/stripe', async (req, res) => {
       ],
       success_url: `${baseUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${baseUrl}/cancel`,
-      metadata: { orderId: orderId.toString() },
+      metadata: {
+        orderId: orderId.toString(),
+        couponCode: couponApplied ? String(couponCode).toUpperCase() : ''
+      },
     });
 
     await pool.query("UPDATE orders SET stripe_session_id = $1 WHERE id = $2", [session.id, orderId]);
@@ -218,14 +239,18 @@ router.post('/stripe', async (req, res) => {
 // ==========================================
 router.post('/paysera', async (req, res) => {
   try {
-    const { items: clientItems } = req.body;
+    const { items: clientItems, couponCode } = req.body; // ✨ زدنا couponCode
     const optionalUser = getOptionalUser(req);
 
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
+    // ✨ تطبيق الكوبون server-side — المبلغ النهائي من السيرفر
+    const { total: chargeTotal } = await applyCouponToTotal(pool, couponCode, serverTotal);
+
     const orderResult = await pool.query(
       "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, 'Paysera', $6) RETURNING id",
-      ['Pending Paysera', 'pending@laclarc.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null]
+      ['Pending Paysera', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null]
+      //                                                           ✨ ^^^^^^^^^^^ بعد الكوبون
     );
     const orderId = orderResult.rows[0].id;
 
@@ -239,7 +264,7 @@ router.post('/paysera', async (req, res) => {
     const data = {
       projectid: process.env.PAYSERA_PROJECT_ID,
       orderid: orderId,
-      amount: Math.round(serverTotal * 100),
+      amount: Math.round(chargeTotal * 100), // ✨ المبلغ المخفض — ماشي serverTotal
       currency: 'USD',
       accepturl: `${process.env.FRONTEND_URL}/success?method=paysera`,
       cancelurl: `${process.env.FRONTEND_URL}/cart`,
@@ -325,14 +350,18 @@ router.get('/paysera/callback', async (req, res) => {
 // ==========================================
 router.post('/crypto', async (req, res) => {
   try {
-    const { items: clientItems } = req.body;
+    const { items: clientItems, couponCode } = req.body; // ✨ زدنا couponCode
     const optionalUser = getOptionalUser(req);
 
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
+    // ✨ تطبيق الكوبون server-side — المبلغ النهائي من السيرفر
+    const { total: chargeTotal } = await applyCouponToTotal(pool, couponCode, serverTotal);
+
     const orderResult = await pool.query(
       "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, 'Crypto', $6) RETURNING id",
-      ['Pending Crypto', 'pending@laclarc.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null]
+      ['Pending Crypto', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null]
+      //                                                          ✨ ^^^^^^^^^^^ بعد الكوبون
     );
     const orderId = orderResult.rows[0].id;
 
@@ -343,10 +372,9 @@ router.post('/crypto', async (req, res) => {
       );
     }
 
-    const apiUrl = 'https://api.nowpayments.io/v1/invoice';
     // نمرر order_id في رابط النجاح لكي تقرأه صفحة /success لحظياً
     const response = await axios.post('https://api.nowpayments.io/v1/invoice', {
-      price_amount: serverTotal,
+      price_amount: chargeTotal, // ✨ المبلغ المخفض — ماشي serverTotal
       price_currency: 'usd',
       order_id: orderId.toString(), 
       order_description: `Laclarc Order #${orderId}`,
@@ -365,9 +393,7 @@ router.post('/crypto', async (req, res) => {
       await pool.query("UPDATE orders SET receipt_url = $1 WHERE id = $2", [response.data.id.toString(), orderId]);
     }
     
-    res.json({ url: response.data.invoice_url });
-    
-    res.json({ url: response.data.invoice_url });
+    res.json({ url: response.data.invoice_url }); // ✨ أصلحنا: كان مكرر جوج مرات → ERR_HTTP_HEADERS_SENT
   } catch (error) {
     logger.logError('Crypto Checkout Error', error.response?.data || error);
     res.status(500).json({ error: error.response?.data?.message || error.message });
@@ -458,6 +484,7 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'يرجى رفع صورة الإيصال' });
 
     const { totalAmount, items, customerName, customerPhone, customerAddress, customerEmail } = req.body;
+    const couponCode = req.body.couponCode || null; // ✨ زدنا: جاي من الـ FormData
     const receiptUrl = req.file.path;
     const fullShippingAddress = customerAddress || JSON.stringify({ line1: 'N/A', city: 'Algeria', state: 'N/A', postal_code: '00000', country: 'DZ' });
     
@@ -472,10 +499,18 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
 
     const { secureItems, serverTotal } = await prepareSecureItems(pool, parsedItems);
 
+    // ✨ الإصلاح الأمني الأهم (Tenet #1):
+    // المبلغ الرسمي كيتحسب هوني من السيرفر (سعر الصرف + الكوبون) — ماكانتوكلش أبداً على totalAmount ديال الـ client
+    const { total: chargeTotal, applied: couponApplied, discount: couponDiscount } =
+      await applyCouponToTotal(pool, couponCode, serverTotal);
+    const authoritativeDZD = Math.round(chargeTotal * USD_TO_DZD);
+    const declaredDZD = Number(totalAmount) || 0;
+
     const orderResult = await pool.query(
       `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, payment_status, receipt_url, user_id) 
        VALUES ($1, $2, $3, $4, $5, 'pending', 'BaridiMob', 'Pending Review', $6, $7) RETURNING id`,
-      [customerName, customerPhone, customerEmail || 'manual@laclarc.com', fullShippingAddress, totalAmount, receiptUrl, optionalUser ? optionalUser.id : null]
+      [customerName, customerPhone, customerEmail || 'manual@laclarc.com', fullShippingAddress, authoritativeDZD, receiptUrl, optionalUser ? optionalUser.id : null]
+      //                                                                ✨ ^^^^^^^^^^^^^^^^ المبلغ الرسمي ديال السيرفر (DZD)
     );
 
     const orderId = orderResult.rows[0].id;
@@ -489,10 +524,11 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
 
     if (customerEmail && !customerEmail.includes('@laclarc.com')) {
       const itemsForEmail = secureItems.map(it => ({ title: it.title, image_url: it.image_url, quantity: it.quantity, price_at_purchase: it.price }));
-      await sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, itemsForEmail);
+      await sendOrderConfirmationEmail(customerEmail, orderId, chargeTotal, itemsForEmail);
+      //                                                    ✨ ^^^^^^^^^^^ بعد الكوبون
     }
 
-    // إشعار فوري للأدمن
+    // إشعار فوري للأدمن — بالمبلغين بجوج (Expected من السيرفر + Declared من العميل) للـ Verification Dossier
     await sendEmail({
       to: process.env.BREVO_USER, 
       subject: `🚨 New BaridiMob Order #${orderId} - Action Required`,
@@ -500,8 +536,10 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
              <p>A new order has been placed via BaridiMob and requires verification.</p>
              <p><strong>Customer:</strong> ${customerName}</p>
              <p><strong>Phone:</strong> ${customerPhone}</p>
-             <p><strong>Declared Total:</strong> ${totalAmount} DZD</p>
-             <p><strong>DB Calculated (USD):</strong> $${serverTotal}</p>
+             <p><strong>Expected (Server):</strong> ${authoritativeDZD} DZD ${couponApplied ? `(Coupon −$${couponDiscount.toFixed(2)})` : ''}</p>
+             <p><strong>Declared (Client):</strong> ${declaredDZD} DZD</p>
+             <p><strong>DB Calculated (USD):</strong> $${chargeTotal}</p>
+             ${declaredDZD !== authoritativeDZD ? '<p style="color:#FF6B9D;font-weight:bold;">⚠️ Declared ≠ Expected — review receipt carefully before approval!</p>' : ''}
              <p><a href="${receiptUrl}" target="_blank" style="background-color: #FF6B9D; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">View Receipt Image</a></p>
              <p>Please log in to your admin panel to approve or reject this order.</p>`
     });
@@ -512,6 +550,7 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 // ==========================================
 // ⚡ مسار التحقق المالي اللحظي للكريبتو (JIT NowPayments Verifier)
 // يستجوب خوادم NowPayments مباشرة لمعرفة حالة تأكيد البلوكتشين فوراً
@@ -543,7 +582,6 @@ router.post('/crypto/verify', async (req, res) => {
     }
 
     // 1. استجواب NowPayments مباشرة عبر الـ API بالـ order_id
-    // نجلب قائمة المدفوعات التابعة لهذا الطلب
     const npRes = await axios.get(`https://api.nowpayments.io/v1/payment/?order_id=${order_id}&limit=1`, {
       headers: { 'x-api-key': process.env.NOWPAYMENTS_API_KEY }
     });
@@ -620,4 +658,24 @@ router.post('/crypto/verify', async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to verify crypto payment' });
   }
 });
+// ==========================================
+// 💳 مسار جلب بوابات الدفع المفعلة للمتجر
+// ==========================================
+router.get('/gateways', async (req, res) => {
+  try {
+    // جلب البوابات المفعلة من جدول الإعدادات، أو إرجاع الكل كإعداد افتراضي
+    const { rows } = await pool.query("SELECT value FROM store_settings WHERE key = 'enabled_gateways'");
+    if (rows.length > 0 && rows[0].value) {
+      try {
+        const enabled = JSON.parse(rows[0].value);
+        if (Array.isArray(enabled)) return res.json({ enabled });
+      } catch (e) {}
+    }
+    // الوضع الافتراضي: كل البوابات مفعلة
+    res.json({ enabled: ['stripe', 'paysera', 'crypto', 'baridimob'] });
+  } catch (err) {
+    res.json({ enabled: ['stripe', 'paysera', 'crypto', 'baridimob'] });
+  }
+});
+
 module.exports = router;

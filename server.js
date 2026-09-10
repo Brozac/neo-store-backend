@@ -11,6 +11,8 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 const { parseVariants, getCategorySlug, phoneAccRegex, pcBlacklistRegex } = require('./utils/parser');
 const { prepareSecureItems } = require('./utils/secureCheckout');
+const { applyCouponToTotal } = require('./utils/couponHelper'); // ✨ التعديل 1: Helper الكوبون الموحد
+
 const requireAdmin = require('./middleware/requireAdmin');
 const rateLimit = require('express-rate-limit');
 const { fulfillCJOrder, cjRequest, parseNumeric } = require('./services/cjService');
@@ -45,6 +47,19 @@ const checkoutLimiter = rateLimit({
 });
 
 const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
+
+// ✨ التعديل 2: كاش ديال Stripe Coupons — مانصاوبوش كوبون جديد فكل checkout (Litter فالـ Dashboard)
+const stripeCouponCache = new Map();
+async function getOrCreateStripeCoupon(couponData) {
+  const key = JSON.stringify(couponData);
+  if (stripeCouponCache.has(key)) return stripeCouponCache.get(key);
+  const sc = await stripe.coupons.create(couponData);
+  stripeCouponCache.set(key, sc.id);
+  if (stripeCouponCache.size > 200) {
+    stripeCouponCache.delete(stripeCouponCache.keys().next().value);
+  }
+  return sc.id;
+}
 
 // ==========================================
 // فحص قاعدة البيانات والمتغيرات
@@ -340,16 +355,16 @@ app.post('/api/validate-coupon', couponLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid coupon request' });
     }
 
-    const result = await pool.query('SELECT * FROM coupons WHERE code = $1 AND is_active = true', [code.toUpperCase()]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Invalid or expired coupon code.' });
-
-    const coupon = result.rows[0];
-    let discount = coupon.discount_type === 'percentage' ? (cartTotal * coupon.discount_value) / 100 : coupon.discount_value;
-    discount = Math.min(discount, cartTotal);
+    // ✨ التعديل 3: Helper الموحد — نفس منطق paymentController و create-checkout-session بالضبط
+    // (Fail-closed + سقف $0.50 للحد الأدنى ديال Stripe/NowPayments)
+    const { applied, discount, total } = await applyCouponToTotal(pool, code, cartTotal);
+    if (!applied) {
+      return res.status(404).json({ error: 'Invalid or expired coupon code.' });
+    }
 
     res.json({
-      discount: parseFloat(discount).toFixed(2),
-      newTotal: parseFloat(cartTotal - discount).toFixed(2),
+      discount: discount.toFixed(2),
+      newTotal: total.toFixed(2),
       message: `Coupon applied! You saved $${discount.toFixed(2)}`
     });
   } catch (err) {
@@ -619,7 +634,7 @@ app.post('/api/admin/backfill-categories', async (req, res) => {
             axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { 
               ...config, 
               headers: { 'CJ-Access-Token': token }, 
-              params: { pid: productId, features: 'enable_video' } 
+              params: { pid: p.cj_product_id, features: 'enable_video' } 
             })
           );
 
@@ -1283,17 +1298,18 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
       );
     }
 
+    // ✨ التعديل 4: تصادق الكوبون عبر الـ Helper الموحد (Fail-closed + سقف $0.50 + كاش Stripe)
+    const { applied: couponApplied, discount: couponDiscount, clamped, coupon: couponRow } =
+      await applyCouponToTotal(pool, couponCode, serverTotal);
+
     let stripeDiscounts = [];
-    if (couponCode) {
-      const couponRes = await pool.query('SELECT * FROM coupons WHERE code = $1 AND is_active = true', [couponCode.toUpperCase()]);
-      if (couponRes.rows.length > 0) {
-        const coupon = couponRes.rows[0];
-        const stripeCouponData = coupon.discount_type === 'percentage' 
-          ? { percent_off: parseFloat(coupon.discount_value), duration: 'once' } 
-          : { amount_off: Math.round(parseFloat(coupon.discount_value) * 100), currency: 'usd', duration: 'once' };
-        const stripeCoupon = await stripe.coupons.create(stripeCouponData);
-        stripeDiscounts = [{ coupon: stripeCoupon.id }];
-      }
+    if (couponApplied) {
+      // percent_off الأصيلة ديال Stripe إلا ماتسوبش — وإلا amount_off المثبت (باش نتجنبو مشاكل الـ clamp)
+      const useNativePercent = couponRow.discount_type === 'percentage' && !clamped && Number(couponRow.discount_value) < 100;
+      const couponData = useNativePercent
+        ? { percent_off: parseFloat(couponRow.discount_value), duration: 'once' }
+        : { amount_off: Math.round(couponDiscount * 100), currency: 'usd', duration: 'once' };
+      stripeDiscounts = [{ coupon: await getOrCreateStripeCoupon(couponData) }];
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -1317,7 +1333,10 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
         { shipping_rate_data: { type: 'fixed_amount', fixed_amount: { amount: 0, currency: 'usd' }, display_name: 'Standard Shipping', delivery_estimate: { minimum: { unit: 'business_day', value: 15 }, maximum: { unit: 'business_day', value: 35 } } } },
         { shipping_rate_data: { type: 'fixed_amount', fixed_amount: { amount: 1500, currency: 'usd' }, display_name: 'Worldwide Express Shipping', delivery_estimate: { minimum: { unit: 'business_day', value: 7 }, maximum: { unit: 'business_day', value: 15 } } } }
       ],
-      metadata: { orderId: orderId.toString() },
+      metadata: { 
+        orderId: orderId.toString(),
+        couponCode: couponApplied ? String(couponCode).toUpperCase() : '' // ✨ للتدقيق المالي
+      },
       success_url: `${baseUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${baseUrl}/cancel`,
     });
@@ -2193,7 +2212,7 @@ cron.schedule('30 * * * *', async () => {
             [trackNumber.trim(), order.id]
           );
 
-          // 2. إرسال رسالة الواتساب التلقائية لهاتف الزبون
+          // 2. إرسال إشعار WhatsApp للزبون برقم التتبع (تم تصحيح تمرير الكائن)
           if (order.customer_phone) {
             await sendOrderTrackingWhatsApp({
               phone: order.customer_phone,
@@ -2204,35 +2223,22 @@ cron.schedule('30 * * * *', async () => {
             });
           }
 
-          // 3. إرسال إيميل التتبع للزبون
-          if (order.customer_email) {
-            await sendEmail({
-              to: order.customer_email,
-              subject: `Your Laclarc Order #${order.id} Has Shipped! ✈️`,
-              html: `
-                <div style="font-family: Arial, sans-serif; max-width: 550px; margin: 0 auto; background: #F9F8FC; padding: 25px; border-radius: 16px; border: 1px solid #E5E7EB;">
-                  <h2 style="color: #1D1E3C; margin-top: 0;">Your Package is on the Way! 📦</h2>
-                  <p style="color: #4B5563; font-size: 14px;">Great news! Your order <strong>#${order.id}</strong> has been shipped via official air logistics.</p>
-                  <div style="background: #fff; padding: 15px; border-radius: 10px; margin: 20px 0; border: 1px solid #E5E7EB;">
-                    <p style="margin: 0; font-size: 12px; color: #888; text-transform: uppercase;">Tracking Number:</p>
-                    <p style="margin: 4px 0 0; font-size: 16px; font-weight: bold; color: #8B78C6; font-family: monospace;">${trackNumber.trim()}</p>
-                  </div>
-                  <div style="text-align: center; margin-top: 25px;">
-                    <a href="${process.env.FRONTEND_URL || 'https://laclarc.com'}/track-order?orderId=${order.id}&email=${encodeURIComponent(order.customer_email)}" style="background: #1D1E3C; color: #fff; padding: 12px 28px; border-radius: 25px; text-decoration: none; font-weight: bold; font-size: 13px; display: inline-block;">
-                      Track Shipment Live &rarr;
-                    </a>
-                  </div>
-                </div>
-              `
-            });
+          // 3. إيميل تأكيد الشحن مع رقم التتبع
+          if (order.customer_email && !order.customer_email.includes('@laclarc.com')) {
+            const itemsRes = await pool.query(
+              `SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`,
+              [order.id]
+            );
+            sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, itemsRes.rows)
+              .catch(err => logger.logError('Tracking Email Dispatch', err));
           }
         }
-      } catch (itemErr) {
-        // إذا كان الطلب ما زال قيد التجهيز في CJ يتخطاه ليفحصه في الدورة القادمة
+      } catch (orderErr) {
+        logger.logError(`Tracking Sync Order #${order.id}`, orderErr);
       }
     }
   } catch (err) {
-    console.error('❌ [Logistics Tracker Error]:', err.message);
+    logger.logError('CJ Tracking & WhatsApp Cron', err);
   }
 });
 // ==========================================
@@ -2324,8 +2330,9 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
     });
   }
 });
+
 // ==========================================
-// 404 ومعالجة الأخطاء
+// 404 ومعالجة الأخطاء العامة
 // ==========================================
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
@@ -2337,9 +2344,22 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-const PORT = process.env.PORT || 5000;
 process.on('unhandledRejection', (reason) => {
   logger.logError('Unhandled Rejection', reason);
 });
 
-app.listen(PORT, () => console.log(`🚀 Server is running on http://localhost:${PORT}`));
+// ==========================================
+// 🚀 الإغلاق الآمن + تشغيل السيرفر
+// ==========================================
+process.on('SIGTERM', async () => {
+  console.log('🛑 SIGTERM received — draining pool...');
+  try { await pool.end(); } catch (e) {}
+  process.exit(0);
+});
+process.on('SIGINT', async () => {
+  try { await pool.end(); } catch (e) {}
+  process.exit(0);
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`🚀 Laclarc Backend running on port ${PORT}`));
