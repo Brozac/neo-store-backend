@@ -1151,7 +1151,7 @@ app.get('/api/products', async (req, res) => {
         return res.json(productsCache);
       }
       const result = await pool.query(
-        'SELECT id, title, price, original_price, image_url, category, video_url FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC'
+        'SELECT id, title, price, original_price, image_url, category, video_url, created_at FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC'
       );
       productsCache = result.rows;
       cacheTime = Date.now();
