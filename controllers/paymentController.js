@@ -11,7 +11,7 @@ const jwt = require('jsonwebtoken');
 const pool = require('../db'); // ✨ استخدام الـ Pool الموحد حصراً
 const { fulfillCJOrder } = require('../services/cjService');
 const { prepareSecureItems } = require('../utils/secureCheckout');
-const { applyCouponToTotal } = require('../utils/couponHelper'); // ✨ زدنا: Helper الكوبون الموحد
+const { applyCouponToTotal } = require('../utils/couponHelper'); // ✨ Helper الكوبون الموحد
 const logger = require('../logger'); 
 
 // إعداد Cloudinary لتخزين إيصالات بريدي موب
@@ -33,7 +33,21 @@ const upload = multer({ storage: storage, limits: { fileSize: 5 * 1024 * 1024 } 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// ✨ زدنا: كاش ديال Stripe Coupons — مانصاوبوش كوبون جديد فكل checkout (Litter فالـ Dashboard)
+// ✨ دالة مساعدة لاستخراج وتنقية بيانات تتبع الإعلانات بأمان
+function extractUtm(body) {
+  let utm = body.utm || {};
+  if (typeof utm === 'string') {
+    try { utm = JSON.parse(utm); } catch (e) { utm = {}; }
+  }
+  return {
+    source: utm.utm_source ? String(utm.utm_source).slice(0, 100) : 'organic',
+    medium: utm.utm_medium ? String(utm.utm_medium).slice(0, 100) : 'direct',
+    campaign: utm.utm_campaign ? String(utm.utm_campaign).slice(0, 150) : null,
+    clickId: utm.click_id ? String(utm.click_id).slice(0, 255) : null
+  };
+}
+
+// ✨ كاش ديال Stripe Coupons — مانصاوبوش كوبون جديد فكل checkout (Litter فالـ Dashboard)
 const stripeCouponCache = new Map();
 async function getOrCreateStripeCoupon(couponData) {
   const key = JSON.stringify(couponData);
@@ -46,7 +60,7 @@ async function getOrCreateStripeCoupon(couponData) {
   return sc.id;
 }
 
-// ✨ زدنا: سعر الصرف الرسمي (Configurable من Render Env بدون Redeploy)
+// ✨ سعر الصرف الرسمي (Configurable من Render Env بدون Redeploy)
 const USD_TO_DZD = Number(process.env.USD_TO_DZD_RATE) || 255;
 
 const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
@@ -164,20 +178,22 @@ function getOptionalUser(req) {
 router.post('/stripe', async (req, res) => {
   try {
     const { items: clientItems, origin, couponCode } = req.body;
+    const utm = extractUtm(req.body); // ✨ استخراج بيانات تتبع الإعلانات
     let baseUrl = origin && origin.startsWith('http') ? origin : (process.env.FRONTEND_URL || 'https://laclarc.com');
     baseUrl = baseUrl.replace(/\/+$/, '');
 
     const optionalUser = getOptionalUser(req);
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
 
-    // ✨ تصادق وتطبيق الكوبون server-side أولاً
+    // تصادق وتطبيق الكوبون server-side أولاً
     const { total: chargeTotal, applied: couponApplied, discount: couponDiscount, clamped, coupon: couponRow } =
       await applyCouponToTotal(pool, couponCode, serverTotal);
 
-    // ✨ تسجيل chargeTotal (المبلغ بعد الكوبون) ليتطابق مع Paysera و Crypto
+    // ✨ تسجيل الطلب مع مصدر الإعلان
     const orderResult = await pool.query(
-      "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, 'Stripe', $6) RETURNING id",
-      ['Pending Customer', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null]
+      `INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id) 
+       VALUES ($1, $2, $3, $4, $5, 'Stripe', $6, $7, $8, $9, $10) RETURNING id`,
+      ['Pending Customer', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null, utm.source, utm.medium, utm.campaign, utm.clickId]
     );
     const orderId = orderResult.rows[0].id;
 
@@ -222,7 +238,9 @@ router.post('/stripe', async (req, res) => {
       cancel_url: `${baseUrl}/cancel`,
       metadata: {
         orderId: orderId.toString(),
-        couponCode: couponApplied ? String(couponCode).toUpperCase() : ''
+        couponCode: couponApplied ? String(couponCode).toUpperCase() : '',
+        utmSource: utm.source, // ✨ توثيق مصدر الإعلان في Stripe
+        utmCampaign: utm.campaign || ''
       },
     });
 
@@ -239,18 +257,18 @@ router.post('/stripe', async (req, res) => {
 // ==========================================
 router.post('/paysera', async (req, res) => {
   try {
-    const { items: clientItems, couponCode } = req.body; // ✨ زدنا couponCode
+    const { items: clientItems, couponCode } = req.body;
+    const utm = extractUtm(req.body); // ✨ استخراج بيانات تتبع الإعلانات
     const optionalUser = getOptionalUser(req);
 
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
-
-    // ✨ تطبيق الكوبون server-side — المبلغ النهائي من السيرفر
     const { total: chargeTotal } = await applyCouponToTotal(pool, couponCode, serverTotal);
 
+    // ✨ تسجيل الطلب مع مصدر الإعلان
     const orderResult = await pool.query(
-      "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, 'Paysera', $6) RETURNING id",
-      ['Pending Paysera', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null]
-      //                                                           ✨ ^^^^^^^^^^^ بعد الكوبون
+      `INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id) 
+       VALUES ($1, $2, $3, $4, $5, 'Paysera', $6, $7, $8, $9, $10) RETURNING id`,
+      ['Pending Paysera', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null, utm.source, utm.medium, utm.campaign, utm.clickId]
     );
     const orderId = orderResult.rows[0].id;
 
@@ -264,7 +282,7 @@ router.post('/paysera', async (req, res) => {
     const data = {
       projectid: process.env.PAYSERA_PROJECT_ID,
       orderid: orderId,
-      amount: Math.round(chargeTotal * 100), // ✨ المبلغ المخفض — ماشي serverTotal
+      amount: Math.round(chargeTotal * 100),
       currency: 'USD',
       accepturl: `${process.env.FRONTEND_URL}/success?method=paysera`,
       cancelurl: `${process.env.FRONTEND_URL}/cart`,
@@ -312,7 +330,7 @@ router.get('/paysera/callback', async (req, res) => {
 
       if (updateRes.rows.length > 0) {
         const order = updateRes.rows[0];
-        res.send('OK'); // الرد الفوري لمنع مهلة Paysera
+        res.send('OK');
 
         (async () => {
           try {
@@ -323,7 +341,6 @@ router.get('/paysera/callback', async (req, res) => {
               address: { line1: order.shipping_address || 'Online Store Purchase', country: 'US' }
             }, items);
 
-            // ✨ تحديث حالة الطلب إلى completed بعد نجاح الـ Fulfillment
             if (cjResponse && cjResponse.success) {
               await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [orderId]);
             }
@@ -350,18 +367,18 @@ router.get('/paysera/callback', async (req, res) => {
 // ==========================================
 router.post('/crypto', async (req, res) => {
   try {
-    const { items: clientItems, couponCode } = req.body; // ✨ زدنا couponCode
+    const { items: clientItems, couponCode } = req.body;
+    const utm = extractUtm(req.body); // ✨ استخراج بيانات تتبع الإعلانات
     const optionalUser = getOptionalUser(req);
 
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
-
-    // ✨ تطبيق الكوبون server-side — المبلغ النهائي من السيرفر
     const { total: chargeTotal } = await applyCouponToTotal(pool, couponCode, serverTotal);
 
+    // ✨ تسجيل الطلب مع مصدر الإعلان
     const orderResult = await pool.query(
-      "INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id) VALUES ($1, $2, $3, $4, $5, 'Crypto', $6) RETURNING id",
-      ['Pending Crypto', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null]
-      //                                                          ✨ ^^^^^^^^^^^ بعد الكوبون
+      `INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id) 
+       VALUES ($1, $2, $3, $4, $5, 'Crypto', $6, $7, $8, $9, $10) RETURNING id`,
+      ['Pending Crypto', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null, utm.source, utm.medium, utm.campaign, utm.clickId]
     );
     const orderId = orderResult.rows[0].id;
 
@@ -372,9 +389,8 @@ router.post('/crypto', async (req, res) => {
       );
     }
 
-    // نمرر order_id في رابط النجاح لكي تقرأه صفحة /success لحظياً
     const response = await axios.post('https://api.nowpayments.io/v1/invoice', {
-      price_amount: chargeTotal, // ✨ المبلغ المخفض — ماشي serverTotal
+      price_amount: chargeTotal,
       price_currency: 'usd',
       order_id: orderId.toString(), 
       order_description: `Laclarc Order #${orderId}`,
@@ -388,19 +404,17 @@ router.post('/crypto', async (req, res) => {
       }
     });
     
-    // حفظ معرف الجلسة/الفاتورة
     if (response.data.id) {
       await pool.query("UPDATE orders SET receipt_url = $1 WHERE id = $2", [response.data.id.toString(), orderId]);
     }
     
-    res.json({ url: response.data.invoice_url }); // ✨ أصلحنا: كان مكرر جوج مرات → ERR_HTTP_HEADERS_SENT
+    res.json({ url: response.data.invoice_url });
   } catch (error) {
     logger.logError('Crypto Checkout Error', error.response?.data || error);
     res.status(500).json({ error: error.response?.data?.message || error.message });
   }
 });
 
-// ترتيب الكائنات المساعدة لمطابقة توقيع NowPayments بدقة
 function sortObject(obj) {
   return Object.keys(obj).sort().reduce((result, key) => {
     if (obj[key] && typeof obj[key] === 'object' && !Array.isArray(obj[key])) {
@@ -484,7 +498,8 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'يرجى رفع صورة الإيصال' });
 
     const { totalAmount, items, customerName, customerPhone, customerAddress, customerEmail } = req.body;
-    const couponCode = req.body.couponCode || null; // ✨ زدنا: جاي من الـ FormData
+    const couponCode = req.body.couponCode || null;
+    const utm = extractUtm(req.body); // ✨ استخراج بيانات تتبع الإعلانات لبريدي موب
     const receiptUrl = req.file.path;
     const fullShippingAddress = customerAddress || JSON.stringify({ line1: 'N/A', city: 'Algeria', state: 'N/A', postal_code: '00000', country: 'DZ' });
     
@@ -499,18 +514,16 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
 
     const { secureItems, serverTotal } = await prepareSecureItems(pool, parsedItems);
 
-    // ✨ الإصلاح الأمني الأهم (Tenet #1):
-    // المبلغ الرسمي كيتحسب هوني من السيرفر (سعر الصرف + الكوبون) — ماكانتوكلش أبداً على totalAmount ديال الـ client
     const { total: chargeTotal, applied: couponApplied, discount: couponDiscount } =
       await applyCouponToTotal(pool, couponCode, serverTotal);
     const authoritativeDZD = Math.round(chargeTotal * USD_TO_DZD);
     const declaredDZD = Number(totalAmount) || 0;
 
+    // ✨ تسجيل الطلب مع مصدر الإعلان
     const orderResult = await pool.query(
-      `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, payment_status, receipt_url, user_id) 
-       VALUES ($1, $2, $3, $4, $5, 'pending', 'BaridiMob', 'Pending Review', $6, $7) RETURNING id`,
-      [customerName, customerPhone, customerEmail || 'manual@laclarc.com', fullShippingAddress, authoritativeDZD, receiptUrl, optionalUser ? optionalUser.id : null]
-      //                                                                ✨ ^^^^^^^^^^^^^^^^ المبلغ الرسمي ديال السيرفر (DZD)
+      `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, payment_status, receipt_url, user_id, utm_source, utm_medium, utm_campaign, click_id) 
+       VALUES ($1, $2, $3, $4, $5, 'pending', 'BaridiMob', 'Pending Review', $6, $7, $8, $9, $10, $11) RETURNING id`,
+      [customerName, customerPhone, customerEmail || 'manual@laclarc.com', fullShippingAddress, authoritativeDZD, receiptUrl, optionalUser ? optionalUser.id : null, utm.source, utm.medium, utm.campaign, utm.clickId]
     );
 
     const orderId = orderResult.rows[0].id;
@@ -525,10 +538,8 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
     if (customerEmail && !customerEmail.includes('@laclarc.com')) {
       const itemsForEmail = secureItems.map(it => ({ title: it.title, image_url: it.image_url, quantity: it.quantity, price_at_purchase: it.price }));
       await sendOrderConfirmationEmail(customerEmail, orderId, chargeTotal, itemsForEmail);
-      //                                                    ✨ ^^^^^^^^^^^ بعد الكوبون
     }
 
-    // إشعار فوري للأدمن — بالمبلغين بجوج (Expected من السيرفر + Declared من العميل) للـ Verification Dossier
     await sendEmail({
       to: process.env.BREVO_USER, 
       subject: `🚨 New BaridiMob Order #${orderId} - Action Required`,
@@ -536,6 +547,7 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
              <p>A new order has been placed via BaridiMob and requires verification.</p>
              <p><strong>Customer:</strong> ${customerName}</p>
              <p><strong>Phone:</strong> ${customerPhone}</p>
+             <p><strong>Source / Campaign:</strong> ${utm.source} / ${utm.campaign || 'direct'}</p>
              <p><strong>Expected (Server):</strong> ${authoritativeDZD} DZD ${couponApplied ? `(Coupon −$${couponDiscount.toFixed(2)})` : ''}</p>
              <p><strong>Declared (Client):</strong> ${declaredDZD} DZD</p>
              <p><strong>DB Calculated (USD):</strong> $${chargeTotal}</p>
@@ -553,7 +565,6 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
 
 // ==========================================
 // ⚡ مسار التحقق المالي اللحظي للكريبتو (JIT NowPayments Verifier)
-// يستجوب خوادم NowPayments مباشرة لمعرفة حالة تأكيد البلوكتشين فوراً
 // ==========================================
 router.post('/crypto/verify', async (req, res) => {
   const { order_id } = req.body;
@@ -570,7 +581,6 @@ router.post('/crypto/verify', async (req, res) => {
 
     const order = orderRes.rows[0];
 
-    // إذا كان الطلب قد تمت معالجته بالفعل مسبقاً
     if (order.status === 'paid' || order.status === 'completed' || order.status === 'fulfilled') {
       return res.json({
         success: true,
@@ -581,14 +591,12 @@ router.post('/crypto/verify', async (req, res) => {
       });
     }
 
-    // 1. استجواب NowPayments مباشرة عبر الـ API بالـ order_id
     const npRes = await axios.get(`https://api.nowpayments.io/v1/payment/?order_id=${order_id}&limit=1`, {
       headers: { 'x-api-key': process.env.NOWPAYMENTS_API_KEY }
     });
 
     const paymentData = npRes.data?.data?.[0];
 
-    // 2. فحص حالة الدفع في البلوكتشين
     const isPaid = paymentData && (
       paymentData.payment_status === 'finished' || 
       paymentData.payment_status === 'confirmed' || 
@@ -596,13 +604,11 @@ router.post('/crypto/verify', async (req, res) => {
     );
 
     if (isPaid) {
-      // 3. قفل ذري فوري للطلب
       const updateRes = await pool.query(
         "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING id",
         [order_id]
       );
 
-      // 4. إرسال الطلب لـ CJ Dropshipping في نفس اللحظة
       if (updateRes.rows.length > 0) {
         console.log(`⚡ [Crypto JIT] Order #${order_id} verified via Blockchain! Fulfilling to CJ...`);
 
@@ -642,7 +648,6 @@ router.post('/crypto/verify', async (req, res) => {
         status: 'paid'
       });
     } else {
-      // الدفع ما زال قيد انتظار تأكيدات الشبكة (Confirming)
       return res.json({
         success: true,
         verified: false,
@@ -658,12 +663,12 @@ router.post('/crypto/verify', async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to verify crypto payment' });
   }
 });
+
 // ==========================================
 // 💳 مسار جلب بوابات الدفع المفعلة للمتجر
 // ==========================================
 router.get('/gateways', async (req, res) => {
   try {
-    // جلب البوابات المفعلة من جدول الإعدادات، أو إرجاع الكل كإعداد افتراضي
     const { rows } = await pool.query("SELECT value FROM store_settings WHERE key = 'enabled_gateways'");
     if (rows.length > 0 && rows[0].value) {
       try {
@@ -671,7 +676,6 @@ router.get('/gateways', async (req, res) => {
         if (Array.isArray(enabled)) return res.json({ enabled });
       } catch (e) {}
     }
-    // الوضع الافتراضي: كل البوابات مفعلة
     res.json({ enabled: ['stripe', 'paysera', 'crypto', 'baridimob'] });
   } catch (err) {
     res.json({ enabled: ['stripe', 'paysera', 'crypto', 'baridimob'] });

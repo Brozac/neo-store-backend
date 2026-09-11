@@ -346,6 +346,30 @@ app.post('/api/admin/scrape-product', scraperLimiter, async (req, res) => {
 });
 
 // ==========================================
+// 📊 مسار تقارير أرباح الإعلانات (Ad Attribution & ROI Analytics)
+// ==========================================
+app.get('/api/admin/analytics/ads', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        COALESCE(utm_source, 'organic/direct') AS source,
+        COUNT(*) AS total_orders,
+        COUNT(CASE WHEN status IN ('paid', 'completed', 'fulfilled') THEN 1 END) AS paid_orders,
+        COALESCE(SUM(CASE WHEN status IN ('paid', 'completed', 'fulfilled') THEN total_amount ELSE 0 END), 0) AS revenue
+      FROM orders
+      WHERE created_at >= NOW() - INTERVAL '30 days'
+      GROUP BY COALESCE(utm_source, 'organic/direct')
+      ORDER BY revenue DESC;
+    `);
+
+    res.json({ success: true, stats: rows });
+  } catch (err) {
+    logger.logError('Ad Analytics Query Error', err);
+    res.status(500).json({ error: 'Failed to fetch ad analytics' });
+  }
+});
+
+// ==========================================
 // مسارات الكوبونات والتقييمات
 // ==========================================
 app.post('/api/validate-coupon', couponLimiter, async (req, res) => {
@@ -1284,23 +1308,29 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
 });
 
 // ==========================================
-// مسار الدفع المحصن (Bank-Grade Checkout)
+// مسار الدفع المحصن (Bank-Grade Checkout مع تتبع الإعلانات والكوبونات)
 // ==========================================
 app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
   try {
-    const { items: clientItems, origin, couponCode } = req.body;
-    let baseUrl = origin && origin.startsWith('http') ? origin : (process.env.FRONTEND_URL || 'http://localhost:3000');
+    const { items: clientItems, origin, couponCode, utm } = req.body;
+    let baseUrl = origin && origin.startsWith('http') ? origin : (process.env.FRONTEND_URL || 'https://laclarc.com');
     baseUrl = baseUrl.replace(/\/+$/, '');
 
     // حساب الأسعار والـ vid حصراً من قاعدة البيانات
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
-
     const optionalUser = getOptionalUser(req);
-    // ✨ تعيين payment_method='Stripe' صراحة منذ البداية لكي يعمل نظام التتبع والـ Sweeper
+
+    // ✨ استخراج وتأمين بيانات تتبع الإعلانات
+    const utmSource = utm?.utm_source ? String(utm.utm_source).slice(0, 100) : 'organic';
+    const utmMedium = utm?.utm_medium ? String(utm.utm_medium).slice(0, 100) : 'direct';
+    const utmCampaign = utm?.utm_campaign ? String(utm.utm_campaign).slice(0, 150) : null;
+    const clickId = utm?.click_id ? String(utm.click_id).slice(0, 255) : null;
+
+    // ✨ تسجيل الطلب (مرة واحدة فقط) مع مصدر الإعلانات
     const orderResult = await pool.query(
-      `INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, user_id, payment_method) 
-       VALUES ($1, $2, $3, $4, $5, $6, 'Stripe') RETURNING id`,
-      ['Pending Customer', 'pending@laclarc.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null]
+      `INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, user_id, payment_method, utm_source, utm_medium, utm_campaign, click_id) 
+       VALUES ($1, $2, $3, $4, $5, $6, 'Stripe', $7, $8, $9, $10) RETURNING id`,
+      ['Pending Customer', 'pending@laclarc.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null, utmSource, utmMedium, utmCampaign, clickId]
     );
     const orderId = orderResult.rows[0].id;
 
@@ -1311,13 +1341,12 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
       );
     }
 
-    // ✨ التعديل 4: تصادق الكوبون عبر الـ Helper الموحد (Fail-closed + سقف $0.50 + كاش Stripe)
+    // تصادق الكوبون عبر الـ Helper الموحد
     const { applied: couponApplied, discount: couponDiscount, clamped, coupon: couponRow } =
       await applyCouponToTotal(pool, couponCode, serverTotal);
 
     let stripeDiscounts = [];
     if (couponApplied) {
-      // percent_off الأصيلة ديال Stripe إلا ماتسوبش — وإلا amount_off المثبت (باش نتجنبو مشاكل الـ clamp)
       const useNativePercent = couponRow.discount_type === 'percentage' && !clamped && Number(couponRow.discount_value) < 100;
       const couponData = useNativePercent
         ? { percent_off: parseFloat(couponRow.discount_value), duration: 'once' }
@@ -1348,7 +1377,9 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
       ],
       metadata: { 
         orderId: orderId.toString(),
-        couponCode: couponApplied ? String(couponCode).toUpperCase() : '' // ✨ للتدقيق المالي
+        couponCode: couponApplied ? String(couponCode).toUpperCase() : '',
+        utmSource: utmSource, // توثيق مصدر الإعلان في Stripe
+        utmCampaign: utmCampaign || ''
       },
       success_url: `${baseUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${baseUrl}/cancel`,
