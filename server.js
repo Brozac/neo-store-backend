@@ -719,66 +719,84 @@ app.post('/api/admin/sync-videos', requireAdmin, async (req, res) => {
 });
 
 async function runCjVideoSync() {
-  const pagesToFetch = 15; // زيادة الصفحات إلى 15 (300 منتج) للبحث الشامل
-  const pageSize = 20;
+  // ✨ v2 — محرك تنويع البحث:
+  //   1. كلمات مفتاحية من فئات غنية بالفيديوهات التسويقية (beauty/grooming/gadgets)
+  //   2. seenPids: مافحّاش نفس المنتج جوج مرات فالجلسة (توفير 1.2s لكل تكرار)
+  //   3. الجمع التراكمي: كل ضغطة Scan كتوسع الرصيد، ماشي نفس الـ 300 منتج ديما
+  const SEARCH_QUERIES = [
+    '',                    // Trending العام
+    'grooming', 'hair trimmer', 'nail clipper',
+    'makeup', 'beauty tool', 'skincare',
+    'kitchen gadget', 'pet supplies',
+    'watch', 'earbuds', 'lamp', 'fitness',
+  ];
+
   let importedCount = 0;
   let checkedCount = 0;
+  const seenPids = new Set();
+  const startedAt = Date.now();
 
-  console.log('⏳ [CJ Video Sync] Starting comprehensive search for video products...');
+  console.log('⏳ [CJ Video Sync v2] Starting multi-keyword video hunt...');
 
-  for (let pageNum = 1; pageNum <= pagesToFetch; pageNum++) {
-    // ✨ البحث الشامل (Trending) بدون كلمات مفتاحية
-    const params = { pageNum, pageSize, searchType: 2 };
+  for (const keyword of SEARCH_QUERIES) {
+    for (let pageNum = 1; pageNum <= 3; pageNum++) {
+      const params = { pageNum, pageSize: 20, searchType: 2 };
+      if (keyword) params.productNameEn = keyword;
 
-    const listRes = await cjRequest((token, config) =>
-      axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list', { ...config, headers: { 'CJ-Access-Token': token }, params })
-    );
-
-    const cjProducts = listRes.data?.data?.list || [];
-    if (cjProducts.length === 0) {
-      console.log('🏁 [CJ Video Sync] No more products found on CJ.');
-      break;
-    }
-
-    console.log(`📄 [CJ Video Sync] Scanning page ${pageNum}/${pagesToFetch}...`);
-
-    for (const cjItem of cjProducts) {
-      await new Promise(r => setTimeout(r, 1000)); // احترام Rate Limit
-      const productId = cjItem.pid ? String(cjItem.pid) : null;
-      if (!productId) continue;
-
-      checkedCount++;
+      let cjProducts;
       try {
-        // 1. جلب تفاصيل المنتج (مع تفعيل خيار الفيديو)
-        const detailRes = await cjRequest((token, config) =>
-          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { 
-            ...config, 
-            headers: { 'CJ-Access-Token': token }, 
-            params: { pid: productId, features: 'enable_video' } 
-          })
+        const listRes = await cjRequest((token, config) =>
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list',
+            { ...config, headers: { 'CJ-Access-Token': token }, params })
         );
+        cjProducts = listRes.data?.data?.list || [];
+      } catch (listErr) {
+        logger.logError(`CJ Video Sync list (${keyword || 'Trending'} p${pageNum})`, listErr);
+        continue; // فشل صفحة ما يوقفش المحرك
+      }
 
-        const details = detailRes.data?.data;
-        if (!details) continue;
+      if (cjProducts.length === 0) break;
 
-        // 2. بناء صف المنتج باستخدام الخدمة الموحدة
-        const productRow = await buildProductRow(details, { fetchVideo: true, isSourced: false });
+      console.log(`📄 [Video Sync] "${keyword || 'Trending'}" p${pageNum}: scanning ${cjProducts.length}...`);
 
-        // 3. إذا نجح في بناء الصف ووجد فيديو، يقوم بإدخاله
-        if (productRow && productRow.video_url) {
-          await upsertProductRow(pool, productRow);
-          importedCount++;
-          console.log(`🎥 [Video Sync] Imported video product: ${productRow.title}`);
+      for (const cjItem of cjProducts) {
+        const productId = cjItem.pid ? String(cjItem.pid) : null;
+        if (!productId || seenPids.has(productId)) continue;
+        seenPids.add(productId);
+        checkedCount++;
+
+        // ✨ احترام الـ QPS ديال CJ (1200ms فاصل — أقوى من 1000)
+        await new Promise(r => setTimeout(r, 1200));
+
+        try {
+          const detailRes = await cjRequest((token, config) =>
+            axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', {
+              ...config,
+              headers: { 'CJ-Access-Token': token },
+              params: { pid: productId, features: 'enable_video' }
+            })
+          );
+
+          const details = detailRes.data?.data;
+          if (!details) continue;
+
+          const productRow = await buildProductRow(details, { fetchVideo: true, isSourced: false });
+
+          if (productRow && productRow.video_url) {
+            await upsertProductRow(pool, productRow);
+            importedCount++;
+            console.log(`🎥 [Video Sync] ✅ #${importedCount}: ${String(productRow.title).slice(0, 60)}`);
+          }
+        } catch (productErr) {
+          // خطأ منتج فردي — ما يوقفش الجولة
         }
-        
-      } catch (productErr) {
-        // تجاهل الأخطاء الفردية
       }
     }
   }
 
   clearProductsCache();
-  console.log(`✅ [CJ Video Sync] Finished. Checked ${checkedCount} products. Found and imported ${importedCount} video products.`);
+  const tookSec = Math.round((Date.now() - startedAt) / 1000);
+  console.log(`✅ [Video Sync v2] Done in ${tookSec}s — Checked ${checkedCount} unique products, Imported ${importedCount} video products.`);
 }
 
 app.post('/api/admin/sync-single-product', async (req, res) => {
