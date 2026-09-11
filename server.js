@@ -2235,15 +2235,24 @@ cron.schedule('30 * * * *', async () => {
       try {
         await new Promise(r => setTimeout(r, 1200)); // احترام QPS
 
-        // استعلام حالة الطلب وتفاصيل الشحنة من CJ
+                // استعلام حالة الطلب وتفاصيل الشحنة من CJ
+        // ✨ إصلاح: getOrderDetail راه POST بـ JSON body حسب وثيقة CJ v2.0 (ماشي GET params)
         const orderInfoRes = await cjRequest((token) =>
-          axios.get('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail', {
-            headers: { 'CJ-Access-Token': token },
-            params: { orderNumber: `STORE-${order.id}` }
-          })
+          axios.post(
+            'https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail',
+            { orderNumber: `STORE-${order.id}` },
+            { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+          )
         );
 
         const cjData = orderInfoRes.data?.data;
+
+        // ✨ CJ كيرجع business errors بـ code 200 HTTP + code داخلي — نفحصوهم
+        if (orderInfoRes.data?.code !== 200) {
+          console.warn(`⚠️ [Tracking] CJ said for #${order.id}: ${orderInfoRes.data?.message} (code: ${orderInfoRes.data?.code})`);
+          continue; // الطلب ماكاينش فـ CJ أصلاً (fulfillment فاشل ولا مازال) — نسكيبيه بهدوء
+        }
+
         const trackNumber = cjData?.trackNumber || cjData?.trackingNumber;
 
         // ✨ إذا أصدرت CJ رقم التتبع للشحنة:
@@ -2277,9 +2286,13 @@ cron.schedule('30 * * * *', async () => {
               .catch(err => logger.logError('Tracking Email Dispatch', err));
           }
         }
-      } catch (orderErr) {
-        logger.logError(`Tracking Sync Order #${order.id}`, orderErr);
-      }
+        } catch (orderErr) {
+          logger.logError(`Tracking Sync Order #${order.id}`, {
+            status: orderErr?.response?.status,
+            cjBody: JSON.stringify(orderErr?.response?.data || {}).slice(0, 500), // 🎯 رسالة CJ الحقيقية
+            msg: orderErr?.message,
+          });
+        }
     }
   } catch (err) {
     logger.logError('CJ Tracking & WhatsApp Cron', err);
