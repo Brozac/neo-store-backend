@@ -382,6 +382,19 @@ app.post('/api/admin/add-coupon', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+// ✨ كوبون الاسترجاع — يُنشأ تلقائياً عند الإقلاع إن لم يكن موجوداً (سقف أمان: 10%)
+(async () => {
+  try {
+    await pool.query(
+      `INSERT INTO coupons (code, discount_type, discount_value, is_active)
+       VALUES ('LACLARC10', 'percentage', 10, true)
+       ON CONFLICT (code) DO NOTHING`
+    );
+    console.log('🎟️ Recovery coupon LACLARC10 ensured in DB.');
+  } catch (e) {
+    console.warn('Recovery coupon seed skipped:', e.message);
+  }
+})();
 
 app.get('/api/reviews/:productId', async (req, res) => {
   try {
