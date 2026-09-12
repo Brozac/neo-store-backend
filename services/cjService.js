@@ -108,20 +108,20 @@ const parseNumeric = (val) => {
 };
 
 // ==========================================
-// 3. محرك الـ Fulfillment والتقسيم الآلي المحصن
+// 3. محرك الـ Fulfillment المحصّن (V3 API — 2025)
 // ==========================================
 async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
   try {
     const addr = customerDetails?.address || {};
     const isSandbox = process.env.CJ_SANDBOX_MODE === 'true' ? 1 : 0;
 
-    // تنظيف اسم الزبون لضمان قبوله في CJ (CJ تطلب اسماً من كلمتين على الأقل)
+    // تنظيف اسم الزبون (CJ يطلب اسماً من كلمتين على الأقل)
     let safeCustomerName = (customerName || '').trim();
     if (!safeCustomerName || safeCustomerName.toLowerCase() === 'guest customer' || !safeCustomerName.includes(' ')) {
       safeCustomerName = safeCustomerName ? `${safeCustomerName} Customer` : 'Valued Customer';
     }
 
-    // استخراج الـ vid المؤكد
+    // استخراج الـ vid المؤكد + storeLineItemId (معرّف العنصر فـ DB)
     const cjProducts = [];
     for (const item of items) {
       let vid = item.vid;
@@ -133,7 +133,11 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
         }
       }
       if (vid) {
-        cjProducts.push({ vid, quantity: item.quantity || 1 });
+        cjProducts.push({
+          vid,
+          quantity: item.quantity || 1,
+          storeLineItemId: item.id ? String(item.id) : `item-${orderId}-${cjProducts.length}`,  // ✨ V3
+        });
       }
     }
 
@@ -143,7 +147,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
       return { success: false, reason: 'NO_CJ_VARIANTS' };
     }
 
-    // استعلام أفضل وأرخص شركات الشحن
+    // استعلام أفضل شركات الشحن
     let logisticsToTry = [];
     try {
       const freightRes = await cjRequest((token) =>
@@ -158,20 +162,20 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
       }
     } catch (e) {}
 
-    logisticsToTry = [...new Set([...logisticsToTry, 'CJPacket Sensitive', 'CJPacket Ordinary', 'CJPacket', 'YunExpress', '4PX'])];
+    logisticsToTry = [...new Set([...logisticsToTry, 'CJPacket Ordinary', 'CJPacket Sensitive', 'YunExpress', '4PX'])];
 
     let orderSuccess = false;
     let lastError = null;
     let needsSplitting = false;
     let successfulCJOrderNumber = null;
 
-    // تنظيف العنوان لمنع أخطاء التنسيق في CJ
     let safeLine1 = (addr.line1 || 'Main Street 1').trim();
     if (!/\d/.test(safeLine1)) safeLine1 += ' 1';
 
+    // ✨ V3 Base Payload
     const basePayload = {
       shippingCustomerName: safeCustomerName,
-      shippingCountry: addr.country || 'US',
+      shippingCountry: addr.country || 'United States',
       shippingCountryCode: addr.country || 'US',
       shippingProvince: addr.state || addr.city || 'State',
       shippingCity: addr.city || 'City',
@@ -179,13 +183,14 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
       shippingAddress2: addr.line2 || '',
       shippingZip: addr.postal_code || '10001',
       shippingPhone: customerDetails?.phone || '1234567890',
+      email: customerDetails?.email || '',  // ✨ V3 — نرسلوا إيميل العميل لـ CJ
       fromCountryCode: 'CN',
-      orderFlow: 1, // إنشاء ودفع تلقائي من رصيد محفظة CJ
-      payType: 2,   // الدفع عبر رصيد الحساب (CJ Balance)
-      isSandbox: isSandbox
+      orderFlow: 1,
+      shopLogisticsType: 3,               // ✨ V3 — CJ يختار المستودع الأمثل
+      isSandbox: isSandbox,
     };
 
-    // 1. محاولة إرسال الطلب مجمعاً كشحنة واحدة
+    // 1. محاولة الإرسال المجمّع
     for (const logisticName of logisticsToTry) {
       const targetOrderNumber = `STORE-${orderId}`;
       const cjOrderPayload = {
@@ -196,26 +201,40 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
       };
 
       try {
-        await new Promise(r => setTimeout(r, 1200)); // احترام QPS
+        await new Promise(r => setTimeout(r, 1200));
         const cjResponse = await cjRequest((token) =>
-          axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrderV2',
+          axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrderV3',  // ✨ V3
             cjOrderPayload,
             { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
           )
         );
 
         if (cjResponse.data.code === 200) {
-          console.log(`🚀 Order #${orderId} Auto-Paid & Sent to CJ successfully via ${logisticName}!`);
+          console.log(`🚀 Order #${orderId} sent to CJ via V3 API (logistic: ${logisticName})!`);
           orderSuccess = true;
           successfulCJOrderNumber = cjResponse.data.data?.orderNumber || targetOrderNumber;
+
+          // ✨ حفظ رقم CJ الرسمي — الـ Webhook tracker يقراه من هنا
+          await pool.query(
+            "UPDATE orders SET cj_order_number = $1 WHERE id = $2",
+            [successfulCJOrderNumber, orderId]
+          ).catch(() => {});
           break;
         } else {
           lastError = cjResponse.data;
 
-          // خطأ تعدد المستودعات (Warehouse Conflict)
+          // 1603000 = Warehouse split needed
           if (lastError.code === 1603000 || lastError.message?.includes('100230')) {
-            console.log(`⚠️ Order #${orderId} products reside in different warehouses. Initiating Auto-Split...`);
+            console.log(`⚠️ Order #${orderId} needs Auto-Split (different warehouses)...`);
             needsSplitting = true;
+            break;
+          }
+
+          // ✨ 1603003 = موجود أصلاً (fulfillment سابق)
+          if (lastError.code === 1603003) {
+            console.log(`ℹ️ [CJ] Order #${orderId} already exists — treating as success.`);
+            orderSuccess = true;
+            successfulCJOrderNumber = targetOrderNumber;
             break;
           }
 
@@ -224,13 +243,20 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
           }
         }
       } catch (err) {
+        // ✨ 1603003 يمكن يجي كـ HTTP exception
+        if (err.response?.data?.code === 1603003) {
+          console.log(`ℹ️ [CJ] Order #${orderId} already exists (exception) — success.`);
+          orderSuccess = true;
+          successfulCJOrderNumber = targetOrderNumber;
+          break;
+        }
         lastError = err.response?.data || err.message;
       }
     }
 
-    // 2. منطق التقسيم الذكي المحصن (Bulletproof Auto-Split)
+    // 2. Auto-Split (V3)
     if (!orderSuccess && needsSplitting) {
-      console.log(`📦 Executing Auto-Split for Order #${orderId} (${cjProducts.length} items)...`);
+      console.log(`📦 Executing Auto-Split V3 for Order #${orderId}...`);
       let successfulSplits = 0;
       const splitOrdersCreated = [];
 
@@ -250,62 +276,62 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
           try {
             await new Promise(r => setTimeout(r, 1200));
             const splitRes = await cjRequest((token) =>
-              axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrderV2',
+              axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrderV3',  // ✨ V3
                 splitPayload,
                 { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
               )
             );
 
             if (splitRes.data.code === 200) {
-              console.log(`✅ Split [${i + 1}/${cjProducts.length}] sent successfully via ${logisticName}!`);
+              console.log(`✅ Split [${i + 1}/${cjProducts.length}] sent via ${logisticName}!`);
               itemSuccess = true;
               successfulSplits++;
               splitOrdersCreated.push(splitOrderNum);
               break;
             }
-          } catch (err) {}
+          } catch (err) {
+            if (err.response?.data?.code === 1603003) {
+              console.log(`ℹ️ [CJ Split] ${splitOrderNum} already exists.`);
+              itemSuccess = true;
+              successfulSplits++;
+              splitOrdersCreated.push(splitOrderNum);
+              break;
+            }
+          }
         }
       }
 
-      // التحقق من نتيجة التقسيم
       if (successfulSplits === cjProducts.length) {
         console.log(`🎉 All ${successfulSplits} split shipments succeeded for Order #${orderId}!`);
         orderSuccess = true;
         successfulCJOrderNumber = splitOrdersCreated.join(', ');
       } else if (successfulSplits > 0) {
-        // حماية أموالك: إذا نجح جزء وفشل جزء، لا تعيد الطلب بالكامل
         console.error(`🚨 Partial fulfillment on Order #${orderId}: ${successfulSplits}/${cjProducts.length} shipped.`);
         await pool.query(
           "UPDATE orders SET status = 'manual', shipping_address = $1 WHERE id = $2",
-          [`PARTIAL SUCCESS (${successfulSplits}/${cjProducts.length} items shipped). Check: ${splitOrdersCreated.join(', ')}`, orderId]
+          [`PARTIAL SUCCESS (${successfulSplits}/${cjProducts.length} shipped): ${splitOrdersCreated.join(', ')}`, orderId]
         );
         return { success: false, partial: true, error: 'Partial fulfillment' };
       }
     }
 
-    // ✨ 3. النتيجة وتحديث قاعدة البيانات وإرجاع الرد الحقيقي
+    // 3. النتيجة النهائية + حفظ cj_order_number
     if (orderSuccess) {
-      // تحديث الحالة إلى fulfilled
       await pool.query("UPDATE orders SET status = 'fulfilled' WHERE id = $1", [orderId]);
-      return { 
-        success: true, 
-        orderNumber: successfulCJOrderNumber 
-      };
+      await pool.query(
+        "UPDATE orders SET cj_order_number = $1 WHERE id = $2",
+        [successfulCJOrderNumber, orderId]
+      ).catch(() => {});
+      return { success: true, orderNumber: successfulCJOrderNumber };
     } else {
       console.error(`❌ CJ Order Fulfillment Failed for #${orderId}. Reason:`, lastError);
       await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
-      return { 
-        success: false, 
-        error: lastError 
-      };
+      return { success: false, error: lastError };
     }
   } catch (err) {
     logger.logError(`CJ Fulfillment Fatal Error #${orderId}`, err);
     await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
-    return { 
-      success: false, 
-      error: err.message 
-    };
+    return { success: false, error: err.message };
   }
 }
 
