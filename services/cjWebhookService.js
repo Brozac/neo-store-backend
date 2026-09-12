@@ -214,13 +214,20 @@ async function cjWebhookHandler(req, res) {
         console.log('   Type:', event.type, '/', event.messageType);
         console.log('   Body (first 200):', rawBody.toString('utf8').slice(0, 200));
         console.log('   Received sign:', String(signHeader).slice(0, 50));
-        console.log('   Try HMAC with these secrets:');
+                console.log('   Try HMAC with these secrets:');
         [
           ['CJ_OPEN_ID', process.env.CJ_OPEN_ID],
           ['CJ_API_KEY', process.env.CJ_API_KEY],
+          ['MCP_TOKEN_FULL', process.env.CJ_MCP_TOKEN],        // ✨ زيد: MCP كامل من env
+          ['API_KEY_AS_IS', process.env.CJ_API_KEY],           // مرجع
         ].forEach(([name, secret]) => {
           if (secret) {
-            console.log(`   ${name} → ${crypto.createHmac('sha256', secret).update(rawBody).digest('base64').slice(0, 50)}...`);
+            // ✨ كنجربو تا الـ JWT الجزء الأخير (مورا @CJ:)
+            const extracted = secret.includes('@CJ:') ? secret.split('@CJ:')[1] : secret;
+            console.log(`   ${name} → ${crypto.createHmac('sha256', extracted).update(rawBody).digest('base64').slice(0, 50)}...`);
+            if (extracted !== secret) {
+              console.log(`   ${name} (extracted JWT part) → ${crypto.createHmac('sha256', extracted).update(rawBody).digest('base64').slice(0, 50)}...`);
+            }
           }
         });
         console.log('   💡 Match one? That\'s your CJ_OPEN_ID for webhooks');
