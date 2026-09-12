@@ -292,4 +292,4 @@ async function subscribeAllStoreProducts() {
   return { total: ids.length, success, failed };
 }
 
-module.exports = { cjWebhookHandler, registerWebhooks, subscribeAllStoreProducts, verifySignature };
+module.exports = { cjWebhookHandler, registerWebhooks, subscribeAllStoreProducts };
