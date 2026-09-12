@@ -25,3 +25,9 @@ npm-debug.log*
 .cache/
 /uploads/
 *.bak*
+
+fix_laclarc*
+check_laclarc*
+final_fix*
+
+*.bak*
