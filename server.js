@@ -168,6 +168,11 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
     })();
   }
 });
+// ==========================================
+// 1.5 مسار CJ Webhook (يجب أن يبقى قبل express.json — بحال Stripe)
+// ==========================================
+const { cjWebhookHandler } = require('./services/cjWebhookService');
+app.post('/api/cj-webhook', express.raw({ type: 'application/json' }), cjWebhookHandler);
 
 // ==========================================
 // 2. Middlewares الأساسية
@@ -440,7 +445,35 @@ app.post('/api/admin/add-review', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+// ==========================================
+// 🐺 CJ Webhooks Management (Admin)
+// ==========================================
+const { registerWebhooks, subscribeAllStoreProducts } = require('./services/cjWebhookService');
 
+app.post('/api/admin/webhook/register', async (req, res) => {
+  try {
+    const callbackUrl = `${process.env.BACKEND_URL || 'https://neo-store-backend.onrender.com'}/api/cj-webhook`;
+    const response = await registerWebhooks(callbackUrl);
+    if (response.data?.code === 200) {
+      res.json({ message: `✅ Webhooks registered! Callback: ${callbackUrl}` });
+    } else {
+      res.status(400).json({ error: response.data?.message || 'Registration failed' });
+    }
+  } catch (err) {
+    logger.logError('Webhook Register', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/webhook/subscribe', async (req, res) => {
+  try {
+    const result = await subscribeAllStoreProducts();
+    res.json({ message: `📌 Subscribed ${result.success}/${result.total} products (${result.failed} failed/skipped)` });
+  } catch (err) {
+    logger.logError('Webhook Subscribe', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 // ==========================================
 // مسار إضافة تقييم معتمد من مستخدم مسجل (مع دعم رفع الصور)
 // ==========================================
