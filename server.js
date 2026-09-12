@@ -2379,69 +2379,60 @@ cron.schedule('0 */2 * * *', async () => {
 // ✅ GET ماشي POST (16900202 مؤكدة بالتجربة — الكومنتار القديم كان غالط)
 // ✅ guards + RETURNING = dedup مع الويب هوك + notifyShipment الموحدة
 cron.schedule('30 * * * *', async () => {
-  console.log('⏳ [CJ Logistics v2] Checking for newly dispatched tracking numbers...');
+  console.log('\u23f3 [CJ Logistics v3] Batch tracking (1 call / up to 50 orders)...');
   try {
     const { rows: pendingTrackingOrders } = await pool.query(`
-      SELECT id, customer_name, customer_email, customer_phone, total_amount, cj_order_number
+      SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number
       FROM orders
       WHERE status IN ('paid', 'fulfilled')
         AND (tracking_number IS NULL OR tracking_number = '')
         AND created_at >= NOW() - INTERVAL '15 days'
-      LIMIT 10;
+      LIMIT 50;
     `);
-
     if (pendingTrackingOrders.length === 0) return;
 
-    for (const order of pendingTrackingOrders) {
-      try {
-        await new Promise(r => setTimeout(r, 1200)); // QPS=1
+    // \u2b50 1.16 \u0642\u064a\u0628\u0644: \u0631\u0642\u0645 CJ (SD...) / \u0631\u0642\u0645 \u0627\u0644\u0645\u062a\u062c\u0631 (STORE-x) / order id
+    const keys = pendingTrackingOrders.map(o => {
+      const stored = String(o.cj_order_number || '').trim();
+      const key = stored && !/^STORE-/i.test(stored) ? stored : `STORE-${o.id}`;
+      return { order: o, key };
+    });
 
-        const stored = String(order.cj_order_number || '').trim();
-        const cjNum = (stored || `STORE-${order.id}`).split(',')[0].trim();
+    const batchRes = await cjRequest((token) =>
+      axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetailBatch',
+        { orderIds: keys.map(k => k.key) },
+        { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+      )
+    );
 
-        let orderInfoRes = await cjRequest((token) =>
-          axios.get('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail', {
-            params: { orderId: cjNum, orderNumber: cjNum }, // ⭐ درس #62: orderId هو المعرف الداخلي (SD...)
-            headers: { 'CJ-Access-Token': token },
-          })
-        );
+    if (batchRes.data?.code !== 200) {
+      // 1600000 = retry later (\u0645\u0627\u0634\u064a "\u0645\u0627\u0643\u0627\u0645\u0643\u0634") — \u0627\u0644\u062f\u0648\u0631\u0629 \u0627\u0644\u062c\u0627\u064a\u0629 \u062a\u0639\u0627\u0648\u062f
+      console.warn(`\u26a0\ufe0f [Tracking] Batch: ${batchRes.data?.message} (code: ${batchRes.data?.code})`);
+      return;
+    }
+    const list = Array.isArray(batchRes.data?.data) ? batchRes.data.data : [];
 
-        if (orderInfoRes.data?.code !== 200 && !/^STORE-/i.test(cjNum)) {
-          // 🔄 fallback: الرقم الداخلي (SD...) ما نتقراش — نجربو بالرقم التجاري ديالنا
-          const altRes = await cjRequest((token) =>
-            axios.get('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail', {
-              params: { orderNumber: `STORE-${order.id}` },
-              headers: { 'CJ-Access-Token': token },
-            })
-          );
-          if (altRes.data?.code === 200) orderInfoRes = altRes;
-        }
-        if (orderInfoRes.data?.code !== 200) {
-          console.warn(`⚠️ [Tracking] CJ said for #${order.id}: ${orderInfoRes.data?.message} (code: ${orderInfoRes.data?.code})`);
-          continue;
-        }
+    // \ud83d\udd2c \u0639\u064a\u0646\u0629 \u0623\u0648\u0644 \u0642\u0631\u0627\u0621\u0629 Batch — \u0622\u062e\u0631 \u0639\u064a\u0646\u0629 \u0641\u0627\u0644\u0645\u0634\u0631\u0648\u0639
+    if (!global._cjSample_OrderDetailBatch) {
+      global._cjSample_OrderDetailBatch = true;
+      console.log('[Sample OrderDetailBatch]', JSON.stringify(list[0] || {}).slice(0, 1000));
+    }
 
-        const cjData = orderInfoRes.data?.data || {};
+    // \u0641\u0647\u0631\u0633\u0629 \u0628\u0627\u0644\u062c\u0648\u062c \u0627\u0644\u0645\u0641\u0627\u062a\u064a\u062d (orderNum = STORE-x | cjOrderCode = SD...)
+    const byKey = new Map();
+    for (const d of list) {
+      if (d.orderNum) byKey.set(String(d.orderNum).toLowerCase(), d);
+      if (d.cjOrderCode) byKey.set(String(d.cjOrderCode).toLowerCase(), d);
+    }
 
-        // 🔬 عينة أول قراءة REST — نضبطو الحقول على الواقع
-        if (!global._cjSample_OrderDetail) {
-          global._cjSample_OrderDetail = true;
-          console.log('🔬 [Sample OrderDetail REST]', JSON.stringify(cjData).slice(0, 800));
-        }
+    for (const { order, key } of keys) {
+      const d = byKey.get(key.toLowerCase());
+      if (!d) continue; // CJ \u062a\u062e\u0637\u0627\u0647 \u0628\u0635\u0645\u062a — \u0646\u0633\u062a\u0646\u0648 \u0627\u0644\u062f\u0648\u0631\u0629 \u0627\u0644\u062c\u0627\u064a\u0629
 
-        const info = cjData.orderInfo || cjData;
-        const cjStatus = String(info.orderStatus || info.status || '').toUpperCase();
-        const trackNumber = info.logisticsShipmentNumber || info.trackNumber || info.trackingNumber
-          || (Array.isArray(cjData.products)
-            ? cjData.products.map(p => p.logisticsShipmentNumber || p.trackNumber || p.trackingNumber).find(Boolean)
-            : null);
+      const status = String(d.orderStatus || '').toUpperCase();
+      const track = String(d.trackNumber || '').trim();
 
-        if (cjStatus !== 'SHIPPED' && cjStatus !== 'DISPATCHED') continue;
-        if (!trackNumber || typeof trackNumber !== 'string' || trackNumber.trim().length <= 3) continue;
-
-        console.log(`🚀 [CJ Dispatched] Tracking for Order #${order.id}: ${trackNumber.trim()}`);
-
-        // ✅ إلا الويب هوك سبقنا → RETURNING فاضي → ما نعاودوش نأذينا العميل
+      if (status === 'SHIPPED' && track.length > 3) {
         const upd = await pool.query(
           `UPDATE orders
              SET tracking_number = $1, status = 'fulfilled',
@@ -2449,12 +2440,32 @@ cron.schedule('30 * * * *', async () => {
            WHERE id = $2 AND status = 'paid'
              AND (tracking_number IS NULL OR tracking_number = '')
            RETURNING id`,
-          [trackNumber.trim(), order.id, cjNum]
+          [track, order.id, d.cjOrderCode || key]
         );
-        if (!upd.rows.length) continue;
-
-        await notifyShipment(order, trackNumber.trim(), info.logisticName);
-      } catch (e) { /* طلب فاشل ما يوقفش الجولة */ }
+        if (upd.rows.length) {
+          console.log(`\ud83d\ude80 [CJ Dispatched] #${order.id}: ${track} (${d.logisticName || '?'})`);
+          await notifyShipment(order, track, d.logisticName);
+        }
+      } else if (status === 'DELIVERED') {
+        if (order.status === 'paid' && track.length > 3) {
+          // \ud83d\udea8 \u0641\u0627\u062a\u0646\u0627 SHIPPED (\u0648\u064a\u0628 \u0647\u0648\u0643 \u0636\u0627\u064a\u0639) — \u0625\u0634\u0639\u0627\u0631 \u0645\u062a\u0623\u062e\u0631 \u062e\u064a\u0631 \u0645\u0646 \u0648\u0627\u0644\u0648
+          const upd = await pool.query(
+            `UPDATE orders SET tracking_number = $1, status = 'fulfilled'
+             WHERE id = $2 AND status = 'paid' AND (tracking_number IS NULL OR tracking_number = '') RETURNING id`,
+            [track, order.id]
+          );
+          if (upd.rows.length) {
+            console.log(`[CJ] #${order.id} DELIVERED (SHIPPED \u0641\u0627\u062a) — \u0625\u0634\u0639\u0627\u0631 \u0645\u062a\u0623\u062e\u0631`);
+            await notifyShipment(order, track, d.logisticName);
+          }
+        } else if (order.status === 'fulfilled') {
+          const upd = await pool.query(
+            "UPDATE orders SET status = 'completed' WHERE id = $1 AND status = 'fulfilled' RETURNING id",
+            [order.id]
+          );
+          if (upd.rows.length) console.log(`[CJ] #${order.id} DELIVERED -> completed`);
+        }
+      }
     }
   } catch (err) {
     logger.logError('CJ Logistics Cron', err);

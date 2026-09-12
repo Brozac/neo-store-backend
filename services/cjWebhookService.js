@@ -93,10 +93,15 @@ function verifySignatureFlexible(rawBody, signHeader, eventOpenId) {
 //   الإرسال لـ CJ) — لا كتابة DB
 // ==========================================
 const CJ_ORDER_STATUS_MAP = {
-  CREATED: 'paid', IN_STOCK: 'paid', IN_PROGRESS: 'paid',
-  SHIPPED: 'fulfilled', DISPATCHED: 'fulfilled',
-  DELIVERED: 'completed', COMPLETED: 'completed',
-  CANCELLED: 'manual', CLOSED: 'manual', REFUND_COMPLETE: 'manual', INTERCEPT: 'manual',
+  // ⭐ الحالات الرسمية (Order Status docs — مؤكدة 2026):
+  CREATED: 'paid', IN_CART: 'paid', UNPAID: 'paid',        // معلومات — الزبون دفع عندنا أصلاً
+  PENDING: 'paid', PROCESSING: 'paid', UNSHIPPED: 'paid',  // aggregate + sub-status — معلومات فقط
+  SHIPPED: 'fulfilled',
+  DELIVERED: 'completed',
+  CANCELLED: 'manual',
+  // 🛡️ احتياط (أسماء قديمة/غير رسمية — ما تضرش):
+  IN_STOCK: 'paid', IN_PROGRESS: 'paid', DISPATCHED: 'fulfilled',
+  COMPLETED: 'completed', CLOSED: 'manual', REFUND_COMPLETE: 'manual', INTERCEPT: 'manual',
 };
 const STATUS_RANK = { pending: 0, manual: 0, paid: 1, fulfilled: 2, completed: 3 };
 
