@@ -2446,22 +2446,7 @@ cron.schedule('30 * * * *', async () => {
           console.log(`\ud83d\ude80 [CJ Dispatched] #${order.id}: ${track} (${d.logisticName || '?'})`);
           await notifyShipment(order, track, d.logisticName);
         }
-      } else if (status === 'CREATED' && !d.logisticName && !d.paymentDate) {
-        // 🤖 طلب عالق: CREATED بلا شحن بلا دفع — auto-repair إلا عدا 2س
-        const ageMs = order.created_at ? Date.now() - new Date(order.created_at).getTime() : 0;
-        if (ageMs > 2 * 3600 * 1000) {
-          const rep = await autoRepairLogistics(d.cjOrderCode || key);
-          if (rep.repaired) {
-            console.log('[AutoHeal] #' + order.id + ': shipping bound ' + rep.logisticsName + ' ($' + rep.postage + ')');
-          } else if (!global['_cjStuck_' + order.id]) {
-            global['_cjStuck_' + order.id] = true;
-            sendAdminAlert(
-              '[CJ] Stuck order (no logistics) #' + order.id + ' - ' + (d.cjOrderCode || key),
-              '<p>Status CREATED, no logistics, no payment at CJ. Auto-repair failed: ' + rep.reason + '</p>'
-            );
-          }
-        }
-} else if (status === 'DELIVERED') {
+      } else if (status === 'DELIVERED') {
         if (order.status === 'paid' && track.length > 3) {
           // \ud83d\udea8 \u0641\u0627\u062a\u0646\u0627 SHIPPED (\u0648\u064a\u0628 \u0647\u0648\u0643 \u0636\u0627\u064a\u0639) — \u0625\u0634\u0639\u0627\u0631 \u0645\u062a\u0623\u062e\u0631 \u062e\u064a\u0631 \u0645\u0646 \u0648\u0627\u0644\u0648
           const upd = await pool.query(
