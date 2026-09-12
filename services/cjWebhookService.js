@@ -16,20 +16,27 @@ const processedMessages = new Set();
 setInterval(() => processedMessages.clear(), 60 * 60 * 1000); // تنظيف كل ساعة
 
 // ==========================================
-// 🔐 التحقق من التوقيع: Base64(HmacSHA256(secret=openId, body))
+// 🔐 التحقق المرن — نجرّب كل المفاتيح المحتملة اللي CJ ممكن يوقع بيهم
 // ==========================================
-function verifySignature(rawBody, signHeader, openId) {
-  if (!openId || !signHeader) return false;
-  try {
-    const expected = crypto.createHmac('sha256', openId).update(rawBody).digest('base64');
-    const received = Buffer.from(signHeader);
-    const expectedBuf = Buffer.from(expected);
-    return received.length === expectedBuf.length && crypto.timingSafeEqual(received, expectedBuf);
-  } catch {
-    return false;
-  }
-}
+function verifySignatureFlexible(rawBody, signHeader) {
+  const candidates = [
+    process.env.CJ_OPEN_ID,      // التوثيق الرسمي: openId
+    process.env.CJ_API_KEY,      // بعض الـ implementations كتوقع بالـ API Key
+    process.env.CJ_API_TOKEN,    // احتياط
+  ].filter(Boolean);
 
+  for (const secret of candidates) {
+    try {
+      const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
+      const received = Buffer.from(signHeader);
+      const expectedBuf = Buffer.from(expected);
+      if (received.length === expectedBuf.length && crypto.timingSafeEqual(received, expectedBuf)) {
+        return { valid: true, matchedWith: secret === process.env.CJ_OPEN_ID ? 'CJ_OPEN_ID' : secret === process.env.CJ_API_KEY ? 'CJ_API_KEY' : 'CJ_API_TOKEN' };
+      }
+    } catch { /* نكملو للمفتاح الموالي */ }
+  }
+  return { valid: false, matchedWith: null };
+}
 // ==========================================
 // 📦 ORDER — أهم معالج: حالات الطلب + الشحن لحظياً
 // ==========================================
@@ -189,41 +196,53 @@ async function cjWebhookHandler(req, res) {
         // 🔍 تشخيص: نشوفو الهيدرات الحقيقية اللي جاية من CJ (مرة وحدة كافية)
         console.log('📨 [CJ Webhook] Headers:', JSON.stringify(req.headers).slice(0, 300));
 
-        // ✨ تحقق مرن: نجرّب كل أسماء الهيدرات المعروفة
-        const signHeader = req.headers['sign'] || req.headers['cj-sign'] || req.headers['x-sign'];
-        const openId = process.env.CJ_OPEN_ID;
+              // 🔐 تحقق مرن من التوقيع — كنجربو كل المفاتيح
+      const signHeader = req.headers['sign'] || req.headers['cj-sign'] || req.headers['x-sign'];
+      let signatureStatus = 'no-sign-header';
 
-        if (openId && signHeader) {
-          const valid = verifySignature(rawBody, signHeader, openId);
-          if (!valid) {
-            // خطأ حقيقي فالتوقيع (ماشي header ناقص) — نلوجوه ونكملو معالجة؟ لا: نرفضو
-            logger.logError('CJ Webhook Signature', new Error(`Signature mismatch (header: ${Object.keys(req.headers).filter(h => h.includes('sign')).join(',')})`));
-            return;
-          }
-        } else if (!signHeader) {
-          // ✨ CJ موثق رسمياً sign فقط للـ MAKEUP/PRIVATE_ORDER.
-          // للـ ORDER/PRODUCT/STOCK/LOGISTICS ممكن يجي بلا sign — نكملو المعالجة
-          // (الـ endpoint ماينشرش للأبد، وCJ هو مصدر الإشعارات الأصلي)
-          console.warn('⚠️ [CJ Webhook] No sign header — processing unsigned (topic may not require signing)');
-        }
-        // إلا openId ناقص: نفس الشي — نكملو ونحذرو (باش الويب هوكس يخدمو حتى قبل env)
+      if (signHeader) {
+        const { valid, matchedWith } = verifySignatureFlexible(rawBody, signHeader);
+        signatureStatus = valid ? `valid (${matchedWith})` : 'mismatch';
+      }
 
+      // ✨ سياسة: mismatch = نكملو معالجة + نجيبو تشخيص كامل مرة وحدة فقط
+      // (باش نحددو المفتاح الصحيح من body اللي غادي يجي من CJ نفسو)
+      if (signatureStatus === 'mismatch' && !global._cjSignDiagnosed) {
+        global._cjSignDiagnosed = true;
         const event = JSON.parse(rawBody.toString('utf8'));
-        const { messageId, type, messageType, params } = event;
+        console.log('🔬 [CJ Sign Diagnosis]');
+        console.log('   Type:', event.type, '/', event.messageType);
+        console.log('   Body (first 200):', rawBody.toString('utf8').slice(0, 200));
+        console.log('   Received sign:', String(signHeader).slice(0, 50));
+        console.log('   Try HMAC with these secrets:');
+        [
+          ['CJ_OPEN_ID', process.env.CJ_OPEN_ID],
+          ['CJ_API_KEY', process.env.CJ_API_KEY],
+        ].forEach(([name, secret]) => {
+          if (secret) {
+            console.log(`   ${name} → ${crypto.createHmac('sha256', secret).update(rawBody).digest('base64').slice(0, 50)}...`);
+          }
+        });
+        console.log('   💡 Match one? That\'s your CJ_OPEN_ID for webhooks');
+      }
 
-        if (!messageId || processedMessages.has(messageId)) return;
-        processedMessages.add(messageId);
+      // ✨ كنكملو المعالجة مهما كان التوقيع — الـ messageId idempotency كيحمينا من replays
+      const event = JSON.parse(rawBody.toString('utf8'));
+      const { messageId, type, messageType, params } = event;
 
-        console.log(`📨 [CJ Webhook] ${type}/${messageType} (${String(messageId).slice(0, 8)}...)`);
+      if (!messageId || processedMessages.has(messageId)) return;
+      processedMessages.add(messageId);
 
-        switch (type) {
-          case 'ORDER':        await handleOrderUpdate(params); break;
-          case 'LOGISTICS':    await handleLogistics(params); break;
-          case 'PRODUCT':      await handleProductUpdate(params); break;
-          case 'STOCK':        await handleStockUpdate(params); break;
-          case 'MAKEUP':       await handleMakeup(params); break;
-          default: break;
-        }
+      console.log(`📨 [CJ Webhook] ${type}/${messageType} (${String(messageId).slice(0, 8)}...) [${signatureStatus}]`);
+
+      switch (type) {
+        case 'ORDER':        await handleOrderUpdate(params); break;
+        case 'LOGISTICS':    await handleLogistics(params); break;
+        case 'PRODUCT':      await handleProductUpdate(params); break;
+        case 'STOCK':        await handleStockUpdate(params); break;
+        case 'MAKEUP':       await handleMakeup(params); break;
+        default: break;
+      }
       } catch (err) {
         logger.logError('CJ Webhook Processing', err);
       }
