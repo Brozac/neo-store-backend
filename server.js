@@ -2397,13 +2397,23 @@ cron.schedule('30 * * * *', async () => {
         const stored = String(order.cj_order_number || '').trim();
         const cjNum = (stored || `STORE-${order.id}`).split(',')[0].trim();
 
-        const orderInfoRes = await cjRequest((token) =>
+        let orderInfoRes = await cjRequest((token) =>
           axios.get('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail', {
             params: { orderNumber: cjNum },
             headers: { 'CJ-Access-Token': token },
           })
         );
 
+        if (orderInfoRes.data?.code !== 200 && !/^STORE-/i.test(cjNum)) {
+          // 🔄 fallback: الرقم الداخلي (SD...) ما نتقراش — نجربو بالرقم التجاري ديالنا
+          const altRes = await cjRequest((token) =>
+            axios.get('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail', {
+              params: { orderNumber: `STORE-${order.id}` },
+              headers: { 'CJ-Access-Token': token },
+            })
+          );
+          if (altRes.data?.code === 200) orderInfoRes = altRes;
+        }
         if (orderInfoRes.data?.code !== 200) {
           console.warn(`⚠️ [Tracking] CJ said for #${order.id}: ${orderInfoRes.data?.message} (code: ${orderInfoRes.data?.code})`);
           continue;

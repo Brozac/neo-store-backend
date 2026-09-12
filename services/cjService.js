@@ -238,7 +238,11 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
     //    + 🔬 عينة أول نجاح (نفس منهجية الويب هوك — اللوج هو ground truth)
     function extractCjNumber(dataObj) {
       const d = dataObj || {};
-      return d.orderNumber || d.cjOrderId || d.orderId || d.cjOrderNumber || null;
+      // ⭐ العينة الذهبية (#62): orderNumber = صدى رقمنا (STORE-x) | orderId = رقم CJ الحقيقي (SD/BT...)
+      const isOurEcho = (v) => typeof v === 'string' && /^STORE-/i.test(v);
+      if (d.orderId && !isOurEcho(d.orderId)) return d.orderId;
+      if (d.orderNumber && !isOurEcho(d.orderNumber)) return d.orderNumber;
+      return d.cjOrderId || d.cjOrderNumber || null;
     }
     function sampleOnce(tag, obj) {
       const key = `_cjSample_${tag}`;
