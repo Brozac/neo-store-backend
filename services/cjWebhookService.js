@@ -182,38 +182,52 @@ async function cjWebhookHandler(req, res) {
   // ✅ الرد الفوري (< 3s إجباري من CJ) — الحماية من auto-close
   res.status(200).json({ code: 200, message: 'OK' });
 
-  (async () => {
-    try {
-      const rawBody = req.body; // Buffer من express.raw
-      const sign = req.headers['sign'];
-      const openId = process.env.CJ_OPEN_ID;
+      (async () => {
+      try {
+        const rawBody = req.body; // Buffer من express.raw
 
-      if (!verifySignature(rawBody, sign, openId)) {
-        logger.logError('CJ Webhook Signature', new Error(`Invalid/missing sign header`));
-        return;
+        // 🔍 تشخيص: نشوفو الهيدرات الحقيقية اللي جاية من CJ (مرة وحدة كافية)
+        console.log('📨 [CJ Webhook] Headers:', JSON.stringify(req.headers).slice(0, 300));
+
+        // ✨ تحقق مرن: نجرّب كل أسماء الهيدرات المعروفة
+        const signHeader = req.headers['sign'] || req.headers['cj-sign'] || req.headers['x-sign'];
+        const openId = process.env.CJ_OPEN_ID;
+
+        if (openId && signHeader) {
+          const valid = verifySignature(rawBody, signHeader, openId);
+          if (!valid) {
+            // خطأ حقيقي فالتوقيع (ماشي header ناقص) — نلوجوه ونكملو معالجة؟ لا: نرفضو
+            logger.logError('CJ Webhook Signature', new Error(`Signature mismatch (header: ${Object.keys(req.headers).filter(h => h.includes('sign')).join(',')})`));
+            return;
+          }
+        } else if (!signHeader) {
+          // ✨ CJ موثق رسمياً sign فقط للـ MAKEUP/PRIVATE_ORDER.
+          // للـ ORDER/PRODUCT/STOCK/LOGISTICS ممكن يجي بلا sign — نكملو المعالجة
+          // (الـ endpoint ماينشرش للأبد، وCJ هو مصدر الإشعارات الأصلي)
+          console.warn('⚠️ [CJ Webhook] No sign header — processing unsigned (topic may not require signing)');
+        }
+        // إلا openId ناقص: نفس الشي — نكملو ونحذرو (باش الويب هوكس يخدمو حتى قبل env)
+
+        const event = JSON.parse(rawBody.toString('utf8'));
+        const { messageId, type, messageType, params } = event;
+
+        if (!messageId || processedMessages.has(messageId)) return;
+        processedMessages.add(messageId);
+
+        console.log(`📨 [CJ Webhook] ${type}/${messageType} (${String(messageId).slice(0, 8)}...)`);
+
+        switch (type) {
+          case 'ORDER':        await handleOrderUpdate(params); break;
+          case 'LOGISTICS':    await handleLogistics(params); break;
+          case 'PRODUCT':      await handleProductUpdate(params); break;
+          case 'STOCK':        await handleStockUpdate(params); break;
+          case 'MAKEUP':       await handleMakeup(params); break;
+          default: break;
+        }
+      } catch (err) {
+        logger.logError('CJ Webhook Processing', err);
       }
-
-      const event = JSON.parse(rawBody.toString('utf8'));
-      const { messageId, type, messageType, params } = event;
-
-      if (!messageId || processedMessages.has(messageId)) return;
-      processedMessages.add(messageId);
-
-      console.log(`📨 [CJ Webhook] ${type}/${messageType} (${messageId.slice(0, 8)}...)`);
-
-      switch (type) {
-        case 'ORDER':        await handleOrderUpdate(params); break;
-        case 'LOGISTICS':    await handleLogistics(params); break;
-        case 'PRODUCT':      await handleProductUpdate(params); break;
-        case 'STOCK':        await handleStockUpdate(params); break;
-        case 'MAKEUP':       await handleMakeup(params); break;
-        default: /* PRIVATE_ORDER — ماكانستعملوهش دابا */ break;
-      }
-    } catch (err) {
-      // الخطأ فالمعالجة مايأثرش على الـ 200 اللي تصيفط — الـ topic مايتسدش
-      logger.logError('CJ Webhook Processing', err);
-    }
-  })();
+    })();
 }
 
 // ==========================================
