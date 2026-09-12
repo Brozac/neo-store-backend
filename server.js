@@ -1165,6 +1165,43 @@ app.put('/api/admin/manual-orders/reject/:id', async (req, res) => {
   }
 });
 
+app.put('/api/admin/retry-fulfillment/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid order id' });
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    const order = orderRes.rows[0];
+    if (!['manual', 'paid'].includes(order.status)) {
+      return res.status(409).json({ error: `Order is '${order.status}' — فقط manual أو paid يمكن إعادة إرسالهم` });
+    }
+    // تمكين محاولة جديدة: نحيدو cj_order_number القديم (الـ COALESCE ما يسمحش بالكتابة فوق)
+    await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1 AND status = 'manual'", [id]);
+    const itemsRes = await pool.query('SELECT * FROM order_items WHERE order_id = $1', [id]);
+
+    let parsedAddress = {};
+    try { parsedAddress = JSON.parse(order.shipping_address); }
+    catch (e) { parsedAddress = { line1: order.shipping_address, country: 'US' }; }
+
+    res.json({ message: 'Retry launched — شوف اللوج' });
+    (async () => {
+      try {
+        const customerDetails = {
+          address: parsedAddress,
+          phone: order.customer_phone || '',
+          email: order.customer_email || '',
+          name: order.customer_name,
+        };
+        const r = await fulfillCJOrder(order.id, order.customer_name, customerDetails, itemsRes.rows);
+        console.log(`🔁 [Retry] #${order.id} ->`, JSON.stringify(r).slice(0, 200));
+      } catch (bgErr) { logger.logError('Retry Fulfillment', bgErr); }
+    })();
+  } catch (err) {
+    logger.logError('Retry Fulfillment Route', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/admin/failed-orders', async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM orders WHERE status = 'manual' AND payment_method != 'BaridiMob' ORDER BY id DESC");

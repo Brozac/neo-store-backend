@@ -227,6 +227,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
       shippingZip: addr.postal_code || '10001',
       shippingPhone: customerDetails?.phone || '1234567890',
       email: safeEmail,                    // ✨ V3 — ديما إيميل صالح
+      platform: 'others',        // ✨ متجر مخصص — بلا هادا: 5027 Platform null not support
       fromCountryCode: 'CN',
       orderFlow: 1,
       shopLogisticsType: 3,               // ✨ V3 — CJ يختار المستودع الأمثل
