@@ -575,7 +575,7 @@ async function subscribeAllStoreProducts() {
     } catch (err) {
       logger.logError(`CJ Subscribe batch ${i / 100 + 1}`, err);
     }
-    await new Promise(r => setTimeout(r, 1200)); // invariant #6 — QPS=1
+    await new Promise(r => setTimeout(r, 3000)); // invariant #6 — QPS=1
   }
 
   return { total: ids.length, success, failed };
