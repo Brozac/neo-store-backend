@@ -240,6 +240,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
       const d = dataObj || {};
       // ⭐ العينة الذهبية (#62): orderNumber = صدى رقمنا (STORE-x) | orderId = رقم CJ الحقيقي (SD/BT...)
       const isOurEcho = (v) => typeof v === 'string' && /^STORE-/i.test(v);
+      if (d.cjOrderCode) return d.cjOrderCode; // ⭐ 1.7/1.16: SD... هو اللي كييجي فالويب هوكات
       if (d.orderId && !isOurEcho(d.orderId)) return d.orderId;
       if (d.orderNumber && !isOurEcho(d.orderNumber)) return d.orderNumber;
       return d.cjOrderId || d.cjOrderNumber || null;
@@ -314,7 +315,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
             await new Promise(r => setTimeout(r, 1200));
             const detail = await cjRequest((token) =>
               axios.get(`${CJ_API}/shopping/order/getOrderDetail`, {
-                params: { orderNumber: targetOrderNumber },
+                params: { orderId: targetOrderNumber }, // ⭐ 1.7: اسم الـ param هو orderId — ويقبل STORE-x مباشرة
                 headers: { 'CJ-Access-Token': token },
               })
             );
