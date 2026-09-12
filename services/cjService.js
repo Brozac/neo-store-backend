@@ -108,9 +108,14 @@ const parseNumeric = (val) => {
 };
 
 // ==========================================
-// 3. محرك الـ Fulfillment المحصّن (V3 API — 2025)
+// 3. محرك الـ Fulfillment المحصّن (V3 API — 2025) — v2 متكامل مع الويب هوك
+// ⚠️ القاعدة الذهبية: 'fulfilled' عندنا = SHIPPED فعلي من CJ (الويب هوك فقط!)
+//    القبول عند CJ = الطلب يبقى 'paid' — والويب هوك هو اللي كيرفع الحالة
 // ==========================================
+const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
+
 async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
+  let cjCreated = false; // 🛡️ واقي الـ catch الفادح — لا manual إلا إلا ما وصل حتى إرسال لـ CJ
   try {
     const addr = customerDetails?.address || {};
     const isSandbox = process.env.CJ_SANDBOX_MODE === 'true' ? 1 : 0;
@@ -120,6 +125,9 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
     if (!safeCustomerName || safeCustomerName.toLowerCase() === 'guest customer' || !safeCustomerName.includes(' ')) {
       safeCustomerName = safeCustomerName ? `${safeCustomerName} Customer` : 'Valued Customer';
     }
+
+    // ✨ V3 كيطلب إيميل صالح — الطلبات بلا إيميل (هاتف فقط) نعطيوه عنواناً مؤسسياً
+    const safeEmail = (customerDetails?.email || '').trim() || 'orders@laclarc.com';
 
     // استخراج الـ vid المؤكد + storeLineItemId (معرّف العنصر فـ DB)
     const cjProducts = [];
@@ -151,7 +159,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
     let logisticsToTry = [];
     try {
       const freightRes = await cjRequest((token) =>
-        axios.post('https://developers.cjdropshipping.com/api2.0/v1/logistic/freightCalculate', {
+        axios.post(`${CJ_API}/logistic/freightCalculate`, {
           startCountryCode: 'CN',
           endCountryCode: addr.country || 'US',
           products: cjProducts.map(p => ({ vid: p.vid, quantity: p.quantity }))
@@ -183,12 +191,35 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
       shippingAddress2: addr.line2 || '',
       shippingZip: addr.postal_code || '10001',
       shippingPhone: customerDetails?.phone || '1234567890',
-      email: customerDetails?.email || '',  // ✨ V3 — نرسلوا إيميل العميل لـ CJ
+      email: safeEmail,                    // ✨ V3 — ديما إيميل صالح
       fromCountryCode: 'CN',
       orderFlow: 1,
       shopLogisticsType: 3,               // ✨ V3 — CJ يختار المستودع الأمثل
       isSandbox: isSandbox,
     };
+
+    // 🔧 استخراج رقم CJ (BT...) من أي response — الأسماء ما مؤكدينش، نجربو المست slaughtered_shuffle كلهم
+    //    + 🔬 عينة أول نجاح (نفس منهجية الويب هوك — اللوج هو ground truth)
+    function extractCjNumber(dataObj) {
+      const d = dataObj || {};
+      return d.orderNumber || d.cjOrderId || d.orderId || d.cjOrderNumber || null;
+    }
+    function sampleOnce(tag, obj) {
+      const key = `_cjSample_${tag}`;
+      if (!global[key]) {
+        global[key] = true;
+        console.log(`🔬 [Sample ${tag}]`, JSON.stringify(obj || {}).slice(0, 600));
+      }
+    }
+
+    // 🔧 حفظ آمن — COALESCE pattern ديال الويب هوك: عمرو ما كيطمش BT موجود بـ STORE-x
+    async function saveCjNumber(num) {
+      if (!num) return;
+      await pool.query(
+        `UPDATE orders SET cj_order_number = COALESCE(NULLIF(cj_order_number,''), NULLIF($1,'')) WHERE id = $2`,
+        [String(num), orderId]
+      ).catch(() => {});
+    }
 
     // 1. محاولة الإرسال المجمّع
     for (const logisticName of logisticsToTry) {
@@ -201,9 +232,9 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
       };
 
       try {
-        await new Promise(r => setTimeout(r, 1200));
+        await new Promise(r => setTimeout(r, 1200)); // invariant #6 — QPS=1
         const cjResponse = await cjRequest((token) =>
-          axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrderV3',  // ✨ V3
+          axios.post(`${CJ_API}/shopping/order/createOrderV3`,
             cjOrderPayload,
             { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
           )
@@ -212,42 +243,86 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
         if (cjResponse.data.code === 200) {
           console.log(`🚀 Order #${orderId} sent to CJ via V3 API (logistic: ${logisticName})!`);
           orderSuccess = true;
-          successfulCJOrderNumber = cjResponse.data.data?.orderNumber || targetOrderNumber;
+          cjCreated = true;
 
-          // ✨ حفظ رقم CJ الرسمي — الـ Webhook tracker يقراه من هنا
-          await pool.query(
-            "UPDATE orders SET cj_order_number = $1 WHERE id = $2",
-            [successfulCJOrderNumber, orderId]
-          ).catch(() => {});
+          // 🔬 عينة أول نجاح — نأكدو اسم حقل رقم CJ فالـ response (/store/ STORE-x ولا BT...؟)
+          sampleOnce('V3-Create', cjResponse.data?.data);
+
+          successfulCJOrderNumber = extractCjNumber(cjResponse.data?.data) || targetOrderNumber;
+          await saveCjNumber(successfulCJOrderNumber);
           break;
-        } else {
-          lastError = cjResponse.data;
-
-          // 1603000 = Warehouse split needed
-          if (lastError.code === 1603000 || lastError.message?.includes('100230')) {
-            console.log(`⚠️ Order #${orderId} needs Auto-Split (different warehouses)...`);
-            needsSplitting = true;
-            break;
-          }
-
-          // ✨ 1603003 = موجود أصلاً (fulfillment سابق)
-          if (lastError.code === 1603003) {
-            console.log(`ℹ️ [CJ] Order #${orderId} already exists — treating as success.`);
-            orderSuccess = true;
-            successfulCJOrderNumber = targetOrderNumber;
-            break;
-          }
-
-          if (lastError.code === 1600200 || lastError.code === 1605001) {
-            break;
-          }
         }
+
+        lastError = cjResponse.data;
+
+        // 1603000 = Warehouse split needed
+        if (lastError.code === 1603000 || lastError.message?.includes('100230')) {
+          console.log(`⚠️ Order #${orderId} needs Auto-Split (different warehouses)...`);
+          needsSplitting = true;
+          break;
+        }
+
+        // ✨ 1603003 = موجود أصلاً — نجاح منطقي + 🔄 استرجاع رقم CJ الحقيقي (BT...)
+        if (lastError.code === 1603003) {
+          console.log(`ℹ️ [CJ] Order #${orderId} already exists — logical success.`);
+          orderSuccess = true;
+          cjCreated = true;
+          successfulCJOrderNumber = targetOrderNumber;
+
+          // 🔄 GET ماشي POST (16900202 مؤكدة بالتجربة) — نجيبو BT الحقيقي
+          try {
+            await new Promise(r => setTimeout(r, 1200));
+            const detail = await cjRequest((token) =>
+              axios.get(`${CJ_API}/shopping/order/getOrderDetail`, {
+                params: { orderNumber: targetOrderNumber },
+                headers: { 'CJ-Access-Token': token },
+              })
+            );
+            const dd = detail.data?.data || {};
+            sampleOnce('OrderDetail', dd);
+            const realCj = extractCjNumber(dd) || extractCjNumber(dd.orderInfo);
+            if (realCj && realCj !== targetOrderNumber) {
+              successfulCJOrderNumber = realCj;
+              console.log(`🔗 [CJ] #${orderId} → رقم CJ الحقيقي: ${realCj}`);
+            }
+          } catch (e) {
+            console.warn(`⚠️ [CJ] ما قدرناش نجيبو رقم CJ الحقيقي لـ #${orderId}:`, e.response?.data?.message || e.message);
+          }
+          await saveCjNumber(successfulCJOrderNumber); // COALESCE: ما كيطمش BT قديم
+          break;
+        }
+
+        // 💰 1605001 = محفظة فارغة → orderFlow:0 (الطلب كيبقى فـ CJ dashboard ينتظر الدفع اليدوي)
+        if (lastError.code === 1605001) {
+          console.warn(`💰 [CJ] #${orderId} محفظة فارغة — محاولة orderFlow:0 (انتظار الداع فالـ dashboard)...`);
+          try {
+            await new Promise(r => setTimeout(r, 1200));
+            const retry = await cjRequest((token) =>
+              axios.post(`${CJ_API}/shopping/order/createOrderV3`,
+                { ...cjOrderPayload, orderFlow: 0 },
+                { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+              )
+            );
+            if (retry.data.code === 200) {
+              orderSuccess = true;
+              cjCreated = true;
+              successfulCJOrderNumber = extractCjNumber(retry.data?.data) || targetOrderNumber;
+              await saveCjNumber(successfulCJOrderNumber);
+              console.log(`✅ [CJ] #${orderId} تسجل بـ orderFlow=0 — عمّر المحفظة باش يمشي للشحن`);
+            }
+          } catch (e) { /* كنطيحو للفشل العادي تحت */ }
+          break;
+        }
+
+        if (lastError.code === 1600200) break; // QPS — backoff موجود أصلاً فـ cjRequest
       } catch (err) {
         // ✨ 1603003 يمكن يجي كـ HTTP exception
         if (err.response?.data?.code === 1603003) {
           console.log(`ℹ️ [CJ] Order #${orderId} already exists (exception) — success.`);
           orderSuccess = true;
+          cjCreated = true;
           successfulCJOrderNumber = targetOrderNumber;
+          await saveCjNumber(successfulCJOrderNumber);
           break;
         }
         lastError = err.response?.data || err.message;
@@ -276,7 +351,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
           try {
             await new Promise(r => setTimeout(r, 1200));
             const splitRes = await cjRequest((token) =>
-              axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrderV3',  // ✨ V3
+              axios.post(`${CJ_API}/shopping/order/createOrderV3`,
                 splitPayload,
                 { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
               )
@@ -287,14 +362,28 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
               itemSuccess = true;
               successfulSplits++;
               splitOrdersCreated.push(splitOrderNum);
+              cjCreated = true;
+              // 🔗 رقم CJ الحقيقي لكل split — LOGISTIC كيلاقيه من بعد
+              const splitCj = extractCjNumber(splitRes.data?.data);
+              if (splitCj && splitCj !== splitOrderNum) await saveCjNumber(splitCj);
+              break;
+            }
+            // ✨ 1603003 كجسم الـ response (النسخة القديمة معالجاة غير كـ exception!)
+            if (splitRes.data.code === 1603003) {
+              console.log(`ℹ️ [CJ Split] ${splitOrderNum} already exists (body).`);
+              itemSuccess = true;
+              successfulSplits++;
+              splitOrdersCreated.push(splitOrderNum);
+              cjCreated = true;
               break;
             }
           } catch (err) {
             if (err.response?.data?.code === 1603003) {
-              console.log(`ℹ️ [CJ Split] ${splitOrderNum} already exists.`);
+              console.log(`ℹ️ [CJ Split] ${splitOrderNum} already exists (exception).`);
               itemSuccess = true;
               successfulSplits++;
               splitOrdersCreated.push(splitOrderNum);
+              cjCreated = true;
               break;
             }
           }
@@ -306,31 +395,43 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
         orderSuccess = true;
         successfulCJOrderNumber = splitOrdersCreated.join(', ');
       } else if (successfulSplits > 0) {
+        // 🚨 جزئي — ⚠️ v2: عمرو ما كنكتبوش فـ shipping_address (كان كيدمر عنوان العميل)!
         console.error(`🚨 Partial fulfillment on Order #${orderId}: ${successfulSplits}/${cjProducts.length} shipped.`);
-        await pool.query(
-          "UPDATE orders SET status = 'manual', shipping_address = $1 WHERE id = $2",
-          [`PARTIAL SUCCESS (${successfulSplits}/${cjProducts.length} shipped): ${splitOrdersCreated.join(', ')}`, orderId]
-        );
+        await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
+        const { sendEmail } = require('../controllers/paymentController');
+        sendEmail({
+          to: process.env.BREVO_USER,
+          subject: `🚨 CJ Partial Fulfillment — Order #${orderId} (${successfulSplits}/${cjProducts.length})`,
+          html: `<p>Splits الناجحين: <code>${splitOrdersCreated.join(', ')}</code></p>
+                 <p>راجع CJ dashboard وأكمل العناصر الناقصة يدوياً — العميل مستنى!</p>`
+        }).catch(() => {});
         return { success: false, partial: true, error: 'Partial fulfillment' };
       }
     }
 
-    // 3. النتيجة النهائية + حفظ cj_order_number
+    // 3. النتيجة النهائية
     if (orderSuccess) {
-      await pool.query("UPDATE orders SET status = 'fulfilled' WHERE id = $1", [orderId]);
+      // ✅ v2 — الإصلاح الحاسم: 'fulfilled' هنا كان BUG كيبلوكي الويب هوك!
+      // forward-only guard: fulfilled(2) >= SHIPPED→fulfilled(2) → SHIPPED كان كيتطنش
+      // → بلا tracking، بلا واتساب، بلا إيميل. الطلب يبقى 'paid' — الويب هوك هو اللي كيرفع.
       await pool.query(
-        "UPDATE orders SET cj_order_number = $1 WHERE id = $2",
-        [successfulCJOrderNumber, orderId]
-      ).catch(() => {});
+        "UPDATE orders SET status = 'paid' WHERE id = $1 AND status IN ('pending','processing')",
+        [orderId]
+      );
+      console.log(`📤 [CJ] #${orderId} مقبول (${successfulCJOrderNumber}) — ننتظر ORDER/SHIPPED webhook للإشعار اللحظي`);
       return { success: true, orderNumber: successfulCJOrderNumber };
-    } else {
-      console.error(`❌ CJ Order Fulfillment Failed for #${orderId}. Reason:`, lastError);
-      await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
-      return { success: false, error: lastError };
     }
+
+    console.error(`❌ CJ Order Fulfillment Failed for #${orderId}. Reason:`, lastError);
+    await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
+    return { success: false, error: lastError };
+
   } catch (err) {
     logger.logError(`CJ Fulfillment Fatal Error #${orderId}`, err);
-    await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
+    // 🛡️ إلا الطلب ديجا تسال فـ CJ — لا manual (كيوقع دبل fulfillment محتمل)
+    if (!cjCreated) {
+      await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]).catch(() => {});
+    }
     return { success: false, error: err.message };
   }
 }

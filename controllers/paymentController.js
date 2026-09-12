@@ -342,7 +342,7 @@ router.get('/paysera/callback', async (req, res) => {
             }, items);
 
             if (cjResponse && cjResponse.success) {
-              await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [orderId]);
+              console.log(`📤 [Crypto] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
             }
 
             if (order.customer_email) {
@@ -469,7 +469,7 @@ router.post('/crypto/callback', async (req, res) => {
             const cjResponse = await fulfillCJOrder(orderId, updatedOrder.customer_name, customerDetails, items);
 
             if (cjResponse && cjResponse.success) {
-              await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [orderId]);
+              console.log(`📤 [Crypto] #${order.id} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
             }
 
             const finalEmail = paymentData.customer_email || updatedOrder.customer_email;
@@ -628,7 +628,7 @@ router.post('/crypto/verify', async (req, res) => {
 
             const cjResponse = await fulfillCJOrder(order.id, order.customer_name, customerDetails, itemsRes.rows);
             if (cjResponse && cjResponse.success) {
-              await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [order.id]);
+              console.log(`📤 [Crypto] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
             }
 
             if (order.customer_email && !order.customer_email.includes('@laclarc.com')) {

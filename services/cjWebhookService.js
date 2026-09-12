@@ -1,4 +1,24 @@
-// services/cjWebhookService.js - Laclarc CJ Webhook Engine (Real-time Sync)
+// services/cjWebhookService.js - Laclarc CJ Webhook Engine v2 (Schema-Confirmed)
+// ============================================================
+// ✅ البنى الحقيقية مؤكدة من عينات حية (زر Test + production):
+//   ORDER:    { cjOrderId, orderNum, orderStatus, logisticName, trackNumber,
+//               createDate, payDate, deliveryDate, updateDate, postage }
+//             ⚠️ orderNum = STORE-{id}(-S{n}) ديالنا | cjOrderId = BT... ديال CJ
+//   LOGISTIC: { orderId (BT...), trackingNumber, trackingStatus, logisticName,
+//               logisticsTrackEvents: "[{}]" }
+//             ⚠️ type = "LOGISTIC" مفرد (ماشي LOGISTICS!) — و trackingNumber هنا
+//               (فـ ORDER: trackNumber) — نفس المفهوم، اسمين مختلفين!
+//   MAKEUP:   { orderId, relationOrderId, payOrderId, amount, reason, type,
+//               diffUseType, status, createDate }  + مُوقّع (header: sign)
+//   PRODUCT:  { pid, fields[], productImage, productName } — صور + DELETE فقط
+//             (productName بالصينية — عمرو مايتلمس)
+//   VARIANT:  { vid, pid, variantSellPrice, variantSku, variantKey,
+//               variantStatus, variantImage } — مصدر الأسعار الحقيقي
+//   STOCK:    { "<vid>": [ { pid, vid, storageNum, areaEn, countryCode } ] }
+// ⚠️ openId فالويب هوك رقمي (44510) — ماشي نفس CJ_OPEN_ID ("CJ5670990")
+// ⚠️ split shipments: tracking_number عمود واحد — S{n} الثاني كيتطنش
+//    حالياً (جدول tracking_events = roadmap)
+// ============================================================
 const axios = require('axios');
 const crypto = require('crypto');
 const pool = require('../db');
@@ -9,132 +29,234 @@ const { sendOrderTrackingWhatsApp } = require('./whatsappService');
 const CJ_BASE = 'https://developers.cjdropshipping.com/api2.0/v1';
 
 // ==========================================
-// 🛡️ Idempotency — messageId ديما كيتبقى ثابت حتى فالـ retries
-// (نفس نمط processedEvents ديال bot.js)
+// 🛡️ Idempotency — messageId ثابت حتى فالـ retries
 // ==========================================
 const processedMessages = new Set();
 setInterval(() => processedMessages.clear(), 60 * 60 * 1000); // تنظيف كل ساعة
 
 // ==========================================
-// 🔐 التحقق المرن — نجرّب كل المفاتيح المحتملة
-// (حصراً للمواضيع الموثقة بالتوقيع: MAKEUP docs 4.2 / PRIVATE_ORDER docs 5.3)
+// 🔐 التوقيع v2 — v1 (HMAC-SHA256/base64 على body فقط) فشلت فـ MAKEUP حقيقي!
+// نجربو: {HMAC-SHA256, HMAC-MD5} × {apiKey, openId} × {body, openId+body}
+//        × {hex, HEX, base64, base64url} + SHA256/MD5(body±apiKey)
+// ⚠️ مؤقتاً: ماكاينش قائمة سوداء — إلا فشل كلشي كنرفضو + SIGN DEBUG + تنبيه
+//    الأدمن (MAKEUP حدث مالي). الـ calibrator كيحسم الألغوريتم من أول زوج.
 // ==========================================
-function verifySignatureFlexible(rawBody, signHeader) {
-  const candidates = [
-    process.env.CJ_OPEN_ID,
-    process.env.CJ_API_KEY,
-    process.env.CJ_API_TOKEN,
-  ].filter(Boolean);
+function _tsEq(a, b) {
+  const ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
 
-  for (const secret of candidates) {
-    try {
-      const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
-      const received = Buffer.from(signHeader);
-      const expectedBuf = Buffer.from(expected);
-      if (received.length === expectedBuf.length && crypto.timingSafeEqual(received, expectedBuf)) {
-        return true;
-      }
-    } catch { /* نكملو للمفتاح الموالي */ }
+function _candidateSigns(rawBody, eventOpenId) {
+  const apiKey = process.env.CJ_API_KEY || process.env.CJ_API_TOKEN || '';
+  const openId = String(eventOpenId ?? process.env.CJ_WEBHOOK_OPEN_ID ?? process.env.CJ_OPEN_ID ?? '');
+  const openIdBuf = Buffer.from(openId);
+  const out = [];
+
+  for (const key of [apiKey, openId]) {
+    if (!key) continue;
+    const hmac = (alg, msg) => crypto.createHmac(alg, key).update(msg);
+    for (const msg of [rawBody, ...(openId ? [Buffer.concat([openIdBuf, rawBody])] : [])]) {
+      out.push(
+        hmac('sha256', msg).digest('hex'),
+        hmac('sha256', msg).digest('hex').toUpperCase(),
+        hmac('sha256', msg).digest('base64'),
+        hmac('sha256', msg).digest('base64url'),
+        hmac('md5', msg).digest('hex'),
+        hmac('md5', msg).digest('hex').toUpperCase()
+      );
+    }
   }
-  return false;
+
+  for (const combo of [
+    Buffer.concat([rawBody, Buffer.from(apiKey)]),
+    Buffer.concat([Buffer.from(apiKey), rawBody]),
+    ...(openId ? [Buffer.concat([openIdBuf, rawBody, Buffer.from(apiKey)])] : []),
+  ]) {
+    out.push(
+      crypto.createHash('sha256').update(combo).digest('hex'),
+      crypto.createHash('md5').update(combo).digest('hex')
+    );
+  }
+  return out;
+}
+
+function verifySignatureFlexible(rawBody, signHeader, eventOpenId) {
+  const received = String(signHeader || '').trim();
+  if (!received) return false;
+  return _candidateSigns(rawBody, eventOpenId).some(expected => _tsEq(expected, received));
 }
 
 // ==========================================
-// 📦 ORDER — أهم معالج: حالات الطلب + الشحن لحظياً
+// 📦 ORDER — حالات الطلب + لحظة الشحن الذهبية
+// خريطة حالات CJ → حالات laclarc
+// ⓘ CREATED/IN_STOCK/IN_PROGRESS = معلومات فقط (الطلب عندنا ديجا paid قبل
+//   الإرسال لـ CJ) — لا كتابة DB
 // ==========================================
+const CJ_ORDER_STATUS_MAP = {
+  CREATED: 'paid', IN_STOCK: 'paid', IN_PROGRESS: 'paid',
+  SHIPPED: 'fulfilled', DISPATCHED: 'fulfilled',
+  DELIVERED: 'completed', COMPLETED: 'completed',
+  CANCELLED: 'manual', CLOSED: 'manual', REFUND_COMPLETE: 'manual', INTERCEPT: 'manual',
+};
+const STATUS_RANK = { pending: 0, manual: 0, paid: 1, fulfilled: 2, completed: 3 };
+
+// 🔔 إشعار الشحن الموحد — ORDER webhook + LOGISTIC rescue + كرون Tracking كيتقاسموه
+// ⚠️ توقيع whatsappService: هادي نسخة positional (مطابقة للويب هوك الأصلي).
+//   إلا فحصتِ services/whatsappService.js ولقيتيه كياخد object واحد، عوّض
+//   السطر المعلّم بـ ⚠️ بالنسخة المعلّمة تحته.
+async function notifyShipment(order, trackNumber, logisticName) {
+  // واتساب (E.164 داخل الخدمة)
+  try {
+    await sendOrderTrackingWhatsApp({ phone: order.customer_phone, customerName: order.customer_name, orderId: order.id, trackingNumber: trackNumber, email: order.customer_email }); // ⚠️ السطر المرجعي
+    // 👇 إلا التوقيع object، استعمل هادي بلاصة السطر الفوق:
+    // await sendOrderTrackingWhatsApp({ phone: order.customer_phone, customerName: order.customer_name, orderId: order.id, trackingNumber: trackNumber, email: order.customer_email });
+  } catch (waErr) { logger.logError('Webhook WhatsApp Notification', waErr); }
+
+  // إيميل تأكيد الشحن (لا إيميلات داخلية)
+  if (order.customer_email && !order.customer_email.includes('@laclarc.com')) {
+    try {
+      const itemsRes = await pool.query(
+        `SELECT oi.*, p.title, p.image_url FROM order_items oi
+         LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`,
+        [order.id]
+      );
+      const { sendOrderConfirmationEmail } = require('../controllers/paymentController');
+      await sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, itemsRes.rows);
+    } catch (mailErr) { logger.logError('Webhook Tracking Email', mailErr); }
+  }
+}
+
 async function handleOrderUpdate(params = {}) {
-  // دفاعي: CJ كيصيفط orderId (رقم CJ = STORE-X عندنا) و/أو orderNumber
-  const cjOrderNumber = params.orderId || params.orderNumber || '';
-  if (!cjOrderNumber) return;
+  const cjOrderId    = String(params.cjOrderId || '').trim();                       // ✅ من العينة (BT...)
+  const orderNum     = String(params.orderNum || params.orderNumber || '').trim();  // ✅ orderNum
+  const statusRaw    = String(params.orderStatus || params.status || '').trim().toUpperCase(); // ✅ orderStatus
+  const trackNumber  = String(params.trackNumber || '').trim();                     // ✅ trackNumber هنا
+  const logisticName = params.logisticName || null;
+  const postage      = Number.isFinite(Number(params.postage)) ? Number(params.postage) : null; // مراقبة مالية
 
-  // استخراج معرف الطلب ديالنا من STORE-{id} (أو split: STORE-{id}-S{n})
-  const storeMatch = cjOrderNumber.match(/^STORE-(\d+)/i);
-  if (!storeMatch) return;
-  const orderId = storeMatch[1];
+  // STORE-{id} أو split STORE-{id}-S{n} — أحداث Test ("test") كيموتو هنا بهدوء
+  const storeMatch = orderNum.match(/^STORE-(\d+)(?:-S\d+)?$/i);
+  if (!storeMatch && !cjOrderId) return;
 
-  const status = String(params.status || '').toUpperCase();
-  const trackNumber = params.trackNumber || params.trackingNumber || null;
+  console.log(`📦 [ORDER] orderNum=${orderNum} cj=${cjOrderId} status=${statusRaw} track=${trackNumber || '—'} carrier=${logisticName || '—'} postage=${postage ?? '—'}`);
 
-  const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
-  if (orderRes.rows.length === 0) return;
+  const mapped = CJ_ORDER_STATUS_MAP[statusRaw];
+  if (!mapped) {
+    console.warn(`⚠️ [ORDER] orderStatus غير معروف "${statusRaw}" — لوج فقط (raw كاين فوق). زيدو للـ map إلا كان حقيقياً.`);
+    return;
+  }
+
+  // معلومات ضعيفة — الطلب كيتصاوب عندنا غير بعد الدفع → ديجا paid
+  if (mapped === 'paid') { console.log(`ℹ️ [ORDER] ${statusRaw} — تجاهل (ديجا paid عندنا)`); return; }
+
+  const orderId = storeMatch ? Number(storeMatch[1]) : null;
+  const orderRes = await pool.query(
+    `SELECT * FROM orders
+     WHERE ($1::int IS NOT NULL AND id = $1)
+        OR (NULLIF($2,'') IS NOT NULL AND cj_order_number = $2)
+     LIMIT 1`,
+    [orderId, cjOrderId || null]
+  );
+  if (!orderRes.rows.length) {
+    console.warn(`⚠️ [ORDER] ما لقيناش order: orderNum=${orderNum} / cj=${cjOrderId}`);
+    return;
+  }
   const order = orderRes.rows[0];
 
-  // 🚚 SHIPPED — اللحظة الذهبية: تحديث + واتساب + إيميل فوراً (بدل انتظار الكرون ساعة)
-  if ((status === 'SHIPPED' || status === 'DISPATCHED') && trackNumber && trackNumber.trim().length > 3) {
-    const updateRes = await pool.query(
-      "UPDATE orders SET tracking_number = $1, status = 'fulfilled' WHERE id = $2 AND (tracking_number IS NULL OR tracking_number = '') RETURNING id",
-      [trackNumber.trim(), orderId]
+  // ⚠️ إلغاء — transition جانبي (استثناء على forward-only) — علّم الأدمن
+  if (mapped === 'manual') {
+    if (order.status === 'pending') return;
+    await pool.query(
+      "UPDATE orders SET status = 'manual' WHERE id = $1 AND status IN ('paid','completed','fulfilled')",
+      [order.id]
     );
-    if (updateRes.rows.length === 0) return; // عالجنا من قبل — dedup على مستوى الـ DB
+    logger.logError(`CJ Webhook: Order #${order.id} ${statusRaw}`, new Error(orderNum));
+    return;
+  }
 
-    console.log(`🚀 [CJ Webhook] Order #${orderId} SHIPPED! Tracking: ${trackNumber} — notifying customer instantly...`);
+  // 🛡️ forward-only — DELIVERED ما كيرجعش SHIPPED (invariant #7)
+  if ((STATUS_RANK[order.status] ?? -1) >= (STATUS_RANK[mapped] ?? -1)) return;
 
-    // واتساب (E.164/+213 داخل الخدمة)
+  // 🚚 SHIPPED — اللحظة الذهبية: DB + واتساب + إيميل فوراً
+  if (mapped === 'fulfilled' && trackNumber) {
+    const upd = await pool.query(
+      `UPDATE orders
+         SET tracking_number = $1,
+             status = 'fulfilled',
+             cj_order_number = COALESCE(NULLIF(cj_order_number,''), $3)
+       WHERE id = $2
+         AND (tracking_number IS NULL OR tracking_number = '')
+       RETURNING id`,
+      [trackNumber, order.id, cjOrderId || null]
+    );
+    if (!upd.rows.length) return; // ديجا معالج — dedup على مستوى الـ DB
+    console.log(`🚀 [ORDER] #${order.id} SHIPPED (${logisticName || '?'}) → ${trackNumber}`);
+    await notifyShipment(order, trackNumber, logisticName);
+    return;
+  }
+
+  // ✅ completed وغيره — + أول تسجيل ديال cj_order_number (LOGISTIC/MMAKEUP غادي يحتاجوه)
+  await pool.query(
+    `UPDATE orders
+       SET status = $1,
+           tracking_number = COALESCE(NULLIF(tracking_number,''), NULLIF($3,'')),
+           cj_order_number = COALESCE(NULLIF(cj_order_number,''), NULLIF($2,''))
+     WHERE id = $4`,
+    [mapped, cjOrderId || '', trackNumber, order.id]
+  );
+  console.log(`✅ [ORDER] #${order.id}: ${order.status} → ${mapped}`);
+}
+
+// ==========================================
+// 🚚 LOGISTIC — أحداث التتبع التفصيلية
+// ⚠️ هنا الحقل trackingNumber (فـ ORDER: trackNumber) — مؤكد بالعينة!
+// 🛟 Rescue: إلا فاتنا ORDER/SHIPPED (رسالة ضايعة) — LOGISTIC كيسالى الوضع
+// ==========================================
+async function handleLogistic(params = {}) {
+  const trackingNumber = String(params.trackingNumber || params.trackNumber || '').trim();
+  const cjOrderId = String(params.orderId || '').trim();
+  if (!trackingNumber && !cjOrderId) return;
+
+  let eventsCount = 0;
+  if (params.logisticsTrackEvents) {
     try {
-      await sendOrderTrackingWhatsApp(order.customer_phone, order.customer_name, order.id, trackNumber.trim());
-    } catch (waErr) {
-      logger.logError('Webhook WhatsApp Notification', waErr);
+      const a = JSON.parse(params.logisticsTrackEvents);
+      eventsCount = Array.isArray(a) ? a.length : 0;
+    } catch { /* string ماشي JSON — تجاهل */ }
+  }
+  console.log(`📦 [LOGISTIC] cj=${cjOrderId} track=${trackingNumber} trackingStatus=${params.trackingStatus} events=${eventsCount} carrier=${params.logisticName || '—'}`);
+  if (!trackingNumber) return;
+
+  const findRes = await pool.query(
+    `SELECT * FROM orders
+     WHERE tracking_number = $1
+        OR (NULLIF($2,'') IS NOT NULL AND cj_order_number = $2)
+     LIMIT 1`,
+    [trackingNumber, cjOrderId]
+  );
+  if (!findRes.rows.length) return;
+  const order = findRes.rows[0];
+
+  // 🛟 Rescue — غير للطلبات المدفوعة بلا tracking (ORDER webhook فاتها)
+  if (!order.tracking_number && order.status === 'paid') {
+    const upd = await pool.query(
+      `UPDATE orders SET tracking_number = $1, status = 'fulfilled'
+       WHERE id = $2 AND tracking_number IS NULL RETURNING id`,
+      [trackingNumber, order.id]
+    );
+    if (upd.rows.length) {
+      console.log(`🛟 [LOGISTIC] Rescue #${order.id} — ORDER/SHIPPED فات، إشعار العميل دابا`);
+      await notifyShipment(order, trackingNumber, params.logisticName);
     }
-
-    // إيميل تأكيد الشحن
-    if (order.customer_email && !order.customer_email.includes('@laclarc.com')) {
-      try {
-        const itemsRes = await pool.query(
-          `SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`,
-          [orderId]
-        );
-        const { sendOrderConfirmationEmail } = require('../controllers/paymentController');
-        await sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, itemsRes.rows);
-      } catch (mailErr) {
-        logger.logError('Webhook Tracking Email', mailErr);
-      }
-    }
-    return;
   }
-
-  // ✅ COMPLETED
-  if (status === 'COMPLETED') {
-    await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1 AND status IN ('paid', 'fulfilled')", [orderId]);
-    return;
-  }
-
-  // ⚠️ إلغاء/استرجاع — علّم الأدمن فوراً
-  if (status === 'CANCELLED' || status === 'REFUND_COMPLETE' || status === 'INTERCEPT') {
-    logger.logError(`CJ Webhook: Order #${orderId} ${status}`, new Error(JSON.stringify(params).slice(0, 300)));
-    await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1 AND status IN ('paid', 'completed', 'fulfilled')", [orderId]);
-  }
+  // مستقبلاً: events → جدول tracking_events (تتبع لحظي كامل فالحساب)
 }
 
 // ==========================================
-// 🚚 LOGISTICS — تحديثات تتبع إضافية (دفاعي — البنية ممكن تتبدل)
+// 🏷️ PRODUCT — صور + DELETE فقط (بنية مؤكدة بعينة حية)
+// ⚠️ السعر ماكيجيش هنا (كيجي من VARIANT) | productName صيني — مانلمسوهش
 // ==========================================
-let _logisticsSampleLogged = false;
-async function handleLogistics(params = {}, rawEvent) {
-  // عينة كاملة مرة وحدة — باش نظبو الـ parser على الواقع
-  if (!_logisticsSampleLogged) {
-    _logisticsSampleLogged = true;
-    console.log('🔬 [Logistics Sample]', JSON.stringify(rawEvent || params).slice(0, 800));
-  }
-
-  const trackNumber = params.trackNumber || params.trackingNumber;
-  if (!trackNumber) return;
-  // مستقبلاً: سجل أحداث التتبع التفصيلية فجدول tracking_events
-  console.log(`📦 [CJ Webhook] Logistics update for ${trackNumber}: ${params.status || 'update'}`);
-}
-
-// ==========================================
-// 🏷️ PRODUCT — البنية الحقيقية (من العينة):
-// { pid, fields: ["productImage"], productImage: "[json]", productName: "[صيني]" }
-// ⚠️ السعر ماكيجيش هنا — كيجي من VARIANT/UPDATE
-// ⚠️ productName بالصينية — مانتحديثوش العناوين أبداً!
-// ==========================================
-let _productSampleLogged = false;
-async function handleProductUpdate(params = {}, rawEvent, messageType) {
-  if (!_productSampleLogged) {
-    _productSampleLogged = true;
-    console.log('🔬 [Product Sample]', JSON.stringify(rawEvent || params).slice(0, 500));
-  }
-
+async function handleProductUpdate(params = {}, messageType) {
   const cjPid = String(params.pid || '');
   if (!cjPid) return;
 
@@ -146,13 +268,13 @@ async function handleProductUpdate(params = {}, rawEvent, messageType) {
   }
 
   const prodRes = await pool.query('SELECT id, image_url FROM products WHERE cj_product_id = $1', [cjPid]);
-  if (prodRes.rows.length === 0) return;
+  if (!prodRes.rows.length) return;
   const product = prodRes.rows[0];
 
-  // ✨ نفحصو غير الحقول المعلنة فـ fields (بلا افتراضات)
+  // نفحصو غير الحقول المعلنة فـ fields (بلا افتراضات)
   const changedFields = Array.isArray(params.fields) ? params.fields : [];
 
-  // تغيّر الصورة الرئيسية → تحديث image_url (إلا الصورة القديمة من CJ نفسو)
+  // ✨ الصورة الرئيسية — غير إلا القديمة من CJ نفسو (حماية الصور ديالنا)
   if (changedFields.includes('productImage') && params.productImage) {
     try {
       const imgs = JSON.parse(params.productImage);
@@ -161,32 +283,23 @@ async function handleProductUpdate(params = {}, rawEvent, messageType) {
         await pool.query('UPDATE products SET image_url = $1 WHERE id = $2', [firstImg, product.id]);
         console.log(`🖼️ [CJ Webhook] Product ${cjPid} main image refreshed.`);
       }
-    } catch { /* productImage ماشي JSON صالح — تجاهل */ }
+    } catch { /* productImage ماشي JSON — تجاهل */ }
   }
-
-  // 📝 ملاحظة: productName كيجي بالصينية — عناويننا إنجليزية، عمرو مايتلمسو
 }
-// ==========================================
-// 🧬 VARIANT — البنية الحقيقية (من العينة):
-// { vid, pid, variantSellPrice: "10.990", variantSku, variantKey, variantStatus: 1 }
-// 💰 هذا هو مصدر الأسعار الحقيقي — حماية الهامش الزمنية!
-// ==========================================
-let _variantSampleLogged = false;
-async function handleVariantUpdate(params = {}, rawEvent, messageType) {
-  if (!_variantSampleLogged) {
-    _variantSampleLogged = true;
-    console.log('🔬 [Variant Sample]', JSON.stringify(rawEvent || params).slice(0, 500));
-  }
 
+// ==========================================
+// 🧬 VARIANT — مصدر الأسعار الحقيقي (حماية الهامش الزمنية)
+// INSERT/UPDATE = دمج | DELETE = حيد من JSONB
+// ==========================================
+async function handleVariantUpdate(params = {}, messageType) {
   const vid = String(params.vid || '');
   const pid = String(params.pid || '');
   if (!vid || !pid) return;
 
   const prodRes = await pool.query('SELECT id, variants FROM products WHERE cj_product_id = $1', [pid]);
-  if (prodRes.rows.length === 0) return;
+  if (!prodRes.rows.length) return;
   const product = prodRes.rows[0];
 
-  // Parse الـ variants JSONB بأمان
   let variants = product.variants;
   if (typeof variants === 'string') {
     try { variants = JSON.parse(variants); } catch { variants = []; }
@@ -195,7 +308,7 @@ async function handleVariantUpdate(params = {}, rawEvent, messageType) {
 
   const idx = variants.findIndex(v => String(v.vid) === vid);
 
-  // 🗑️ DELETE → نحيدو الـ variant من القائمة
+  // 🗑️ DELETE → حيد من القائمة
   if (messageType === 'DELETE') {
     if (idx > -1) {
       variants.splice(idx, 1);
@@ -205,13 +318,13 @@ async function handleVariantUpdate(params = {}, rawEvent, messageType) {
     return;
   }
 
-  // ✨ INSERT / UPDATE — دمج البيانات الجديدة (نحافظو على أي حقول محلية)
+  // ✨ INSERT/UPDATE — دمج (نحافظو على أي حقول محلية)
   const updates = {};
   if (params.variantSellPrice !== undefined) updates.variantSellPrice = params.variantSellPrice;
-  if (params.variantSku !== undefined) updates.variantSku = params.variantSku;
-  if (params.variantKey !== undefined) updates.variantKey = params.variantKey;
-  if (params.variantStatus !== undefined) updates.variantStatus = params.variantStatus;
-  if (params.variantImage !== undefined) updates.variantImage = params.variantImage;
+  if (params.variantSku      !== undefined) updates.variantSku = params.variantSku;
+  if (params.variantKey      !== undefined) updates.variantKey = params.variantKey;
+  if (params.variantStatus   !== undefined) updates.variantStatus = params.variantStatus;
+  if (params.variantImage    !== undefined) updates.variantImage = params.variantImage;
 
   let oldPrice = null;
   if (idx > -1) {
@@ -223,7 +336,7 @@ async function handleVariantUpdate(params = {}, rawEvent, messageType) {
 
   await pool.query('UPDATE products SET variants = $1 WHERE id = $2', [JSON.stringify(variants), product.id]);
 
-  // 💰 لوج تغيّرات الأسعار فقط — أهم إشارة مالية
+  // 💰 لوج تغيّرات الأسعار — أهم إشارة مالية
   const newPrice = params.variantSellPrice;
   if (newPrice && oldPrice && String(oldPrice) !== String(newPrice)) {
     console.log(`💰 [CJ Webhook] Variant ${vid} price: $${oldPrice} → $${newPrice} (product ${pid})`);
@@ -231,38 +344,23 @@ async function handleVariantUpdate(params = {}, rawEvent, messageType) {
 }
 
 // ==========================================
-// 📦 STOCK — البنية الحقيقية (من العينة الحية):
-// params: { "<vid>": [ { pid, vid, storageNum, areaEn, countryCode } ] }
-// الكمية الحقيقية = storageNum ✅
+// 📦 STOCK — params: { "<vid>": [ { pid, vid, storageNum, ... } ] }
+// الكمية الحقيقية = storageNum — تجميع لكل pid عبر المستودعات/الـ variants
 // ==========================================
-let _stockSampleLogged = false;
-async function handleStockUpdate(params = {}, rawEvent) {
-  if (!_stockSampleLogged) {
-    _stockSampleLogged = true;
-    console.log('🔬 [Stock Sample]', JSON.stringify(rawEvent || params).slice(0, 500));
-  }
-
-  // ✨ تجميع المخزون الإجمالي لكل pid (عدة variants/warehouses لنفس المنتج)
+async function handleStockUpdate(params = {}) {
   const stockByPid = new Map();
 
   for (const [key, records] of Object.entries(params)) {
     if (!Array.isArray(records)) continue;
-
     for (const rec of records) {
       const pid = String(rec.pid || key);
-      const vid = rec.vid ? String(rec.vid) : null;
       const qty = Number(rec.storageNum ?? rec.stockQuantity ?? rec.quantity ?? rec.stock ?? rec.qty);
       if (!Number.isFinite(qty)) continue;
-
-      // إجمالي عبر المستودعات/الـ variants
       stockByPid.set(pid, (stockByPid.get(pid) || 0) + qty);
-
-      // ✨ اختياري مستقبلاً: تحديث مخزون كل variant فالـ JSONB
-      // (حالياً كنكفيو بمستوى المنتج — كافي لعرض متوفر/غير متوفر)
     }
   }
 
-  // تحديث واحد لكل منتج (ماشي واحد لكل record — أداء أنظف)
+  // تحديث واحد لكل منتج (أداء أنظف — كافي لمستوى متوفر/غير متوفر)
   for (const [pid, totalQty] of stockByPid) {
     const available = totalQty > 0;
     const res = await pool.query(
@@ -276,7 +374,8 @@ async function handleStockUpdate(params = {}, rawEvent) {
 }
 
 // ==========================================
-// 💳 MAKEUP — فاتورة فرق شحن من CJ → 🔔 إنذار الأدمن فوراً
+// 💳 MAKEUP — فاتورة فرق شحن (حقول مؤكدة بالعينة: status/orderId/amount/reason)
+// ⚠️ هادا الموضوع مُوقّع — ما كيوصل هنا إلا بعد verifySignatureFlexible
 // ==========================================
 async function handleMakeup(params = {}) {
   console.warn(`💳 [CJ Webhook] MAKEUP BILL ${params.status}: ${params.orderId} — $${params.amount} (${params.reason})`);
@@ -288,6 +387,7 @@ async function handleMakeup(params = {}) {
       subject: `💳 CJ Makeup Bill Created — $${params.amount} for ${params.relationOrderId}`,
       html: `<h2>CJ Postage Makeup Bill</h2>
              <p><strong>Original Order:</strong> ${params.relationOrderId}</p>
+             <p><strong>CJ Order:</strong> ${params.orderId}</p>
              <p><strong>Amount:</strong> $${params.amount}</p>
              <p><strong>Reason:</strong> ${params.reason || 'N/A'}</p>
              <p>Pay it from CJ wallet to avoid fulfillment delays.</p>`
@@ -296,50 +396,84 @@ async function handleMakeup(params = {}) {
 }
 
 // ==========================================
-// 🎯 المعالج الرئيسي — 200 فوري + معالجة خلفية
+// 🎯 المعالج الرئيسي — 200 فوري (< 3s إجباري) + معالجة خلفية كاملة
 // ==========================================
 async function cjWebhookHandler(req, res) {
-  // ✅ الرد الفوري (< 3s إجباري من CJ) — الحماية من auto-close
   res.status(200).json({ code: 200, message: 'OK' });
 
   (async () => {
     try {
       const rawBody = req.body; // Buffer من express.raw
-      const event = JSON.parse(rawBody.toString('utf8'));
-      const { messageId, type, messageType, params } = event;
+      let event;
+      try { event = JSON.parse(rawBody.toString('utf8')); }
+      catch {
+        logger.logError('CJ Webhook: JSON غير صالح', new Error(rawBody.toString('utf8').slice(0, 200)));
+        return;
+      }
 
-      // 🔬 عينة كاملة أول مرة لكل نوع — باش نظبو الـ parsers على الواقع
+      const { messageId, type, messageType, params } = event;
+      if (!type) return;
+
+      // 🔬 عينة كاملة أول مرة لكل نوع — ground truth دايم فاللوج
       const sampleKey = `_cjSample_${type}`;
       if (!global[sampleKey]) {
         global[sampleKey] = true;
         console.log(`🔬 [Sample ${type}]`, rawBody.toString('utf8').slice(0, 800));
       }
 
-      // 🔐 التوقيع الصارم — حصراً للمواضيع الموثقة بالتوقيع (docs 4.2 / 5.3)
-      // ORDER/PRODUCT/STOCK/LOGISTICS: CJ ماكيوثقش عليهم توقيعاً — كيتعالجو مباشرة
+      // 🪪 فحص openId مرن (soft — تحذير فقط؛ الويب هوك كيصيفط رقم 44510)
+      const expectedOpenId = process.env.CJ_WEBHOOK_OPEN_ID;
+      if (expectedOpenId && String(event.openId ?? '') !== expectedOpenId) {
+        console.warn(`⚠️ [CJ Webhook] openId ${event.openId} ≠ المتوقع (${expectedOpenId}) — تحذير فقط`);
+      }
+
+      // 🔐 التوقيع الصارم — حصراً MAKEUP (docs 4.2) / PRIVATE_ORDER (docs 5.3)
+      // ORDER/PRODUCT/STOCK/VARIANT/LOGISTIC: CJ ماكيوثقش عليهم — مباشرة
       const signHeader = req.headers['sign'];
       if (signHeader && (type === 'MAKEUP' || type === 'PRIVATE_ORDER')) {
-        const valid = verifySignatureFlexible(rawBody, signHeader);
+        const valid = verifySignatureFlexible(rawBody, signHeader, event.openId);
         if (!valid) {
+          // 🧪 تسريب تشخيصي (مرة/10د) — زوج (body, sign) جاهز للـ calibrator
+          if (!global._cjSignFailAt || Date.now() - global._cjSignFailAt > 10 * 60 * 1000) {
+            global._cjSignFailAt = Date.now();
+            console.warn(
+              `🔐 [SIGN DEBUG] sign(${String(signHeader).length})=${String(signHeader)}\n` +
+              `🔐 [SIGN DEBUG] body(${rawBody.length})=${rawBody.toString('utf8')}\n` +
+              `🔐 [SIGN DEBUG] openId=${event.openId} → node tools/cj-sign-calibrator.js '<body>' '<sign>' ${event.openId}`
+            );
+          }
+          // 💳 MAKEUP = حدث مالي — الأدمن خاصو يعرف حتى إلا تسقات
+          if (type === 'MAKEUP') {
+            const { sendEmail } = require('../controllers/paymentController');
+            sendEmail({
+              to: process.env.BREVO_USER,
+              subject: `🚨 CJ MAKEUP مرفوض (signature) — $${params?.amount} ${params?.orderId}`,
+              html: `<p>فاتورة Makeup تسقات من التحقق. شوف 🔐 [SIGN DEBUG] فاللوج + شغّل calibrator.</p>
+                     <pre>${JSON.stringify(params || {}).slice(0, 400)}</pre>`
+            }).catch(() => {});
+          }
           logger.logError('CJ Webhook: signed topic rejected', new Error(`${type} signature invalid`));
           return;
         }
       }
 
-      // 🛡️ Idempotency — الرسائل المكررة (retries) كيتجاهلو
+      // 🛡️ Idempotency — retries كيتجاهلو
       if (!messageId || processedMessages.has(messageId)) return;
       processedMessages.add(messageId);
 
       console.log(`📨 [CJ Webhook] ${type}/${messageType} (${String(messageId).slice(0, 8)}...)`);
 
-            switch (type) {
-        case 'ORDER':        await handleOrderUpdate(params); break;
-        case 'LOGISTICS':    await handleLogistics(params, event); break;
-        case 'PRODUCT':      await handleProductUpdate(params, event, messageType); break;
-        case 'VARIANT':      await handleVariantUpdate(params, event, messageType); break;  // ✨ جديد
-        case 'STOCK':        await handleStockUpdate(params, event); break;
-        case 'MAKEUP':       await handleMakeup(params); break;
-        default: break;
+      switch (type) {
+        case 'ORDER':       await handleOrderUpdate(params); break;
+        case 'LOGISTIC':    // ✅ CJ كيصيفط "LOGISTIC" مفرد (عينة d99e1435) — كان كيطيح صامت!
+        case 'LOGISTICS':   await handleLogistic(params); break; // احتياط للجمع
+        case 'PRODUCT':     await handleProductUpdate(params, messageType); break;
+        case 'VARIANT':     await handleVariantUpdate(params, messageType); break;
+        case 'STOCK':       await handleStockUpdate(params); break;
+        case 'MAKEUP':      await handleMakeup(params); break;
+        default:
+          console.log(`ℹ️ [CJ Webhook] نوع غير معالج: ${type}/${messageType}`);
+          break;
       }
     } catch (err) {
       logger.logError('CJ Webhook Processing', err);
@@ -349,6 +483,7 @@ async function cjWebhookHandler(req, res) {
 
 // ==========================================
 // 📝 تسجيل الـ Callback URL عند CJ
+// (PRIVATE_ORDER ما كنسجلوهش عمداً — ماعندناش معالج مستقل ليه دابا)
 // ==========================================
 async function registerWebhooks(callbackUrl) {
   return cjRequest((token) => axios.post(`${CJ_BASE}/webhook/set`, {
@@ -380,14 +515,14 @@ async function subscribeAllStoreProducts() {
       ));
       const data = res.data?.data || {};
       success += (data.successProductIds || []).length;
-      failed += (data.failProductIds || []).length;
+      failed  += (data.failProductIds   || []).length;
     } catch (err) {
       logger.logError(`CJ Subscribe batch ${i / 100 + 1}`, err);
     }
-    await new Promise(r => setTimeout(r, 1200)); // Tenet #6
+    await new Promise(r => setTimeout(r, 1200)); // invariant #6 — QPS=1
   }
 
   return { total: ids.length, success, failed };
 }
 
-module.exports = { cjWebhookHandler, registerWebhooks, subscribeAllStoreProducts };
+module.exports = { cjWebhookHandler, registerWebhooks, subscribeAllStoreProducts, notifyShipment };

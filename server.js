@@ -45,6 +45,7 @@ const checkoutLimiter = rateLimit({
   max: 25, // 25 محاولة فتح جلسة دفع لكل زائر كل 15 دقيقة (كافية للزبون الطبيعي وتمنع البوتات)
   message: { error: 'Too many checkout attempts, please try again in a few minutes.' } 
 });
+const trackLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, message: { error: 'Too many tracking requests.' } });
 
 const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
 
@@ -113,8 +114,8 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    const orderId = session.metadata?.orderId;
-    if (!orderId) return;
+        const orderId = parseInt(session.metadata?.orderId, 10);
+    if (!Number.isFinite(orderId)) return; // 🛡️ metadata تالفة → تجاهل بنعومة
 
     (async () => {
       try {
@@ -125,7 +126,7 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
         const shippingAddress = addr ? JSON.stringify(addr) : JSON.stringify({ line1: 'Online Store Purchase', country: 'US' });
         const totalAmount = session.amount_total / 100;
 
-        // 🚨 Atomic Update محصّن: تحديث الحالة وطريقة الدفع لمنع التكرار
+        // 🚨 قفل ذري: واحد فقط كيربح (هادا ولا JIT verifier)
         const updateRes = await pool.query(
           `UPDATE orders 
            SET customer_name = $1, customer_email = $2, customer_phone = $3, 
@@ -152,10 +153,14 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
         console.log(`✅ Order #${orderId} marked as paid! Background processing started.`);
 
         const cjResponse = await fulfillCJOrder(orderId, customerName, session.customer_details, items);
-        
-        // ✨ تحديث حالة الطلب بعد نجاح إرساله لـ CJ لكي لا يعالجه كرون الـ Reconcile مجدداً!
+
+        // ✅ v2 — حيدنا UPDATE 'completed' (قاتل #1): الحالة تبقى paid +
+        //   cj_order_number محفوظ داخل fulfillCJOrder (يحمي من إعادة الـ Reconcile)
+        //   الويب هوك SHIPPED هو اللي كيرفع لـ fulfilled + يصيفط واتساب/إيميل فثواني
         if (cjResponse && cjResponse.success) {
-          await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [orderId]);
+          console.log(`📤 [Stripe WH] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
+        } else {
+          console.error(`❌ [Stripe WH] CJ fulfillment فشل لـ #${orderId} → manual داخل fulfillCJOrder`);
         }
 
         if (customerEmail) {
@@ -171,7 +176,12 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
 // ==========================================
 // 1.5 مسار CJ Webhook (يجب أن يبقى قبل express.json — بحال Stripe)
 // ==========================================
-const { cjWebhookHandler } = require('./services/cjWebhookService');
+const { 
+  cjWebhookHandler, 
+  notifyShipment, 
+  registerWebhooks, 
+  subscribeAllStoreProducts 
+} = require('./services/cjWebhookService');
 app.post('/api/cj-webhook', express.raw({ type: 'application/json' }), cjWebhookHandler);
 
 // ==========================================
@@ -416,10 +426,10 @@ app.post('/api/admin/add-coupon', async (req, res) => {
   try {
     await pool.query(
       `INSERT INTO coupons (code, discount_type, discount_value, is_active)
-       VALUES ('LACLARC10', 'percentage', 10, true)
+       VALUES ('RECOVER10', 'percentage', 10, true)
        ON CONFLICT (code) DO NOTHING`
     );
-    console.log('🎟️ Recovery coupon LACLARC10 ensured in DB.');
+    console.log('🎟️ Recovery coupon RECOVER10 ensured (abandoned-cart emails promise it).');
   } catch (e) {
     console.warn('Recovery coupon seed skipped:', e.message);
   }
@@ -448,8 +458,6 @@ app.post('/api/admin/add-review', async (req, res) => {
 // ==========================================
 // 🐺 CJ Webhooks Management (Admin)
 // ==========================================
-const { registerWebhooks, subscribeAllStoreProducts } = require('./services/cjWebhookService');
-
 app.post('/api/admin/webhook/register', async (req, res) => {
   try {
     const callbackUrl = `${process.env.BACKEND_URL || 'https://neo-store-backend.onrender.com'}/api/cj-webhook`;
@@ -896,7 +904,7 @@ async function runCjProductSync(keyword) {
     if (cjProducts.length === 0) break;
 
     for (const cjItem of cjProducts) {
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, 1200));
       const productId = cjItem.pid ? String(cjItem.pid) : null;
       if (!productId) continue;
 
@@ -1088,16 +1096,25 @@ app.get('/api/admin/manual-orders', async (req, res) => {
 
 app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
-    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid order id' });
 
-    await pool.query("UPDATE orders SET status = 'paid' WHERE id = $1", [id]);
+    // ✨ v2: قفل ذري — pending → paid فقط (ضغطة ثانية = 409، ما كيرجعش fulfilled لـ paid)
+    const updateRes = await pool.query(
+      "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING *",
+      [id]
+    );
+    if (updateRes.rows.length === 0) {
+      const exists = await pool.query('SELECT status FROM orders WHERE id = $1', [id]);
+      if (exists.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+      return res.status(409).json({ error: `Order is '${exists.rows[0].status}' — already processed` });
+    }
+    const order = updateRes.rows[0];
+
     res.json({ message: 'Order approved. Sending to CJ in background...' });
 
     (async () => {
       try {
-        const order = orderRes.rows[0];
         const itemsRes = await pool.query('SELECT * FROM order_items WHERE order_id = $1', [id]);
         const items = itemsRes.rows;
 
@@ -1105,11 +1122,20 @@ app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
         try { parsedAddress = JSON.parse(order.shipping_address); }
         catch (e) { parsedAddress = { line1: order.shipping_address, country: 'DZ' }; }
 
-        const customerDetails = { address: parsedAddress, phone: order.customer_phone };
+        const customerDetails = {
+          address: parsedAddress,
+          phone: order.customer_phone,
+          email: order.customer_email || '',   // ✨ V3 — fulfillCJOrder v2 عندو fallback آمن
+          name: order.customer_name,
+        };
+
         const cjResponse = await fulfillCJOrder(order.id, order.customer_name, customerDetails, items);
 
+        // ✅ v2 — بلا 'completed': الحالة تبقى paid، الويب هوك SHIPPED هو اللي كيرفع + يصيفط واتساب
         if (cjResponse && cjResponse.success) {
-          await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [order.id]);
+          console.log(`📤 [BaridiMob] #${id} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
+        } else {
+          console.error(`❌ [BaridiMob] CJ fulfillment فشل لـ #${id} → manual داخل fulfillCJOrder`);
         }
 
         if (order.customer_email) {
@@ -1363,6 +1389,7 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
 // ==========================================
 app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
   try {
+    let orderId = null;
     const { items: clientItems, origin, couponCode, utm } = req.body;
     let baseUrl = origin && origin.startsWith('http') ? origin : (process.env.FRONTEND_URL || 'https://laclarc.com');
     baseUrl = baseUrl.replace(/\/+$/, '');
@@ -1383,7 +1410,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, 'Stripe', $7, $8, $9, $10) RETURNING id`,
       ['Pending Customer', 'pending@laclarc.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null, utmSource, utmMedium, utmCampaign, clickId]
     );
-    const orderId = orderResult.rows[0].id;
+    orderId = orderResult.rows[0].id;
 
     for (const item of secureItems) {
       await pool.query(
@@ -1438,38 +1465,53 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
 
     await pool.query("UPDATE orders SET stripe_session_id = $1 WHERE id = $2", [session.id, orderId]);
     res.json({ url: session.url });
-  } catch (err) {
+    } catch (err) {
+    // 🧹 إلا فشل Stripe session، الـ pending عمرو ما يتخلص
+    if (orderId) {
+      await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status = 'pending'", [orderId]).catch(() => {});
+    }
     logger.logError('Create Checkout Session', err);
     res.status(500).json({ error: err.message });
   }
 });
-// ==========================================
-// ⚡ مسار التحقق المالي اللحظي JIT (Just-In-Time Stripe Verifier)
-// يستجوب خوادم Stripe مباشرة في الوقت الفعلي قبل إطلاق أي شحنة لـ CJ
+/// ==========================================
+// ⚡ مسار التحقق المالي اللحظي JIT v2 (Just-In-Time Stripe Verifier)
+// يستجوب خوادم Stripe مباشرة قبل إطلاق أي شحنة لـ CJ (invariant #8)
+// ⚠️ القاعدة الذهبية (v2): بعد النجاح الحالة تبقى 'paid' — الويب هوك
+//    SHIPPED هو اللي كيرفعها لـ fulfilled + يصيفط واتساب/إيميل فثواني
 // ==========================================
 app.post('/api/payment/verify-session', async (req, res) => {
   const { session_id } = req.body;
 
-  if (!session_id || typeof session_id !== 'string') {
+  if (!session_id || typeof session_id !== 'string' || session_id.length > 500) {
     return res.status(400).json({ success: false, error: 'Session ID is required' });
   }
 
   try {
-    // 1. استجواب مباشر وفوري لخوادم Stripe (JIT API Call)
-    const session = await stripe.checkout.sessions.retrieve(session_id);
+    // 1. استجواب مباشر وفوري لخوادم Stripe — البيانات من Stripe ماشي من العميل
+    let session;
+    try {
+      session = await stripe.checkout.sessions.retrieve(session_id);
+    } catch (e) {
+      // session_id غير صالح/منتهي → 404 نظيف بدل 500
+      return res.status(404).json({ success: false, error: 'Invalid checkout session' });
+    }
 
     if (!session || !session.metadata?.orderId) {
       return res.status(404).json({ success: false, error: 'Invalid checkout session' });
     }
 
     const orderId = parseInt(session.metadata.orderId, 10);
+    if (!Number.isFinite(orderId)) {
+      return res.status(404).json({ success: false, error: 'Invalid checkout session' });
+    }
 
     // 2. التحقق الجازم: هل تم الدفع بنجاح 100% في Stripe؟
     if (session.payment_status !== 'paid') {
-      return res.status(400).json({ 
-        success: false, 
-        status: 'unpaid', 
-        message: 'Payment has not been completed or was declined by the bank.' 
+      return res.status(400).json({
+        success: false,
+        status: 'unpaid',
+        message: 'Payment has not been completed or was declined by the bank.'
       });
     }
 
@@ -1477,44 +1519,56 @@ app.post('/api/payment/verify-session', async (req, res) => {
     const customerEmail = session.customer_details?.email || '';
     const customerPhone = session.customer_details?.phone || '';
     const addr = session.customer_details?.address;
-    const shippingAddress = addr 
-      ? JSON.stringify(addr) 
+    const shippingAddress = addr
+      ? JSON.stringify(addr)
       : JSON.stringify({ line1: 'Online Store Purchase', country: 'US' });
+    // ⓘ USD/EUR: /100 صحيح. عملية zero-decimal (JPY/KRW) إلا فتحتوها يوماً
     const paidAmount = session.amount_total / 100;
 
-    // 3. قفل ذري (Atomic Lock): إذا كان الطلب ما زال pending يتم تحويله لـ paid فوراً
+    // 3. قفل ذري: pending → paid — واحد فقط كيربح (JIT ولا Stripe Webhook)
     const updateRes = await pool.query(
-      `UPDATE orders 
-       SET customer_name = $1, customer_email = $2, customer_phone = $3, 
-           shipping_address = $4, total_amount = $5, payment_method = 'Stripe', 
-           status = 'paid' 
-       WHERE id = $6 AND status = 'pending' 
+      `UPDATE orders
+       SET customer_name = $1, customer_email = $2, customer_phone = $3,
+           shipping_address = $4, total_amount = $5, payment_method = 'Stripe',
+           status = 'paid'
+       WHERE id = $6 AND status = 'pending'
        RETURNING id`,
       [customerName, customerEmail, customerPhone, shippingAddress, paidAmount, orderId]
     );
 
-    // جلب بيانات وعناصر الطلب
     const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
     const fullOrder = orderRes.rows[0];
+    if (!fullOrder) {
+      // 🛡️ metadata يشير لطلب ماشي موجود (session قديم/test) — رد نظيف بدل 500
+      return res.status(404).json({ success: false, error: 'Order not found' });
+    }
 
     const itemsRes = await pool.query(`
-      SELECT oi.*, p.title, p.image_url 
-      FROM order_items oi 
-      LEFT JOIN products p ON oi.product_id = p.id 
+      SELECT oi.*, p.title, p.image_url
+      FROM order_items oi
+      LEFT JOIN products p ON oi.product_id = p.id
       WHERE oi.order_id = $1
     `, [orderId]);
     const items = itemsRes.rows;
 
-    // 4. إذا أمسكنا بالطلب (لم يسبقنا الـ Webhook)، نرسله لـ CJ فوراً في الخلفية
+    // 4. إذا أمسكنا بالقفل (ما سبقناش الـ Webhook) → CJ فوراً فالخلفية
     if (updateRes.rows.length > 0) {
       console.log(`⚡ [JIT Verification] Order #${orderId} verified with Stripe! Fulfilling to CJ immediately...`);
 
       (async () => {
         try {
           const cjResponse = await fulfillCJOrder(orderId, customerName, session.customer_details, items);
-          if (cjResponse && cjResponse.success) {
-            await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [orderId]);
+
+          // ✅ v2 — الإصلاح الحاسم: حيدنا UPDATE status='completed'!
+          //   كان كيقفز paid(1) → completed(3) → guard ديال الويب هوك كيطيح SHIPPED(2)
+          //   → بلا tracking_number، بلا واتساب، بلا إيميل (نفس P0 ديال 'fulfilled')
+          //   'completed' = DELIVERED فقط — حصراً من ويب هوك DELIVERED/COMPLETED
+          if (cjResponse?.success) {
+            console.log(`📤 [JIT] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
+          } else {
+            console.error(`❌ [JIT] CJ fulfillment فشل لـ #${orderId} → marked manual داخل fulfillCJOrder`);
           }
+
           if (customerEmail) {
             sendOrderConfirmationEmail(customerEmail, orderId, paidAmount, items)
               .catch(err => logger.logError('JIT Email Dispatch', err));
@@ -1527,7 +1581,7 @@ app.post('/api/payment/verify-session', async (req, res) => {
       console.log(`ℹ️ [JIT Verification] Order #${orderId} was already locked/processed by Webhook.`);
     }
 
-    // 5. إرجاع النتيجة الفورية للواجهة لتأكيد الدفع والمبلغ الحقيقي
+    // 5. الرد الفوري — الحالة 'paid' (صحيحة: الشحن مازال ما وقعش!)
     res.json({
       success: true,
       verified: true,
@@ -1615,8 +1669,8 @@ app.get('/api/orders/track/:identifier', async (req, res) => {
   }
 });
 
-app.get('/api/track/:trackNumber', async (req, res) => {
-  try {
+app.get('/api/track/:trackNumber', trackLimiter, async (req, res) => {
+    try {
     const { trackNumber } = req.params;
     const response = await cjRequest((token) => axios.get(`https://developers.cjdropshipping.com/api2.0/v1/logistic/trackInfo`, { headers: { 'CJ-Access-Token': token }, params: { trackNumber } }));
     if (response.data.code === 200) res.json(response.data.data);
@@ -2067,58 +2121,72 @@ cron.schedule('0 11,18 * * *', async () => {
   await postDailyProductToFacebook();
 });
 
-// 6. كرون مطابقة مدفوعات Stripe (Payment Reconciliation - كل 15 دقيقة)
+// 6. كرون مطابقة مدفوعات Stripe v2 (كل 15 دقيقة)
+// الهدف الحقيقي: طلب paid اللي fulfillment فشل قبل ما يوصل CJ (crash شبكي...)
+// ✅ v2: guard cj_order_number — الطلب المقبول فـ CJ عندو رقم → عمرو ما يتعاود
+//   (قبل: كيتعاود كل 15د → 1603003 → إيميل مكرر! و'completed' كانت المجمّع الوهمي)
 cron.schedule('*/15 * * * *', async () => {
   if (isReconciling) return;
   isReconciling = true;
 
   try {
-    // جلب الطلبات المدفوعة ولكن لم تكتمل في CJ
     const query = `
-      SELECT id, stripe_session_id, total_amount 
-      FROM orders 
-      WHERE payment_method = 'Stripe' 
+      SELECT id, stripe_session_id, total_amount
+      FROM orders
+      WHERE payment_method = 'Stripe'
         AND status IN ('paid', 'reconciling')
         AND stripe_session_id IS NOT NULL
+        AND (cj_order_number IS NULL OR cj_order_number = '')
         AND created_at <= NOW() - INTERVAL '10 minutes'
       LIMIT 15;
     `;
     const { rows: pendingOrders } = await pool.query(query);
+    if (pendingOrders.length > 0) {
+      console.log(`🔄 [Stripe Reconcile v2] ${pendingOrders.length} طلب ما وصلوش لـ CJ — إعادة محاولة...`);
+    }
 
     for (const order of pendingOrders) {
       try {
-        await pool.query("UPDATE orders SET status = 'reconciling' WHERE id = $1", [order.id]);
+        // ✅ v2 — لا حالة وسيطة 'reconciling' جديدة (كانت كتخلي الطلب يتيم إلا crash)
         const session = await stripe.checkout.sessions.retrieve(order.stripe_session_id);
 
         if (session.payment_status === 'paid') {
-          console.log(`💰 [Stripe Reconcile] Order ${order.id} confirmed paid in Stripe. Sending to CJ...`);
-          
+          console.log(`💰 [Stripe Reconcile] Order ${order.id} confirmed paid. Sending to CJ...`);
+
           const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [order.id]);
           const fullOrder = orderRes.rows[0];
           const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [order.id]);
           const items = itemsRes.rows;
 
           let parsedAddress = {};
-          try { parsedAddress = JSON.parse(fullOrder.shipping_address); } 
+          try { parsedAddress = JSON.parse(fullOrder.shipping_address); }
           catch (e) { parsedAddress = { line1: fullOrder.shipping_address, country: 'US' }; }
-          const customerDetails = { address: parsedAddress, phone: fullOrder.customer_phone || '0000000000' };
+          const customerDetails = {
+            address: parsedAddress,
+            phone: fullOrder.customer_phone || '0000000000',
+            email: fullOrder.customer_email || '',
+            name: fullOrder.customer_name,
+          };
 
           const cjResponse = await fulfillCJOrder(order.id, fullOrder.customer_name, customerDetails, items);
 
-          // ✨ إصلاح الثغرة الحرجة: تغيير الحالة إلى 'completed' لمنع الحلقة اللانهائية وإعادة الطلب كل 15 دقيقة
           if (cjResponse && cjResponse.success) {
-            await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [order.id]);
+            // ✅ الحالة تبقى paid + cj_order_number تولى محفوظ → ما يتعاودش أبداً
+            console.log(`📤 [Reconcile] #${order.id} مقبول فـ CJ (${cjResponse.orderNumber})`);
             if (fullOrder.customer_email) {
               sendOrderConfirmationEmail(fullOrder.customer_email, order.id, fullOrder.total_amount, items)
                 .catch(err => logger.logError('Reconcile Email', err));
             }
           } else {
-            // إذا تعثر إرساله لـ CJ، يتحول إلى manual ليظهر في لوحة failed orders ولا يعلق في حلقة reconcile
             await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [order.id]);
           }
         } else {
-          console.log(`⚠️ [Stripe Reconcile] Order ${order.id} unpaid in Stripe. Cancelling.`);
-          await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1", [order.id]);
+          // ✅ v2 — إلغاء ذري (ما كيمسش طلب متسجل فـ CJ أصلاً)
+          const upd = await pool.query(
+            "UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status IN ('paid','reconciling') AND (cj_order_number IS NULL OR cj_order_number = '') RETURNING id",
+            [order.id]
+          );
+          if (upd.rows.length) console.log(`⚠️ [Stripe Reconcile] Order ${order.id} unpaid in Stripe. Cancelled.`);
         }
       } catch (error) {
         logger.logError(`Stripe Reconcile Order #${order.id}`, error);
@@ -2126,6 +2194,11 @@ cron.schedule('*/15 * * * *', async () => {
       }
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
+
+    // 🧹 تنظيف legacy: 'reconciling' معلقين من النسخة القديمة → رجعهم paid (بلا مساس بالشاودين)
+    await pool.query(
+      "UPDATE orders SET status = 'paid' WHERE status = 'reconciling' AND (cj_order_number IS NULL OR cj_order_number = '') AND (tracking_number IS NULL OR tracking_number = '')"
+    );
   } catch (error) {
     logger.logError('Stripe Reconcile Cron Fatal', error);
   } finally {
@@ -2263,18 +2336,16 @@ cron.schedule('0 */2 * * *', async () => {
     console.error('❌ [Abandoned Cart] Error:', err.message);
   }
 });
-// ==========================================
-// 📦 9. كرون تتبع شحنات CJ وإرسال إشعارات WhatsApp التلقائية
-// يفحص الطلبات المشحونة حديثاً، يستخرج رقم التتبع، ويرسله للزبون عبر واتساب
-// ==========================================
+// 9. كرون التتبع v2 — fallback ديال الويب هوك (كل نصف ساعة)
+// ✅ GET ماشي POST (16900202 مؤكدة بالتجربة — الكومنتار القديم كان غالط)
+// ✅ guards + RETURNING = dedup مع الويب هوك + notifyShipment الموحدة
 cron.schedule('30 * * * *', async () => {
-  console.log('⏳ [CJ Logistics] Checking for newly dispatched tracking numbers...');
+  console.log('⏳ [CJ Logistics v2] Checking for newly dispatched tracking numbers...');
   try {
-    // جلب الطلبات المدفوعة التي لا تملك رقم تتبع بعد ومر عليها أقل من 15 يوماً
     const { rows: pendingTrackingOrders } = await pool.query(`
-      SELECT id, customer_name, customer_email, customer_phone, shipping_address, total_amount 
-      FROM orders 
-      WHERE (status = 'paid' OR status = 'completed') 
+      SELECT id, customer_name, customer_email, customer_phone, total_amount, cj_order_number
+      FROM orders
+      WHERE status IN ('paid', 'fulfilled')
         AND (tracking_number IS NULL OR tracking_number = '')
         AND created_at >= NOW() - INTERVAL '15 days'
       LIMIT 10;
@@ -2284,69 +2355,60 @@ cron.schedule('30 * * * *', async () => {
 
     for (const order of pendingTrackingOrders) {
       try {
-        await new Promise(r => setTimeout(r, 1200)); // احترام QPS
+        await new Promise(r => setTimeout(r, 1200)); // QPS=1
 
-                // استعلام حالة الطلب وتفاصيل الشحنة من CJ
-        // ✨ إصلاح: getOrderDetail راه POST بـ JSON body حسب وثيقة CJ v2.0 (ماشي GET params)
+        const stored = String(order.cj_order_number || '').trim();
+        const cjNum = (stored || `STORE-${order.id}`).split(',')[0].trim();
+
         const orderInfoRes = await cjRequest((token) =>
-          axios.post(
-            'https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail',
-            { orderNumber: `STORE-${order.id}` },
-            { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
-          )
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail', {
+            params: { orderNumber: cjNum },
+            headers: { 'CJ-Access-Token': token },
+          })
         );
 
-        const cjData = orderInfoRes.data?.data;
-
-        // ✨ CJ كيرجع business errors بـ code 200 HTTP + code داخلي — نفحصوهم
         if (orderInfoRes.data?.code !== 200) {
           console.warn(`⚠️ [Tracking] CJ said for #${order.id}: ${orderInfoRes.data?.message} (code: ${orderInfoRes.data?.code})`);
-          continue; // الطلب ماكاينش فـ CJ أصلاً (fulfillment فاشل ولا مازال) — نسكيبيه بهدوء
+          continue;
         }
 
-        const trackNumber = cjData?.trackNumber || cjData?.trackingNumber;
+        const cjData = orderInfoRes.data?.data || {};
 
-        // ✨ إذا أصدرت CJ رقم التتبع للشحنة:
-        if (trackNumber && typeof trackNumber === 'string' && trackNumber.trim().length > 3) {
-          console.log(`🚀 [CJ Dispatched] Found tracking number for Order #${order.id}: ${trackNumber}`);
-
-          // 1. تحديث قاعدة البيانات
-          await pool.query(
-            "UPDATE orders SET tracking_number = $1, status = 'fulfilled' WHERE id = $2",
-            [trackNumber.trim(), order.id]
-          );
-
-          // 2. إرسال إشعار WhatsApp للزبون برقم التتبع (تم تصحيح تمرير الكائن)
-          if (order.customer_phone) {
-            await sendOrderTrackingWhatsApp({
-              phone: order.customer_phone,
-              customerName: order.customer_name,
-              orderId: order.id,
-              trackingNumber: trackNumber.trim(),
-              email: order.customer_email
-            });
-          }
-
-          // 3. إيميل تأكيد الشحن مع رقم التتبع
-          if (order.customer_email && !order.customer_email.includes('@laclarc.com')) {
-            const itemsRes = await pool.query(
-              `SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`,
-              [order.id]
-            );
-            sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, itemsRes.rows)
-              .catch(err => logger.logError('Tracking Email Dispatch', err));
-          }
+        // 🔬 عينة أول قراءة REST — نضبطو الحقول على الواقع
+        if (!global._cjSample_OrderDetail) {
+          global._cjSample_OrderDetail = true;
+          console.log('🔬 [Sample OrderDetail REST]', JSON.stringify(cjData).slice(0, 800));
         }
-        } catch (orderErr) {
-          logger.logError(`Tracking Sync Order #${order.id}`, {
-            status: orderErr?.response?.status,
-            cjBody: JSON.stringify(orderErr?.response?.data || {}).slice(0, 500), // 🎯 رسالة CJ الحقيقية
-            msg: orderErr?.message,
-          });
-        }
+
+        const info = cjData.orderInfo || cjData;
+        const cjStatus = String(info.orderStatus || info.status || '').toUpperCase();
+        const trackNumber = info.logisticsShipmentNumber || info.trackNumber || info.trackingNumber
+          || (Array.isArray(cjData.products)
+            ? cjData.products.map(p => p.logisticsShipmentNumber || p.trackNumber || p.trackingNumber).find(Boolean)
+            : null);
+
+        if (cjStatus !== 'SHIPPED' && cjStatus !== 'DISPATCHED') continue;
+        if (!trackNumber || typeof trackNumber !== 'string' || trackNumber.trim().length <= 3) continue;
+
+        console.log(`🚀 [CJ Dispatched] Tracking for Order #${order.id}: ${trackNumber.trim()}`);
+
+        // ✅ إلا الويب هوك سبقنا → RETURNING فاضي → ما نعاودوش نأذينا العميل
+        const upd = await pool.query(
+          `UPDATE orders
+             SET tracking_number = $1, status = 'fulfilled',
+                 cj_order_number = COALESCE(NULLIF(cj_order_number,''), $3)
+           WHERE id = $2 AND status = 'paid'
+             AND (tracking_number IS NULL OR tracking_number = '')
+           RETURNING id`,
+          [trackNumber.trim(), order.id, cjNum]
+        );
+        if (!upd.rows.length) continue;
+
+        await notifyShipment(order, trackNumber.trim(), info.logisticName);
+      } catch (e) { /* طلب فاشل ما يوقفش الجولة */ }
     }
   } catch (err) {
-    logger.logError('CJ Tracking & WhatsApp Cron', err);
+    logger.logError('CJ Logistics Cron', err);
   }
 });
 // ==========================================
