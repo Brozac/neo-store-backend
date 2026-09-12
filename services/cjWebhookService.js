@@ -120,8 +120,23 @@ async function notifyShipment(order, trackNumber, logisticName) {
          LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`,
         [order.id]
       );
-      const { sendOrderConfirmationEmail } = require('../controllers/paymentController');
-      await sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, itemsRes.rows);
+      const pcMod = require('../controllers/paymentController');
+      if (typeof pcMod.sendOrderConfirmationEmail === 'function') {
+        await pcMod.sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, itemsRes.rows);
+      } else {
+        await sendEmailDirect({
+          to: order.customer_email,
+          subject: 'Your Laclarc order #' + order.id + ' has shipped! Tracking: ' + trackNumber,
+          html: '<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:20px;">'
+            + '<h2 style="color:#8B78C6;">Great news — your order is on its way! 🚀</h2>'
+            + '<p>Order <strong>#' + order.id + '</strong> has been shipped'
+            + (logisticName ? ' via <strong>' + logisticName + '</strong>' : '') + '.</p>'
+            + '<p style="background:#F9F8FC;border:1px solid #E5E7EB;border-radius:8px;padding:12px;">'
+            + '<strong>Tracking number:</strong> <span style="font-size:16px;color:#1D1E3C;">' + trackNumber + '</span></p>'
+            + '<p>You can follow your parcel anytime with this number.</p>'
+            + '<p>Thank you for shopping with Laclarc! 💜</p></div>'
+        });
+      }
     } catch (mailErr) { logger.logError('Webhook Tracking Email', mailErr); }
   }
 }
@@ -377,12 +392,53 @@ async function handleStockUpdate(params = {}) {
 // 💳 MAKEUP — فاتورة فرق شحن (حقول مؤكدة بالعينة: status/orderId/amount/reason)
 // ⚠️ هادا الموضوع مُوقّع — ما كيوصل هنا إلا بعد verifySignatureFlexible
 // ==========================================
+// 📧 مرسل إيميلات الأدمن — مكتفٍ ذاتياً (Brevo مباشرة)
+// ⚠️ sendEmail محلية فـ server.js وما كتتصدرش — الاعتماد عليها كان bug انكشف بفضل نجاح التوقيع
+// 📧 مرسل مباشر للزبون — Brevo، مكتفٍ ذاتياً (paymentController كيصدر router فقط!)
+async function sendEmailDirect({ to, subject, html }) {
+  try {
+    await axios.post('https://api.brevo.com/v3/smtp/email', {
+      sender: { name: 'Laclarc Support', email: process.env.BREVO_USER },
+      to: [{ email: to }],
+      subject, htmlContent: html
+    }, {
+      headers: {
+        'api-key': process.env.BREVO_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      }
+    });
+    console.log('[direct-email] sent to ' + to + ': ' + subject);
+  } catch (e) {
+    logger.logError('Direct Email (Brevo)', (e.response && e.response.data) || e.message);
+  }
+}
+
+async function sendAdminEmail({ subject, html }) {
+  try {
+    await axios.post('https://api.brevo.com/v3/smtp/email', {
+      sender: { name: 'Laclarc Support', email: process.env.BREVO_USER },
+      to: [{ email: process.env.BREVO_USER }],
+      subject, htmlContent: html
+    }, {
+      headers: {
+        'api-key': process.env.BREVO_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      }
+    });
+    console.log('[admin-email] sent: ' + subject);
+  } catch (e) {
+    logger.logError('Admin Email (Brevo)', (e.response && e.response.data) || e.message);
+  }
+}
+
 async function handleMakeup(params = {}) {
   console.warn(`💳 [CJ Webhook] MAKEUP BILL ${params.status}: ${params.orderId} — $${params.amount} (${params.reason})`);
 
   if (params.status === 'CREATED') {
-    const { sendEmail } = require('../controllers/paymentController');
-    await sendEmail({
+    
+    await sendAdminEmail({
       to: process.env.BREVO_USER,
       subject: `💳 CJ Makeup Bill Created — $${params.amount} for ${params.relationOrderId}`,
       html: `<h2>CJ Postage Makeup Bill</h2>
@@ -444,8 +500,8 @@ async function cjWebhookHandler(req, res) {
           }
           // 💳 MAKEUP = حدث مالي — الأدمن خاصو يعرف حتى إلا تسقات
           if (type === 'MAKEUP') {
-            const { sendEmail } = require('../controllers/paymentController');
-            sendEmail({
+            
+            sendAdminEmail({
               to: process.env.BREVO_USER,
               subject: `🚨 CJ MAKEUP مرفوض (signature) — $${params?.amount} ${params?.orderId}`,
               html: `<p>فاتورة Makeup تسقات من التحقق. شوف 🔐 [SIGN DEBUG] فاللوج + شغّل calibrator.</p>
