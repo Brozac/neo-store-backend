@@ -123,42 +123,110 @@ async function handleLogistics(params = {}, rawEvent) {
 }
 
 // ==========================================
-// 🏷️ PRODUCT — تغيّر السعر/الحالة → نطبقو صيغة التسعير ديالنا
+// 🏷️ PRODUCT — البنية الحقيقية (من العينة):
+// { pid, fields: ["productImage"], productImage: "[json]", productName: "[صيني]" }
+// ⚠️ السعر ماكيجيش هنا — كيجي من VARIANT/UPDATE
+// ⚠️ productName بالصينية — مانتحديثوش العناوين أبداً!
 // ==========================================
 let _productSampleLogged = false;
-async function handleProductUpdate(params = {}, rawEvent) {
-  // عينة كاملة مرة وحدة
+async function handleProductUpdate(params = {}, rawEvent, messageType) {
   if (!_productSampleLogged) {
     _productSampleLogged = true;
-    console.log('🔬 [Product Sample]', JSON.stringify(rawEvent || params).slice(0, 800));
+    console.log('🔬 [Product Sample]', JSON.stringify(rawEvent || params).slice(0, 500));
   }
 
-  const cjPid = String(params.productId || params.pid || '');
+  const cjPid = String(params.pid || '');
   if (!cjPid) return;
 
-  const prodRes = await pool.query('SELECT id, price FROM products WHERE cj_product_id = $1', [cjPid]);
-  if (prodRes.rows.length === 0) return;
-  const product = prodRes.rows[0];
-
-  // منتج تزال من CJ → نخفيو من المتجر
-  if (params.status && String(params.status).toUpperCase() === 'DELETE') {
-    await pool.query('UPDATE products SET stock_status = false WHERE id = $1', [product.id]);
-    console.log(`🗑️ [CJ Webhook] Product ${cjPid} delisted — hidden from store.`);
+  // 🗑️ حذف من CJ → إخفاء من المتجر
+  if (messageType === 'DELETE') {
+    await pool.query('UPDATE products SET stock_status = false WHERE cj_product_id = $1', [cjPid]);
+    console.log(`🗑️ [CJ Webhook] Product ${cjPid} DELETED by CJ — hidden from store.`);
     return;
   }
 
-  // تغيّر السعر → نعيدو الحساب بصيغة Laclarc (نفس معادلة الـ sync)
-  const cjPrice = parseFloat(params.sellPrice ?? params.costPrice);
-  if (Number.isFinite(cjPrice) && cjPrice > 0) {
-    let sellingPrice = cjPrice <= 5 ? cjPrice * 3.5 : cjPrice <= 15 ? cjPrice * 2.8 : cjPrice <= 30 ? cjPrice * 2.2 : cjPrice * 1.8;
-    sellingPrice = Math.max(9.99, Math.floor(sellingPrice) - 0.01);
-    const safePrice = parseFloat(sellingPrice.toFixed(2));
+  const prodRes = await pool.query('SELECT id, image_url FROM products WHERE cj_product_id = $1', [cjPid]);
+  if (prodRes.rows.length === 0) return;
+  const product = prodRes.rows[0];
 
-    if (Math.abs(safePrice - Number(product.price)) > 0.01) {
-      await pool.query('UPDATE products SET price = $1, original_price = $2 WHERE id = $3',
-        [safePrice, parseFloat((safePrice * 1.5).toFixed(2)), product.id]);
-      console.log(`💰 [CJ Webhook] Product ${cjPid} price updated: $${product.price} → $${safePrice}`);
+  // ✨ نفحصو غير الحقول المعلنة فـ fields (بلا افتراضات)
+  const changedFields = Array.isArray(params.fields) ? params.fields : [];
+
+  // تغيّر الصورة الرئيسية → تحديث image_url (إلا الصورة القديمة من CJ نفسو)
+  if (changedFields.includes('productImage') && params.productImage) {
+    try {
+      const imgs = JSON.parse(params.productImage);
+      const firstImg = Array.isArray(imgs) ? imgs.find(u => typeof u === 'string' && u.startsWith('http')) : null;
+      if (firstImg && product.image_url && product.image_url.includes('cjdropshipping') && firstImg !== product.image_url) {
+        await pool.query('UPDATE products SET image_url = $1 WHERE id = $2', [firstImg, product.id]);
+        console.log(`🖼️ [CJ Webhook] Product ${cjPid} main image refreshed.`);
+      }
+    } catch { /* productImage ماشي JSON صالح — تجاهل */ }
+  }
+
+  // 📝 ملاحظة: productName كيجي بالصينية — عناويننا إنجليزية، عمرو مايتلمسو
+}
+// ==========================================
+// 🧬 VARIANT — البنية الحقيقية (من العينة):
+// { vid, pid, variantSellPrice: "10.990", variantSku, variantKey, variantStatus: 1 }
+// 💰 هذا هو مصدر الأسعار الحقيقي — حماية الهامش الزمنية!
+// ==========================================
+let _variantSampleLogged = false;
+async function handleVariantUpdate(params = {}, rawEvent, messageType) {
+  if (!_variantSampleLogged) {
+    _variantSampleLogged = true;
+    console.log('🔬 [Variant Sample]', JSON.stringify(rawEvent || params).slice(0, 500));
+  }
+
+  const vid = String(params.vid || '');
+  const pid = String(params.pid || '');
+  if (!vid || !pid) return;
+
+  const prodRes = await pool.query('SELECT id, variants FROM products WHERE cj_product_id = $1', [pid]);
+  if (prodRes.rows.length === 0) return;
+  const product = prodRes.rows[0];
+
+  // Parse الـ variants JSONB بأمان
+  let variants = product.variants;
+  if (typeof variants === 'string') {
+    try { variants = JSON.parse(variants); } catch { variants = []; }
+  }
+  if (!Array.isArray(variants)) variants = [];
+
+  const idx = variants.findIndex(v => String(v.vid) === vid);
+
+  // 🗑️ DELETE → نحيدو الـ variant من القائمة
+  if (messageType === 'DELETE') {
+    if (idx > -1) {
+      variants.splice(idx, 1);
+      await pool.query('UPDATE products SET variants = $1 WHERE id = $2', [JSON.stringify(variants), product.id]);
+      console.log(`🗑️ [CJ Webhook] Variant ${vid} removed from product ${pid}.`);
     }
+    return;
+  }
+
+  // ✨ INSERT / UPDATE — دمج البيانات الجديدة (نحافظو على أي حقول محلية)
+  const updates = {};
+  if (params.variantSellPrice !== undefined) updates.variantSellPrice = params.variantSellPrice;
+  if (params.variantSku !== undefined) updates.variantSku = params.variantSku;
+  if (params.variantKey !== undefined) updates.variantKey = params.variantKey;
+  if (params.variantStatus !== undefined) updates.variantStatus = params.variantStatus;
+  if (params.variantImage !== undefined) updates.variantImage = params.variantImage;
+
+  let oldPrice = null;
+  if (idx > -1) {
+    oldPrice = variants[idx].variantSellPrice;
+    variants[idx] = { ...variants[idx], ...updates };
+  } else {
+    variants.push({ vid, ...updates });
+  }
+
+  await pool.query('UPDATE products SET variants = $1 WHERE id = $2', [JSON.stringify(variants), product.id]);
+
+  // 💰 لوج تغيّرات الأسعار فقط — أهم إشارة مالية
+  const newPrice = params.variantSellPrice;
+  if (newPrice && oldPrice && String(oldPrice) !== String(newPrice)) {
+    console.log(`💰 [CJ Webhook] Variant ${vid} price: $${oldPrice} → $${newPrice} (product ${pid})`);
   }
 }
 
@@ -264,10 +332,11 @@ async function cjWebhookHandler(req, res) {
 
       console.log(`📨 [CJ Webhook] ${type}/${messageType} (${String(messageId).slice(0, 8)}...)`);
 
-      switch (type) {
+            switch (type) {
         case 'ORDER':        await handleOrderUpdate(params); break;
         case 'LOGISTICS':    await handleLogistics(params, event); break;
-        case 'PRODUCT':      await handleProductUpdate(params, event); break;
+        case 'PRODUCT':      await handleProductUpdate(params, event, messageType); break;
+        case 'VARIANT':      await handleVariantUpdate(params, event, messageType); break;  // ✨ جديد
         case 'STOCK':        await handleStockUpdate(params, event); break;
         case 'MAKEUP':       await handleMakeup(params); break;
         default: break;
