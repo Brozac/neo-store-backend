@@ -2399,7 +2399,7 @@ cron.schedule('30 * * * *', async () => {
 
         let orderInfoRes = await cjRequest((token) =>
           axios.get('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail', {
-            params: { orderNumber: cjNum },
+            params: { orderId: cjNum, orderNumber: cjNum }, // ⭐ درس #62: orderId هو المعرف الداخلي (SD...)
             headers: { 'CJ-Access-Token': token },
           })
         );
