@@ -163,37 +163,46 @@ async function handleProductUpdate(params = {}, rawEvent) {
 }
 
 // ==========================================
-// 📦 STOCK — البنية الحقيقية من اللوج:
-// params: { "<id>": [ { pid, areaEn, countryCode, stock..., } ] }
+// 📦 STOCK — البنية الحقيقية (من العينة الحية):
+// params: { "<vid>": [ { pid, vid, storageNum, areaEn, countryCode } ] }
+// الكمية الحقيقية = storageNum ✅
 // ==========================================
 let _stockSampleLogged = false;
 async function handleStockUpdate(params = {}, rawEvent) {
-  // عينة كاملة مرة وحدة — باش نأكدو أسماء حقول الكمية بالضبط
   if (!_stockSampleLogged) {
     _stockSampleLogged = true;
-    console.log('🔬 [Stock Sample]', JSON.stringify(rawEvent || params).slice(0, 800));
+    console.log('🔬 [Stock Sample]', JSON.stringify(rawEvent || params).slice(0, 500));
   }
+
+  // ✨ تجميع المخزون الإجمالي لكل pid (عدة variants/warehouses لنفس المنتج)
+  const stockByPid = new Map();
 
   for (const [key, records] of Object.entries(params)) {
     if (!Array.isArray(records)) continue;
 
     for (const rec of records) {
       const pid = String(rec.pid || key);
-      if (!pid) continue;
+      const vid = rec.vid ? String(rec.vid) : null;
+      const qty = Number(rec.storageNum ?? rec.stockQuantity ?? rec.quantity ?? rec.stock ?? rec.qty);
+      if (!Number.isFinite(qty)) continue;
 
-      // ✨ CJ ممكن يسمي الكمية بأي اسم من هادو
-      const qty = rec.stockQuantity ?? rec.quantity ?? rec.stock ?? rec.qty ?? rec.availableStock;
-      if (qty === undefined) continue;
+      // إجمالي عبر المستودعات/الـ variants
+      stockByPid.set(pid, (stockByPid.get(pid) || 0) + qty);
 
-      const available = Number(qty) > 0;
+      // ✨ اختياري مستقبلاً: تحديث مخزون كل variant فالـ JSONB
+      // (حالياً كنكفيو بمستوى المنتج — كافي لعرض متوفر/غير متوفر)
+    }
+  }
 
-      await pool.query(
-        'UPDATE products SET stock_status = $1 WHERE cj_product_id = $2',
-        [available, pid]
-      );
-      if (!available) {
-        console.log(`📉 [CJ Webhook] Product ${pid} OUT OF STOCK — hidden from store.`);
-      }
+  // تحديث واحد لكل منتج (ماشي واحد لكل record — أداء أنظف)
+  for (const [pid, totalQty] of stockByPid) {
+    const available = totalQty > 0;
+    const res = await pool.query(
+      'UPDATE products SET stock_status = $1 WHERE cj_product_id = $2 RETURNING id',
+      [available, pid]
+    );
+    if (res.rows.length > 0 && !available) {
+      console.log(`📉 [CJ Webhook] Product ${pid} OUT OF STOCK (${totalQty} left) — hidden from store.`);
     }
   }
 }
