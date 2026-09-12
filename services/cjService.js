@@ -69,10 +69,28 @@ async function getCJToken(forceRefresh = false) {
 // ==========================================
 // 2. محرك الطلبات الذكي مع الحماية من الـ Rate Limit
 // ==========================================
+// ==========================================
+// 2.5 🚦 بوابة QPS عالمية — كل نداءات CJ (webhooks/crons/fulfillment) صنبور واحد
+// كيضمن مسافة دنيا بين النداءات الفعلية مهما كان عدد المستهلكين المتوازيين
+// ==========================================
+const CJ_MIN_GAP_MS = 1100; // تحت سقف 1 QPS بهامش
+let cjChain = Promise.resolve();
+let cjLastAt = 0;
+function cjPace() {
+  const job = cjChain.then(async () => {
+    const wait = Math.max(0, cjLastAt + CJ_MIN_GAP_MS - Date.now());
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    cjLastAt = Date.now();
+  });
+  cjChain = job.then(() => {}, () => {});
+  return job;
+}
+
 async function cjRequest(requestFn, retryCount = 0) {
   try {
     const token = await getCJToken();
     const config = { timeout: 45000 };
+    await cjPace();
     return await requestFn(token, config);
   } catch (err) {
     const status = err.response?.status;
@@ -80,7 +98,7 @@ async function cjRequest(requestFn, retryCount = 0) {
     const isAuthError = status === 401 || cjCode === 401 || cjCode === 1600001;
 
     // خطأ تجاوز حد الطلبات في الثانية (QPS=1)
-    if (cjCode === 1600200) {
+    if (cjCode === 1600200 || status === 429) {
       if (retryCount < 3) {
         const backoffTime = (retryCount + 1) * 1500;
         console.warn(`⚠️ CJ QPS Limit hit. Retrying in ${backoffTime}ms (Attempt ${retryCount + 1}/3)...`);
@@ -94,6 +112,7 @@ async function cjRequest(requestFn, retryCount = 0) {
     if (isAuthError && retryCount < 1) {
       console.log('⚠️ CJ token expired during request. Refreshing now...');
       const freshToken = await getCJToken(true);
+      await cjPace(); // 🚦 حتى الـ retry مدبّر
       return await requestFn(freshToken, { timeout: 45000 });
     }
     throw err;
@@ -113,6 +132,22 @@ const parseNumeric = (val) => {
 //    القبول عند CJ = الطلب يبقى 'paid' — والويب هوك هو اللي كيرفع الحالة
 // ==========================================
 const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
+
+// 📧 تنبيه الأدمن — مكتفٍ ذاتياً (paymentController كيصدر router فقط — الدرس من MAKEUP!)
+async function sendAdminAlert(subject, html) {
+  try {
+    await axios.post('https://api.brevo.com/v3/smtp/email', {
+      sender: { name: 'Laclarc Support', email: process.env.BREVO_USER },
+      to: [{ email: process.env.BREVO_USER }],
+      subject: subject,
+      htmlContent: html
+    }, { headers: { 'api-key': process.env.BREVO_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' } });
+    console.log('[admin-alert] sent: ' + subject);
+  } catch (e) {
+    logger.logError('Admin Alert (Brevo)', (e.response && e.response.data) || e.message);
+  }
+}
+
 
 async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
   let cjCreated = false; // 🛡️ واقي الـ catch الفادح — لا manual إلا إلا ما وصل حتى إرسال لـ CJ
@@ -198,7 +233,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
       isSandbox: isSandbox,
     };
 
-    // 🔧 استخراج رقم CJ (BT...) من أي response — الأسماء ما مؤكدينش، نجربو المست slaughtered_shuffle كلهم
+    // 🔧 استخراج رقم CJ (BT...) من أي response — الأسماء ما مؤكدينش، نجربو المست المستويين كلهم
     //    + 🔬 عينة أول نجاح (نفس منهجية الويب هوك — اللوج هو ground truth)
     function extractCjNumber(dataObj) {
       const d = dataObj || {};
@@ -398,13 +433,11 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
         // 🚨 جزئي — ⚠️ v2: عمرو ما كنكتبوش فـ shipping_address (كان كيدمر عنوان العميل)!
         console.error(`🚨 Partial fulfillment on Order #${orderId}: ${successfulSplits}/${cjProducts.length} shipped.`);
         await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
-        const { sendEmail } = require('../controllers/paymentController');
-        sendEmail({
-          to: process.env.BREVO_USER,
-          subject: `🚨 CJ Partial Fulfillment — Order #${orderId} (${successfulSplits}/${cjProducts.length})`,
-          html: `<p>Splits الناجحين: <code>${splitOrdersCreated.join(', ')}</code></p>
-                 <p>راجع CJ dashboard وأكمل العناصر الناقصة يدوياً — العميل مستنى!</p>`
-        }).catch(() => {});
+        sendAdminAlert(
+          `🚨 CJ Partial Fulfillment — Order #${orderId} (${successfulSplits}/${cjProducts.length})`,
+          `<p>Splits الناجحين: <code>${splitOrdersCreated.join(', ')}</code></p>
+           <p>راجع CJ dashboard وأكمل العناصر الناقصة يدوياً — العميل مستنى!</p>`
+        ); // fire-and-forget — داخلياً فيها catch
         return { success: false, partial: true, error: 'Partial fulfillment' };
       }
     }
