@@ -16,13 +16,14 @@ const processedMessages = new Set();
 setInterval(() => processedMessages.clear(), 60 * 60 * 1000); // تنظيف كل ساعة
 
 // ==========================================
-// 🔐 التحقق المرن — نجرّب كل المفاتيح المحتملة اللي CJ ممكن يوقع بيهم
+// 🔐 التحقق المرن — نجرّب كل المفاتيح المحتملة
+// (حصراً للمواضيع الموثقة بالتوقيع: MAKEUP docs 4.2 / PRIVATE_ORDER docs 5.3)
 // ==========================================
 function verifySignatureFlexible(rawBody, signHeader) {
   const candidates = [
-    process.env.CJ_OPEN_ID,      // التوثيق الرسمي: openId
-    process.env.CJ_API_KEY,      // بعض الـ implementations كتوقع بالـ API Key
-    process.env.CJ_API_TOKEN,    // احتياط
+    process.env.CJ_OPEN_ID,
+    process.env.CJ_API_KEY,
+    process.env.CJ_API_TOKEN,
   ].filter(Boolean);
 
   for (const secret of candidates) {
@@ -31,12 +32,13 @@ function verifySignatureFlexible(rawBody, signHeader) {
       const received = Buffer.from(signHeader);
       const expectedBuf = Buffer.from(expected);
       if (received.length === expectedBuf.length && crypto.timingSafeEqual(received, expectedBuf)) {
-        return { valid: true, matchedWith: secret === process.env.CJ_OPEN_ID ? 'CJ_OPEN_ID' : secret === process.env.CJ_API_KEY ? 'CJ_API_KEY' : 'CJ_API_TOKEN' };
+        return true;
       }
     } catch { /* نكملو للمفتاح الموالي */ }
   }
-  return { valid: false, matchedWith: null };
+  return false;
 }
+
 // ==========================================
 // 📦 ORDER — أهم معالج: حالات الطلب + الشحن لحظياً
 // ==========================================
@@ -106,7 +108,14 @@ async function handleOrderUpdate(params = {}) {
 // ==========================================
 // 🚚 LOGISTICS — تحديثات تتبع إضافية (دفاعي — البنية ممكن تتبدل)
 // ==========================================
-async function handleLogistics(params = {}) {
+let _logisticsSampleLogged = false;
+async function handleLogistics(params = {}, rawEvent) {
+  // عينة كاملة مرة وحدة — باش نظبو الـ parser على الواقع
+  if (!_logisticsSampleLogged) {
+    _logisticsSampleLogged = true;
+    console.log('🔬 [Logistics Sample]', JSON.stringify(rawEvent || params).slice(0, 800));
+  }
+
   const trackNumber = params.trackNumber || params.trackingNumber;
   if (!trackNumber) return;
   // مستقبلاً: سجل أحداث التتبع التفصيلية فجدول tracking_events
@@ -116,7 +125,14 @@ async function handleLogistics(params = {}) {
 // ==========================================
 // 🏷️ PRODUCT — تغيّر السعر/الحالة → نطبقو صيغة التسعير ديالنا
 // ==========================================
-async function handleProductUpdate(params = {}) {
+let _productSampleLogged = false;
+async function handleProductUpdate(params = {}, rawEvent) {
+  // عينة كاملة مرة وحدة
+  if (!_productSampleLogged) {
+    _productSampleLogged = true;
+    console.log('🔬 [Product Sample]', JSON.stringify(rawEvent || params).slice(0, 800));
+  }
+
   const cjPid = String(params.productId || params.pid || '');
   if (!cjPid) return;
 
@@ -147,18 +163,38 @@ async function handleProductUpdate(params = {}) {
 }
 
 // ==========================================
-// 📦 STOCK — المخزون خوا → نخفيو فوراً (بلا بيع منتج ناقص)
+// 📦 STOCK — البنية الحقيقية من اللوج:
+// params: { "<id>": [ { pid, areaEn, countryCode, stock..., } ] }
 // ==========================================
-async function handleStockUpdate(params = {}) {
-  const cjPid = String(params.productId || params.pid || '');
-  if (!cjPid) return;
-  const available = params.stockQuantity === undefined ? null : Number(params.stockQuantity) > 0;
+let _stockSampleLogged = false;
+async function handleStockUpdate(params = {}, rawEvent) {
+  // عينة كاملة مرة وحدة — باش نأكدو أسماء حقول الكمية بالضبط
+  if (!_stockSampleLogged) {
+    _stockSampleLogged = true;
+    console.log('🔬 [Stock Sample]', JSON.stringify(rawEvent || params).slice(0, 800));
+  }
 
-  if (available === false) {
-    await pool.query('UPDATE products SET stock_status = false WHERE cj_product_id = $1', [cjPid]);
-    console.log(`📉 [CJ Webhook] Product ${cjPid} out of stock — hidden from store.`);
-  } else if (available === true) {
-    await pool.query('UPDATE products SET stock_status = true WHERE cj_product_id = $1', [cjPid]);
+  for (const [key, records] of Object.entries(params)) {
+    if (!Array.isArray(records)) continue;
+
+    for (const rec of records) {
+      const pid = String(rec.pid || key);
+      if (!pid) continue;
+
+      // ✨ CJ ممكن يسمي الكمية بأي اسم من هادو
+      const qty = rec.stockQuantity ?? rec.quantity ?? rec.stock ?? rec.qty ?? rec.availableStock;
+      if (qty === undefined) continue;
+
+      const available = Number(qty) > 0;
+
+      await pool.query(
+        'UPDATE products SET stock_status = $1 WHERE cj_product_id = $2',
+        [available, pid]
+      );
+      if (!available) {
+        console.log(`📉 [CJ Webhook] Product ${pid} OUT OF STOCK — hidden from store.`);
+      }
+    }
   }
 }
 
@@ -189,71 +225,48 @@ async function cjWebhookHandler(req, res) {
   // ✅ الرد الفوري (< 3s إجباري من CJ) — الحماية من auto-close
   res.status(200).json({ code: 200, message: 'OK' });
 
-      (async () => {
-      try {
-        const rawBody = req.body; // Buffer من express.raw
-
-        // 🔍 تشخيص: نشوفو الهيدرات الحقيقية اللي جاية من CJ (مرة وحدة كافية)
-        console.log('📨 [CJ Webhook] Headers:', JSON.stringify(req.headers).slice(0, 300));
-
-              // 🔐 تحقق مرن من التوقيع — كنجربو كل المفاتيح
-      const signHeader = req.headers['sign'] || req.headers['cj-sign'] || req.headers['x-sign'];
-      let signatureStatus = 'no-sign-header';
-
-      if (signHeader) {
-        const { valid, matchedWith } = verifySignatureFlexible(rawBody, signHeader);
-        signatureStatus = valid ? `valid (${matchedWith})` : 'mismatch';
-      }
-
-      // ✨ سياسة: mismatch = نكملو معالجة + نجيبو تشخيص كامل مرة وحدة فقط
-      // (باش نحددو المفتاح الصحيح من body اللي غادي يجي من CJ نفسو)
-      if (signatureStatus === 'mismatch' && !global._cjSignDiagnosed) {
-        global._cjSignDiagnosed = true;
-        const event = JSON.parse(rawBody.toString('utf8'));
-        console.log('🔬 [CJ Sign Diagnosis]');
-        console.log('   Type:', event.type, '/', event.messageType);
-        console.log('   Body (first 200):', rawBody.toString('utf8').slice(0, 200));
-        console.log('   Received sign:', String(signHeader).slice(0, 50));
-                console.log('   Try HMAC with these secrets:');
-        [
-          ['CJ_OPEN_ID', process.env.CJ_OPEN_ID],
-          ['CJ_API_KEY', process.env.CJ_API_KEY],
-          ['MCP_TOKEN_FULL', process.env.CJ_MCP_TOKEN],        // ✨ زيد: MCP كامل من env
-          ['API_KEY_AS_IS', process.env.CJ_API_KEY],           // مرجع
-        ].forEach(([name, secret]) => {
-          if (secret) {
-            // ✨ كنجربو تا الـ JWT الجزء الأخير (مورا @CJ:)
-            const extracted = secret.includes('@CJ:') ? secret.split('@CJ:')[1] : secret;
-            console.log(`   ${name} → ${crypto.createHmac('sha256', extracted).update(rawBody).digest('base64').slice(0, 50)}...`);
-            if (extracted !== secret) {
-              console.log(`   ${name} (extracted JWT part) → ${crypto.createHmac('sha256', extracted).update(rawBody).digest('base64').slice(0, 50)}...`);
-            }
-          }
-        });
-        console.log('   💡 Match one? That\'s your CJ_OPEN_ID for webhooks');
-      }
-
-      // ✨ كنكملو المعالجة مهما كان التوقيع — الـ messageId idempotency كيحمينا من replays
+  (async () => {
+    try {
+      const rawBody = req.body; // Buffer من express.raw
       const event = JSON.parse(rawBody.toString('utf8'));
       const { messageId, type, messageType, params } = event;
 
+      // 🔬 عينة كاملة أول مرة لكل نوع — باش نظبو الـ parsers على الواقع
+      const sampleKey = `_cjSample_${type}`;
+      if (!global[sampleKey]) {
+        global[sampleKey] = true;
+        console.log(`🔬 [Sample ${type}]`, rawBody.toString('utf8').slice(0, 800));
+      }
+
+      // 🔐 التوقيع الصارم — حصراً للمواضيع الموثقة بالتوقيع (docs 4.2 / 5.3)
+      // ORDER/PRODUCT/STOCK/LOGISTICS: CJ ماكيوثقش عليهم توقيعاً — كيتعالجو مباشرة
+      const signHeader = req.headers['sign'];
+      if (signHeader && (type === 'MAKEUP' || type === 'PRIVATE_ORDER')) {
+        const valid = verifySignatureFlexible(rawBody, signHeader);
+        if (!valid) {
+          logger.logError('CJ Webhook: signed topic rejected', new Error(`${type} signature invalid`));
+          return;
+        }
+      }
+
+      // 🛡️ Idempotency — الرسائل المكررة (retries) كيتجاهلو
       if (!messageId || processedMessages.has(messageId)) return;
       processedMessages.add(messageId);
 
-      console.log(`📨 [CJ Webhook] ${type}/${messageType} (${String(messageId).slice(0, 8)}...) [${signatureStatus}]`);
+      console.log(`📨 [CJ Webhook] ${type}/${messageType} (${String(messageId).slice(0, 8)}...)`);
 
       switch (type) {
         case 'ORDER':        await handleOrderUpdate(params); break;
-        case 'LOGISTICS':    await handleLogistics(params); break;
-        case 'PRODUCT':      await handleProductUpdate(params); break;
-        case 'STOCK':        await handleStockUpdate(params); break;
+        case 'LOGISTICS':    await handleLogistics(params, event); break;
+        case 'PRODUCT':      await handleProductUpdate(params, event); break;
+        case 'STOCK':        await handleStockUpdate(params, event); break;
         case 'MAKEUP':       await handleMakeup(params); break;
         default: break;
       }
-      } catch (err) {
-        logger.logError('CJ Webhook Processing', err);
-      }
-    })();
+    } catch (err) {
+      logger.logError('CJ Webhook Processing', err);
+    }
+  })();
 }
 
 // ==========================================
