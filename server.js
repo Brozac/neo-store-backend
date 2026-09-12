@@ -474,17 +474,19 @@ app.post('/api/admin/webhook/register', async (req, res) => {
 });
 
 app.post('/api/admin/webhook/subscribe', async (req, res) => {
-  try {
-    const result = await subscribeAllStoreProducts();
-    res.json({ message: `📌 Subscribed ${result.success}/${result.total} products (${result.failed} failed/skipped)` });
-  } catch (err) {
-    logger.logError('Webhook Subscribe', err);
-    res.status(500).json({ error: 'Server error' });
-  }
+  // ✨ v2 — 200 فوري: الدفعات كياخدو دقايق (بوابة QPS + 3000ms بين الدفعات) والفرونت عنده 60s timeout
+  // (نفس نمط sync-categories — invariant #3: لا نحجب الرد على مهام طويلة)
+  res.json({ message: '📌 Subscription started in background — راقب اللوج للنتيجة النهائية' });
+  (async () => {
+    try {
+      const result = await subscribeAllStoreProducts();
+      console.log(`📌 [Subscribe] انتهى: ${result.success}/${result.total} منتج مشترك (${result.failed} فاشل/متخطى)`);
+    } catch (err) {
+      logger.logError('Webhook Subscribe (Background)', err);
+    }
+  })();
 });
-// ==========================================
-// مسار إضافة تقييم معتمد من مستخدم مسجل (مع دعم رفع الصور)
-// ==========================================
+
 app.post('/api/reviews/add', authenticateToken, async (req, res) => {
   try {
     const { product_id, rating, content, country, images } = req.body;
