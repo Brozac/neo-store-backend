@@ -153,7 +153,9 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
   let cjCreated = false; // 🛡️ واقي الـ catch الفادح — لا manual إلا إلا ما وصل حتى إرسال لـ CJ
   try {
     const addr = customerDetails?.address || {};
-    const isSandbox = process.env.CJ_SANDBOX_MODE === 'true' ? 1 : 0;
+    // 🛡️ حماية الإنتاج: الساندبوكس مسموح فقط فالتطوير المحلي — الطلبات الساندبوكس ما تُشحنش أبداً!
+    const isSandbox = (process.env.CJ_SANDBOX_MODE === 'true' && process.env.NODE_ENV !== 'production') ? 1 : 0;
+    if (isSandbox) console.warn('🧪 [SANDBOX] طلب #' + orderId + ' كيتخلق sandbox — ما غاديش يشحن!');
 
     // تنظيف اسم الزبون (CJ يطلب اسماً من كلمتين على الأقل)
     let safeCustomerName = (customerName || '').trim();
