@@ -15,7 +15,7 @@ const { applyCouponToTotal } = require('./utils/couponHelper'); // ✨ التع�
 
 const requireAdmin = require('./middleware/requireAdmin');
 const rateLimit = require('express-rate-limit');
-const { fulfillCJOrder, cjRequest, parseNumeric } = require('./services/cjService');
+const { fulfillCJOrder, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
 const logger = require('./logger');
@@ -2382,7 +2382,7 @@ cron.schedule('30 * * * *', async () => {
   console.log('\u23f3 [CJ Logistics v3] Batch tracking (1 call / up to 50 orders)...');
   try {
     const { rows: pendingTrackingOrders } = await pool.query(`
-      SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number
+      SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number, created_at
       FROM orders
       WHERE status IN ('paid', 'fulfilled')
         AND (tracking_number IS NULL OR tracking_number = '')
@@ -2446,7 +2446,22 @@ cron.schedule('30 * * * *', async () => {
           console.log(`\ud83d\ude80 [CJ Dispatched] #${order.id}: ${track} (${d.logisticName || '?'})`);
           await notifyShipment(order, track, d.logisticName);
         }
-      } else if (status === 'DELIVERED') {
+      } else if (status === 'CREATED' && !d.logisticName && !d.paymentDate) {
+        // 🤖 طلب عالق: CREATED بلا شحن بلا دفع — auto-repair إلا عدا 2س
+        const ageMs = order.created_at ? Date.now() - new Date(order.created_at).getTime() : 0;
+        if (ageMs > 2 * 3600 * 1000) {
+          const rep = await autoRepairLogistics(d.cjOrderCode || key);
+          if (rep.repaired) {
+            console.log('[AutoHeal] #' + order.id + ': shipping bound ' + rep.logisticsName + ' ($' + rep.postage + ')');
+          } else if (!global['_cjStuck_' + order.id]) {
+            global['_cjStuck_' + order.id] = true;
+            sendAdminAlert(
+              '[CJ] Stuck order (no logistics) #' + order.id + ' - ' + (d.cjOrderCode || key),
+              '<p>Status CREATED, no logistics, no payment at CJ. Auto-repair failed: ' + rep.reason + '</p>'
+            );
+          }
+        }
+} else if (status === 'DELIVERED') {
         if (order.status === 'paid' && track.length > 3) {
           // \ud83d\udea8 \u0641\u0627\u062a\u0646\u0627 SHIPPED (\u0648\u064a\u0628 \u0647\u0648\u0643 \u0636\u0627\u064a\u0639) — \u0625\u0634\u0639\u0627\u0631 \u0645\u062a\u0623\u062e\u0631 \u062e\u064a\u0631 \u0645\u0646 \u0648\u0627\u0644\u0648
           const upd = await pool.query(
@@ -2471,6 +2486,102 @@ cron.schedule('30 * * * *', async () => {
     logger.logError('CJ Logistics Cron', err);
   }
 });
+// ==========================================
+// 🤖 Auto-Heal cron - السلّم الكامل للطلبات العالقة (1.13/1.14 → 1.8 delete+recreate → 2.2 autopay)
+// ==========================================
+cron.schedule('17,47 * * * *', async () => {
+  try {
+    const { rows: stuck } = await pool.query(`
+      SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number, created_at
+      FROM orders
+      WHERE status IN ('paid', 'fulfilled')
+        AND (tracking_number IS NULL OR tracking_number = '')
+        AND created_at <= NOW() - INTERVAL '2 hours'
+        AND created_at >= NOW() - INTERVAL '30 days'
+      LIMIT 10;
+    `);
+    if (!stuck.length) return;
+
+    const keys = stuck.map(function (o) {
+      const stored = String(o.cj_order_number || '').trim();
+      return { order: o, key: (stored && !/^STORE-/i.test(stored)) ? stored : ('STORE-' + o.id) };
+    });
+
+    const res = await cjRequest((token) =>
+      axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetailBatch',
+        { orderIds: keys.map(function (k) { return k.key; }) },
+        { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+      )
+    );
+    if (res.data?.code !== 200) return;
+    const list = Array.isArray(res.data.data) ? res.data.data : [];
+    const byKey = new Map();
+    for (const d of list) {
+      if (d.orderNum) byKey.set(String(d.orderNum).toLowerCase(), d);
+      if (d.cjOrderCode) byKey.set(String(d.cjOrderCode).toLowerCase(), d);
+    }
+
+    for (const { order, key } of keys) {
+      const d = byKey.get(key.toLowerCase());
+      if (!d) continue;
+      const status = String(d.orderStatus || '').toUpperCase();
+      const hasLogi = !!d.logisticName;
+      const paid = !!d.paymentDate;
+
+      // 1) CREATED عالق بلا شحن بلا دفع → السلّم
+      if (status === 'CREATED' && !hasLogi && !paid) {
+        const rep = await autoRepairLogistics(d.cjOrderCode || key);
+        if (rep.repaired) {
+          console.log('[AutoHeal] #' + order.id + ' logistics bound: ' + rep.logisticsName + ' ($' + rep.postage + ')');
+          continue;
+        }
+        if (!global['_cjRecreate_' + order.id]) {
+          global['_cjRecreate_' + order.id] = true; // محاولة recreate واحدة برك لكل session
+          console.warn('[AutoHeal] #' + order.id + ' repair failed (' + rep.reason + ') - delete + recreate...');
+          const del = await deleteCJOrder(d.orderId, d.cjOrderCode, key);
+          if (!del.ok) {
+            console.warn('[AutoHeal] delete failed #' + order.id + ': ' + del.reason);
+            if (typeof sendAdminAlert === 'function') sendAdminAlert('[CJ] Stuck order #' + order.id + ' - auto-repair & delete failed', '<p>repair: ' + rep.reason + ' | delete: ' + del.reason + '</p>').catch(function () {});
+            continue;
+          }
+          await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [order.id]).catch(function () {});
+          (async () => {
+            try {
+              const oRes = await pool.query('SELECT * FROM orders WHERE id = $1', [order.id]);
+              const full = oRes.rows[0];
+              const iRes = await pool.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
+              let addr = {};
+              try { addr = JSON.parse(full.shipping_address); } catch (e) { addr = { line1: full.shipping_address, country: 'US' }; }
+              const r = await fulfillCJOrder(order.id, full.customer_name, {
+                address: addr, phone: full.customer_phone || '', email: full.customer_email || '', name: full.customer_name
+              }, iRes.rows);
+              console.log('[AutoHeal] recreate #' + order.id + ' ->', JSON.stringify(r).slice(0, 200));
+            } catch (e) { logger.logError('AutoHeal recreate #' + order.id, e); }
+          })();
+          continue;
+        }
+        // سبقنا recreate — تنبيه مرة كل 24س
+        if (!global['_cjStuckAlert_' + order.id] || Date.now() - global['_cjStuckAlert_' + order.id] > 86400000) {
+          global['_cjStuckAlert_' + order.id] = Date.now();
+          if (typeof sendAdminAlert === 'function') sendAdminAlert('[CJ] Order #' + order.id + ' still stuck after recreate attempt', '<p>Status: CREATED, no logistics, no payment. Last repair reason: ' + rep.reason + '</p>').catch(function () {});
+        }
+        continue;
+      }
+
+      // 2) شحن محدد لكن غير مدفوع عند CJ → autopay من المحفظة (2.2)
+      if (hasLogi && !paid && (status === 'UNPAID' || status === 'CREATED')) {
+        if (!global['_cjPayTry_' + order.id] || Date.now() - global['_cjPayTry_' + order.id] > 3600000) {
+          global['_cjPayTry_' + order.id] = Date.now();
+          const pay = await payCJOrderBalance(d.orderId, d.cjOrderCode, key);
+          console.log('[AutoHeal] payBalance #' + order.id + ':', pay.ok ? 'PAID' : 'failed: ' + pay.reason);
+        }
+      }
+    }
+  } catch (err) {
+    logger.logError('AutoHeal Cron', err);
+  }
+});
+
 // ==========================================
 // 🤖 On-Site AI Sales Agent (Live Chat)
 // ==========================================

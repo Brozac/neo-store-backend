@@ -292,6 +292,13 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
           sampleOnce('V3-Create', cjResponse.data?.data);
 
           successfulCJOrderNumber = extractCjNumber(cjResponse.data?.data) || targetOrderNumber;
+          if (cjResponse.data?.data?.logisticsMiss === true) {
+            // 🤖 logisticsMiss: CJ ma-kan-sh binda shipping — auto-repair tawa (1.13+1.14)
+            console.warn('[CJ] #' + orderId + ' logisticsMiss=true — auto-repair...');
+            const rep = await autoRepairLogistics(successfulCJOrderNumber);
+            if (rep.repaired) console.log('[CJ] #' + orderId + ' logistics bound: ' + rep.logisticsName + ' ($' + rep.postage + ')');
+            else console.warn('[CJ] #' + orderId + ' auto-repair failed: ' + rep.reason);
+          }
           await saveCjNumber(successfulCJOrderNumber);
           break;
         }
@@ -477,4 +484,78 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
   }
 }
 
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric };
+// ==========================================
+// 🤖 autoRepairLogistics — 1.13 + 1.14: bind cheapest available shipping
+// for orders stuck at CREATED with logisticsMiss (no logistics bound at CJ)
+// ==========================================
+async function autoRepairLogistics(cjOrderCode) {
+  try {
+    if (!cjOrderCode) return { repaired: false, reason: 'no_order_code' };
+    const opt = await cjRequest((token) =>
+      axios.get(CJ_API + '/shopping/order/getOrderLogisticsInfo', {
+        params: { orderCode: cjOrderCode },
+        headers: { 'CJ-Access-Token': token },
+      })
+    );
+    if (opt.data?.code !== 200) return { repaired: false, reason: 'query_' + opt.data?.code };
+    const list = Array.isArray(opt.data.data) ? opt.data.data : [];
+    if (!list.length) return { repaired: false, reason: 'no_options' };
+
+    const eligible = list.filter(function (o) { return o.hasStock !== false; });
+    if (!eligible.length) return { repaired: false, reason: 'no_stock_options' };
+    const cheapest = eligible.slice().sort(function (a, b) { return a.postage - b.postage; })[0];
+
+    const tryFrom = (from) => cjRequest((token) =>
+      axios.post(CJ_API + '/shopping/order/updateLogistics',
+        { id: cheapest.id, orderCode: cjOrderCode, logisticsName: cheapest.logisticsName, from: from },
+        { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } })
+    );
+    let mod = await tryFrom(1); // 1 = complete order
+    if (mod.data?.code !== 200) mod = await tryFrom(0); // fallback: incomplete
+    if (mod.data?.code !== 200) return { repaired: false, reason: 'modify_' + mod.data?.code };
+    return { repaired: true, logisticsName: cheapest.logisticsName, postage: cheapest.postage };
+  } catch (e) {
+    logger.logError('autoRepairLogistics', e);
+    return { repaired: false, reason: e.message };
+  }
+}
+// ==========================================
+// 🗑️ deleteCJOrder - 1.8: DELETE (CREATED/IN_CART only, per docs)
+// ==========================================
+async function deleteCJOrder(...candidates) {
+  for (const v of candidates.filter(Boolean)) {
+    try {
+      const res = await cjRequest((token) =>
+        axios.delete(CJ_API + '/shopping/order/deleteOrder', {
+          params: { orderId: String(v) },
+          headers: { 'CJ-Access-Token': token },
+        })
+      );
+      if (res.data?.code === 200) return { ok: true };
+    } catch (e) { /* next candidate */ }
+  }
+  return { ok: false, reason: 'delete_failed_all_candidates' };
+}
+
+// ==========================================
+// 💳 payCJOrderBalance - 2.2: pay unpaid order from CJ wallet
+// ==========================================
+async function payCJOrderBalance(...candidates) {
+  let lastReason = 'no_candidates';
+  for (const v of candidates.filter(Boolean)) {
+    try {
+      const res = await cjRequest((token) =>
+        axios.post(CJ_API + '/shopping/pay/payBalance',
+          { orderId: String(v) },
+          { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+        )
+      );
+      if (res.data?.code === 200) return { ok: true };
+      lastReason = (res.data?.message || 'code_' + res.data?.code);
+    } catch (e) {
+      lastReason = (e.response && e.response.data && e.response.data.message) || e.message;
+    }
+  }
+  return { ok: false, reason: lastReason };
+}
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance };
