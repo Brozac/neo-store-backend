@@ -133,6 +133,35 @@ const parseNumeric = (val) => {
 // ==========================================
 const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
 
+// 🛡️ cryptoPaymentGuard — ضد الدفع الناقص (underpayment) — fail-closed
+// كيتسماوى فـ fulfillCJOrder إلا payment_method='Crypto/NowPayments'
+async function cryptoPaymentGuard(orderId) {
+  try {
+    // 1) جيب payment_ref تاع الطلب من DB
+    const r = await pool.query('SELECT payment_method, payment_ref, total_amount FROM orders WHERE id = $1', [orderId]);
+    const o = r.rows[0];
+    if (!o) return { allow: false, reason: 'order_not_found' };
+    if (!/crypto|nowpayments/i.test(o.payment_method || '')) return { allow: true, reason: 'not_crypto' };
+    if (!o.payment_ref) { console.warn('[NP-Guard] #' + orderId + ' بلا payment_ref — رفض احتياطي'); return { allow: false, reason: 'no_payment_ref' }; }
+    const key = process.env.NOWPAYMENTS_API_KEY;
+    if (!key) { console.error('[NP-Guard] NOWPAYMENTS_API_KEY ناقص'); return { allow: false, reason: 'no_api_key' }; }
+    // 2) استعلم NowPayments مباشرة (JIT):
+    const res = await axios.get('https://api.nowpayments.io/v1/payment/' + o.payment_ref, {
+      headers: { 'x-api-key': key }, timeout: 15000
+    });
+    const p = res.data || {};
+    const paidUsd = Number(p.actually_paid_usd ?? 0);
+    const status = String(p.payment_status || '');
+    const ok = (status === 'finished' || status === 'confirmed') && paidUsd + 0.01 >= Number(o.total_amount);
+    console.log('[NP-Guard] #' + orderId + ' status=' + status + ' paid_usd=' + paidUsd + ' total=' + o.total_amount + ' => ' + (ok ? 'ALLOW' : 'DENY'));
+    return ok ? { allow: true } : { allow: false, reason: 'payment_' + status + '_' + paidUsd };
+  } catch (e) {
+    logger.logError('cryptoPaymentGuard #' + orderId, e);
+    return { allow: false, reason: 'guard_error' }; // فشل التحقق = رفض
+  }
+}
+
+
 // 📧 تنبيه الأدمن — مكتفٍ ذاتياً (paymentController كيصدر router فقط — الدرس من MAKEUP!)
 async function sendAdminAlert(subject, html) {
   try {
@@ -150,7 +179,14 @@ async function sendAdminAlert(subject, html) {
 
 
 async function fulfillCJOrder(orderId, customerName, customerDetails, items, orderNumberOverride = null, forcedLogisticName = null) {
-  let cjCreated = false; // 🛡️ واقي الـ catch الفادح — لا manual إلا إلا ما وصل حتى إرسال لـ CJ
+  let cjCreated = false;
+  // 🛡️ NP-Guard: إلا crypto — الدراهم مؤكدة فالمحفظة قبل أي إرسال (fail-closed)
+  const _guard = await cryptoPaymentGuard(orderId);
+  if (!_guard.allow) {
+    console.error('[NP-Guard] رفض إرسال #' + orderId + ' لـ CJ: ' + _guard.reason);
+    return { success: false, reason: 'PAYMENT_NOT_CONFIRMED', detail: _guard.reason };
+  }
+ // 🛡️ واقي الـ catch الفادح — لا manual إلا إلا ما وصل حتى إرسال لـ CJ
   try {
     const addr = customerDetails?.address || {};
     // 🛡️ حماية الإنتاج: الساندبوكس مسموح فقط فالتطوير المحلي — الطلبات الساندبوكس ما تُشحنش أبداً!

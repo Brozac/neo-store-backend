@@ -448,8 +448,8 @@ router.post('/crypto/callback', async (req, res) => {
       if (orderRes.rows.length === 0) return res.status(404).send('Order not found');
 
       const updateRes = await pool.query(
-        "UPDATE orders SET status='paid', customer_email=COALESCE($1, customer_email) WHERE id=$2 AND status='pending' RETURNING *",
-        [paymentData.customer_email || null, orderId]
+        "UPDATE orders SET status='paid', customer_email=COALESCE($1, customer_email), payment_ref=COALESCE($3, payment_ref) WHERE id=$2 AND status='pending' RETURNING *",
+        [paymentData.customer_email || null, orderId, paymentData.payment_id || null]
       );
 
       if (updateRes.rows.length > 0) {
