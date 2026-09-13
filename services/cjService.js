@@ -149,7 +149,7 @@ async function sendAdminAlert(subject, html) {
 }
 
 
-async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
+async function fulfillCJOrder(orderId, customerName, customerDetails, items, orderNumberOverride = null) {
   let cjCreated = false; // 🛡️ واقي الـ catch الفادح — لا manual إلا إلا ما وصل حتى إرسال لـ CJ
   try {
     const addr = customerDetails?.address || {};
@@ -266,7 +266,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items) {
 
     // 1. محاولة الإرسال المجمّع
     for (const logisticName of logisticsToTry) {
-      const targetOrderNumber = `STORE-${orderId}`;
+      const targetOrderNumber = orderNumberOverride || `STORE-${orderId}`;
       const cjOrderPayload = {
         ...basePayload,
         orderNumber: targetOrderNumber,
