@@ -149,7 +149,7 @@ async function sendAdminAlert(subject, html) {
 }
 
 
-async function fulfillCJOrder(orderId, customerName, customerDetails, items, orderNumberOverride = null) {
+async function fulfillCJOrder(orderId, customerName, customerDetails, items, orderNumberOverride = null, forcedLogisticName = null) {
   let cjCreated = false; // 🛡️ واقي الـ catch الفادح — لا manual إلا إلا ما وصل حتى إرسال لـ CJ
   try {
     const addr = customerDetails?.address || {};
@@ -207,7 +207,8 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
       }
     } catch (e) {}
 
-    logisticsToTry = [...new Set([...logisticsToTry, 'CJPacket Ordinary', 'CJPacket Sensitive', 'YunExpress', '4PX'])];
+    if (forcedLogisticName) logisticsToTry = [forcedLogisticName]; // ⭐ فرض صريح يتقدم على كولش
+    else logisticsToTry = [...new Set([...logisticsToTry, 'CJPacket Ordinary', 'CJPacket Sensitive', 'YunExpress', '4PX'])];
 
     let orderSuccess = false;
     let lastError = null;
