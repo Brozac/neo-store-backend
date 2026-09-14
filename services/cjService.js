@@ -3,6 +3,7 @@ require('dotenv').config();
 const axios = require('axios');
 const pool = require('../db');
 const logger = require('../logger');
+const { sendPurchaseConversion } = require('./conversionService');
 
 let cachedCjToken = null;
 let cachedCjTokenExpiry = null;
@@ -201,6 +202,30 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
 
     // ✨ V3 كيطلب إيميل صالح — الطلبات بلا إيميل (هاتف فقط) نعطيوه عنواناً مؤسسياً
     const safeEmail = (customerDetails?.email || '').trim() || 'orders@laclarc.com';
+    // ═══ CAPI Purchase — Fire-and-Forget (Tenet #3) ═══
+// آمن مع إعادات المحاولة (1605001 wallet / reconcile cron):
+// نفس event_id purch_{orderId} → Meta/TikTok يعملو Dedup تلقائياً.
+try {
+  const capiItems = Array.isArray(order?.items)
+    ? order.items.map(it => ({
+        productId: it.product_id ?? it.productId,
+        quantity:  it.quantity   ?? 1,
+        price:     it.price_at_purchase ?? it.price,
+      }))
+    : [];
+
+  sendPurchaseConversion({
+    orderId,
+    value: parseFloat(order.total_amount),
+    items: capiItems,
+    email:        order.customer_email ?? order.email,
+    phone:        order.customer_phone ?? order.phone,
+    customerName: order.customer_name  ?? order.name,
+    city:         order.customer_city  ?? order.city,
+  })
+    .then((s) => console.log(`[CAPI] purch_${orderId} dispatched ✓`, JSON.stringify(s)))
+    .catch((e) => console.warn(`[CAPI] purch_${orderId} non-fatal: ${e.message}`));
+} catch (e) { /* حاجز نهائي — مستحيل يطيح الـ fulfillment بسبب CAPI */ }
 
     // استخراج الـ vid المؤكد + storeLineItemId (معرّف العنصر فـ DB)
     const cjProducts = [];

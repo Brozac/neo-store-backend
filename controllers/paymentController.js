@@ -13,6 +13,8 @@ const { fulfillCJOrder } = require('../services/cjService');
 const { prepareSecureItems } = require('../utils/secureCheckout');
 const { applyCouponToTotal } = require('../utils/couponHelper'); // ✨ Helper الكوبون الموحد
 const logger = require('../logger'); 
+// 🆕 FILE 4: خدمة الـ Conversions API — تخزين سياق المتصفح (IP/UA) للـ Dedup matching
+const { setConversionContext } = require('../services/conversionService');
 
 // إعداد Cloudinary لتخزين إيصالات بريدي موب
 cloudinary.config({
@@ -342,7 +344,8 @@ router.get('/paysera/callback', async (req, res) => {
             }, items);
 
             if (cjResponse && cjResponse.success) {
-              console.log(`📤 [Crypto] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
+              // 🧹 FIX: الوسم كان [Crypto] بالغلط — اللوجات هي الحقيقة المطلقة، الوسم الصحيح إجباري
+              console.log(`📤 [Paysera] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
             }
 
             if (order.customer_email) {
@@ -469,7 +472,9 @@ router.post('/crypto/callback', async (req, res) => {
             const cjResponse = await fulfillCJOrder(orderId, updatedOrder.customer_name, customerDetails, items);
 
             if (cjResponse && cjResponse.success) {
-              console.log(`📤 [Crypto] #${order.id} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
+              // 🐛 FIX #1: كانت #${order.id} — متغير غير موجود هنا (الصحيح: updatedOrder)
+              //   الـ ReferenceError كان يقتل الإيميل بصمت بعد كل IPN ناجح
+              console.log(`📤 [Crypto] #${updatedOrder.id} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
             }
 
             const finalEmail = paymentData.customer_email || updatedOrder.customer_email;
@@ -565,6 +570,7 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
 
 // ==========================================
 // ⚡ مسار التحقق المالي اللحظي للكريبتو (JIT NowPayments Verifier)
+// FILE 4: + setConversionContext + items/currency فالردود (عقد الـ Dedup)
 // ==========================================
 router.post('/crypto/verify', async (req, res) => {
   const { order_id } = req.body;
@@ -581,16 +587,39 @@ router.post('/crypto/verify', async (req, res) => {
 
     const order = orderRes.rows[0];
 
+    // 🆕 FILE 4-a: الزبون الحقيقي هو لي يزور /success — خبّئ IP/UA للـ CAPI
+    setConversionContext(order.id, {
+      clientIp: req.ip,
+      userAgent: req.headers['user-agent'],
+    });
+
+    // 🆕 FILE 4-b: items مطلوبة فكل الردود (أساس event_id matching فالمتصفح)
+    const itemsRes = await pool.query(`
+      SELECT oi.*, p.title, p.image_url
+      FROM order_items oi
+      LEFT JOIN products p ON oi.product_id = p.id
+      WHERE oi.order_id = $1
+    `, [order_id]);
+    const items = itemsRes.rows;
+    const pixelItems = items.map(i => ({ productId: i.product_id, quantity: i.quantity }));
+
+    // 🐛 FIX #3: DECIMAL يرجع string من pg — بلا parseFloat البكسل يطلع $0.00
+    const verifiedAmount = parseFloat(order.total_amount);
+
+    // الفرع A: سبقنا الـ IPN webhook — الطلب مدفوع خلاص، رد كامل فوري
     if (order.status === 'paid' || order.status === 'completed' || order.status === 'fulfilled') {
       return res.json({
         success: true,
         verified: true,
         orderId: order.id,
-        amount: order.total_amount,
-        status: order.status
+        amount: verifiedAmount,
+        currency: 'USD',
+        status: order.status,
+        items: pixelItems,
       });
     }
 
+    // استجواب مباشر لـ NowPayments
     const npRes = await axios.get(`https://api.nowpayments.io/v1/payment/?order_id=${order_id}&limit=1`, {
       headers: { 'x-api-key': process.env.NOWPAYMENTS_API_KEY }
     });
@@ -598,68 +627,66 @@ router.post('/crypto/verify', async (req, res) => {
     const paymentData = npRes.data?.data?.[0];
 
     const isPaid = paymentData && (
-      paymentData.payment_status === 'finished' || 
-      paymentData.payment_status === 'confirmed' || 
+      paymentData.payment_status === 'finished' ||
+      paymentData.payment_status === 'confirmed' ||
       paymentData.payment_status === 'sending'
     );
 
     if (isPaid) {
+      // قفل ذري: pending → paid — واحد برك يربح (JIT ولا IPN)
       const updateRes = await pool.query(
         "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING id",
         [order_id]
       );
 
       if (updateRes.rows.length > 0) {
-        console.log(`⚡ [Crypto JIT] Order #${order_id} verified via Blockchain! Fulfilling to CJ...`);
+        console.log(`⚡ [Crypto JIT] Order #${order.id} verified via Blockchain! Fulfilling to CJ...`);
 
         (async () => {
           try {
-            const itemsRes = await pool.query(`
-              SELECT oi.*, p.title, p.image_url 
-              FROM order_items oi 
-              LEFT JOIN products p ON oi.product_id = p.id 
-              WHERE oi.order_id = $1
-            `, [order_id]);
-
             const customerDetails = {
               address: { line1: order.shipping_address || 'Online Purchase', country: 'US' },
               phone: order.customer_phone || '1234567890'
             };
 
-            const cjResponse = await fulfillCJOrder(order.id, order.customer_name, customerDetails, itemsRes.rows);
+            const cjResponse = await fulfillCJOrder(order.id, order.customer_name, customerDetails, items);
             if (cjResponse && cjResponse.success) {
-              console.log(`📤 [Crypto] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
+              // 🐛 FIX #2: كانت #${orderId} — متغير غير موجود → ReferenceError يقتل الإيميل
+              console.log(`📤 [Crypto] #${order.id} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
             }
 
             if (order.customer_email && !order.customer_email.includes('@laclarc.com')) {
-              await sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, itemsRes.rows);
+              await sendOrderConfirmationEmail(order.customer_email, order.id, verifiedAmount, items);
             }
           } catch (bgErr) {
             logger.logError('Crypto JIT Fulfillment Error', bgErr);
           }
         })();
+      } else {
+        console.log(`ℹ️ [Crypto JIT] Order #${order.id} was already locked/processed by IPN webhook.`);
       }
 
+      // 🆕 FILE 4-c: رد كامل فالفرعين (winner + loser) — الزبون يستحق البكسل فالحالتين
       return res.json({
         success: true,
         verified: true,
         orderId: order.id,
-        amount: order.total_amount,
-        status: 'paid'
-      });
-    } else {
-      return res.json({
-        success: true,
-        verified: false,
-        orderId: order.id,
-        amount: order.total_amount,
-        status: paymentData?.payment_status || 'waiting',
-        message: 'Transaction detected on blockchain, awaiting network confirmations.'
+        amount: verifiedAmount,
+        currency: 'USD',
+        status: 'paid',
+        items: pixelItems,
       });
     }
 
+    // مازال ما تأكدش على البلوكتشين
+    return res.status(400).json({
+      success: false,
+      status: 'unpaid',
+      message: 'Payment has not been confirmed on the blockchain yet.'
+    });
+
   } catch (error) {
-    logger.logError('Crypto JIT Error', error.response?.data || error.message);
+    logger.logError('Crypto JIT Verification Error', error);
     res.status(500).json({ success: false, error: 'Failed to verify crypto payment' });
   }
 });

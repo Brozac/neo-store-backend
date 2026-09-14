@@ -15,6 +15,7 @@ const { applyCouponToTotal } = require('./utils/couponHelper'); // ✨ التع�
 
 const requireAdmin = require('./middleware/requireAdmin');
 const rateLimit = require('express-rate-limit');
+const { setConversionContext } = require('./services/conversionService');
 const { fulfillCJOrder, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
@@ -1590,6 +1591,14 @@ app.post('/api/payment/verify-session', async (req, res) => {
     `, [orderId]);
     const items = itemsRes.rows;
 
+    // 🆕 FILE 3-b: خبّئ سياق المتصفح الحقيقي (IP/UA) قبل أي fulfillCJOrder محتمل.
+    //   يغطي الفرعين: إذا JIT ربح القفل يقراها fulfillCJOrder مباشرة،
+    //   وإذا Webhook سبقنا — هو لي يقراها من ctxMap (Degraded match مقبول إذا فات الوقت).
+    setConversionContext(orderId, {
+      clientIp: req.ip,
+      userAgent: req.headers['user-agent'],
+    });
+
     // 4. إذا أمسكنا بالقفل (ما سبقناش الـ Webhook) → CJ فوراً فالخلفية
     if (updateRes.rows.length > 0) {
       console.log(`⚡ [JIT Verification] Order #${orderId} verified with Stripe! Fulfilling to CJ immediately...`);
@@ -1628,7 +1637,10 @@ app.post('/api/payment/verify-session', async (req, res) => {
       amount: paidAmount,
       currency: session.currency?.toUpperCase() || 'USD',
       customerEmail: fullOrder.customer_email,
-      status: fullOrder.status
+      status: fullOrder.status,
+      // 🆕 FILE 3-c: items للـ Browser Pixel — eventID matching إجباري ضد العد المزدوج.
+      //   يخدم فالفرعين (winner + loser) — الزبون يستحق البكسل الموثّق فالحالتين.
+      items: items.map(i => ({ productId: i.product_id, quantity: i.quantity })),
     });
 
   } catch (error) {
