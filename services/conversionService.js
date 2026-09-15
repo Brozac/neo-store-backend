@@ -84,20 +84,25 @@ function postJSON(url, extraHeaders, body) {
   });
 }
 
-// ─── Context Stash: الـ JIT يخبّئ IP/UA قبل الـ fulfillment ───
-// (الـ webhook/cron ما عندهمش req — التخزين القصير يعوّض)
+// ─── Context Stash: الـ JIT يخبّئ IP/UA + بصمات Meta (Mission #4) قبل الـ fulfillment ───
 const ctxMap = new Map();
-function setConversionContext(orderId, { clientIp, userAgent }) {
+function setConversionContext(orderId, { clientIp, userAgent, fbp, fbc } = {}) {
   if (!orderId) return;
-  ctxMap.set(String(orderId), { clientIp, userAgent, ts: Date.now() });
-  if (ctxMap.size > 500) {                      // Memory-leak defense
-    const cutoff = Date.now() - 10 * 60 * 1000; // TTL: 10 دقائق
+  ctxMap.set(String(orderId), {
+    clientIp, userAgent,
+    fbp: typeof fbp === 'string' ? fbp : undefined,   // 🆕 Mission #4
+    fbc: typeof fbc === 'string' ? fbc : undefined,   // 🆕 Mission #4
+    ts: Date.now(),
+  });
+  if (ctxMap.size > 500) {
+    const cutoff = Date.now() - 10 * 60 * 1000;
     for (const [k, v] of ctxMap) if (v.ts < cutoff) ctxMap.delete(k);
   }
 }
 
 // ─── Meta CAPI v18 ───
 async function sendMeta({ eventId, eventTime, value, contentIds, contents, p }) {
+  console.log(`🔬 [sendMeta ENTRY] id=${eventId} fbp_in=${p.fbp} fbc_in=${p.fbc}`);  // 🔬 مؤقت
   if (!META_PIXEL_ID || !META_TOKEN) return { ok: false, detail: 'Meta env missing — skipped' };
 
   const userData = {};
@@ -108,7 +113,10 @@ async function sendMeta({ eventId, eventTime, value, contentIds, contents, p }) 
   if (p.clientIp && p.clientIp !== '::1' && !p.clientIp.startsWith('127.'))
     userData.client_ip_address = p.clientIp;              // يُرسل خام — ماشي hashed
   if (p.userAgent) userData.client_user_agent = String(p.userAgent).slice(0, 500);
-
+  // 🆕 Mission #4: بصمات المتصفح — أقوى رابط مطابقة بين البكسل والسيرفر
+  if (p.fbp) userData.fbp = String(p.fbp).slice(0, 200);
+  if (p.fbc) userData.fbc = String(p.fbc).slice(0, 500);
+console.log(`🔬 [sendMeta UD] fbp=${userData.fbp} fbc=${userData.fbc}`);  // 🔬 مؤقت
   const event = {
     event_name: 'Purchase',
     event_time: eventTime,
@@ -187,12 +195,14 @@ async function sendPurchaseConversion(p) {
   const eventId   = `purch_${orderId}`;              // 🔒 صيغة ثابتة — ممنوع تغييرها
   const eventTime = Math.floor(Date.now() / 1000);
 
-  // دمج Context تاع JIT إذا متوفرش فالمعاملات
+  // دمج Context تاع JIT إذا متوفرش فالمعاملات — 🆕 Mission #4: + fbp/fbc
   const ctx = ctxMap.get(String(orderId));
   const enriched = {
     ...p,
     clientIp:  p.clientIp  || ctx?.clientIp,
     userAgent: p.userAgent || ctx?.userAgent,
+    fbp: p.fbp || ctx?.fbp,
+    fbc: p.fbc || ctx?.fbc,
   };
 
   const items = (Array.isArray(p.items) && p.items.length)

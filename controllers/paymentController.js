@@ -587,10 +587,12 @@ router.post('/crypto/verify', async (req, res) => {
 
     const order = orderRes.rows[0];
 
-    // 🆕 FILE 4-a: الزبون الحقيقي هو لي يزور /success — خبّئ IP/UA للـ CAPI
+    // 🆕 FILE 4-a + Mission #4: الزبون الحقيقي هو لي يزور /success
     setConversionContext(order.id, {
       clientIp: req.ip,
       userAgent: req.headers['user-agent'],
+      fbp: typeof req.body?._fbp === 'string' ? req.body._fbp.slice(0, 200) : undefined,
+      fbc: typeof req.body?._fbc === 'string' ? req.body._fbc.slice(0, 500) : undefined,
     });
 
     // 🆕 FILE 4-b: items مطلوبة فكل الردود (أساس event_id matching فالمتصفح)

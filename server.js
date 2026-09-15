@@ -1594,9 +1594,12 @@ app.post('/api/payment/verify-session', async (req, res) => {
     // 🆕 FILE 3-b: خبّئ سياق المتصفح الحقيقي (IP/UA) قبل أي fulfillCJOrder محتمل.
     //   يغطي الفرعين: إذا JIT ربح القفل يقراها fulfillCJOrder مباشرة،
     //   وإذا Webhook سبقنا — هو لي يقراها من ctxMap (Degraded match مقبول إذا فات الوقت).
+    // 🆕 Mission #4: بصمات المتصفح تاع الزبون الحقيقي → EMQ uplift للـ CAPI
     setConversionContext(orderId, {
       clientIp: req.ip,
       userAgent: req.headers['user-agent'],
+      fbp: typeof req.body?._fbp === 'string' ? req.body._fbp.slice(0, 200) : undefined,
+      fbc: typeof req.body?._fbc === 'string' ? req.body._fbc.slice(0, 500) : undefined,
     });
 
     // 4. إذا أمسكنا بالقفل (ما سبقناش الـ Webhook) → CJ فوراً فالخلفية
