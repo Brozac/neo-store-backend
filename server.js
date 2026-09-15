@@ -636,7 +636,7 @@ app.get('/api/admin/disputes', async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.get('https://developers.cjdropshipping.com/api2.0/v1/disputes/getDisputeList', { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/admin/disputes/create', async (req, res) => {
@@ -646,7 +646,7 @@ app.post('/api/admin/disputes/create', async (req, res) => {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/disputes/create', payload, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
     if (response.data.code === 200) res.json({ message: 'Dispute created successfully!' });
     else res.status(400).json({ error: response.data.message || 'Failed to create dispute' });
-  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.get('/api/admin/track/:trackNumber', async (req, res) => {
@@ -655,7 +655,7 @@ app.get('/api/admin/track/:trackNumber', async (req, res) => {
     const response = await cjRequest((token) => axios.get(`https://developers.cjdropshipping.com/api2.0/v1/logistic/trackInfo`, { headers: { 'CJ-Access-Token': token }, params: { trackNumber } }));
     if (response.data.code === 200) res.json(response.data.data);
     else res.status(400).json({ error: response.data.message || 'Tracking number not found' });
-  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ==========================================
@@ -1842,14 +1842,14 @@ app.post('/api/admin/cogs', async (req, res) => {
     const { orderCodes } = req.body;
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/queryCogsBasicDataOrderInfoList', { orderCodesList: orderCodes }, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/admin/merge/match', async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/autoMatchMergeOrderListV3', { filterOrder: true, orderStatus: 100 }, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/admin/merge/submit', async (req, res) => {
@@ -1857,28 +1857,28 @@ app.post('/api/admin/merge/submit', async (req, res) => {
     const { orders } = req.body;
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/submitMergeOrderBatchV3', orders, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.get('/api/admin/makeup/list', async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/makeup/list', { pageNum: 1, pageSize: 20, type: 0 }, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.get('/api/addresses', requireAdmin, async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/privateInventory/address/list', {}, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/addresses/create', requireAdmin, async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/privateInventory/address/create', req.body, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/admin/sourcing/create', async (req, res) => {
