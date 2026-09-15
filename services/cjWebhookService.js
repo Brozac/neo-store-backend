@@ -96,6 +96,7 @@ const CJ_ORDER_STATUS_MAP = {
   // ⭐ الحالات الرسمية (Order Status docs — مؤكدة 2026):
   CREATED: 'paid', IN_CART: 'paid', UNPAID: 'paid',        // معلومات — الزبون دفع عندنا أصلاً
   PENDING: 'paid', PROCESSING: 'paid', UNSHIPPED: 'paid',  // aggregate + sub-status — معلومات فقط
+  TRASH: 'paid',  // 🆕 Fix#4 (درس #69): حذف داخلي من عندنا (zombie cleanup) — إخباري برك، لا mutation
   SHIPPED: 'fulfilled',
   DELIVERED: 'completed',
   CANCELLED: 'manual',
