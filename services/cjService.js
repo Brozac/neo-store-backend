@@ -344,7 +344,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
       await pool.query(
         `UPDATE orders SET cj_order_number = COALESCE(NULLIF(cj_order_number,''), NULLIF($1,'')) WHERE id = $2`,
         [String(num), orderId]
-      ).catch(() => {});
+      ).catch((e) => console.warn('⚠️ [CJ] saveCjNumber failed for #' + orderId + ' (' + num + '): ' + e.message));
     }
 
     // 1. محاولة الإرسال المجمّع
@@ -579,7 +579,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
   } catch (err) {
     logger.logError(`CJ Fulfillment Fatal Error #${orderId}`, err);
     if (!cjCreated) {
-      await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]).catch(() => {});
+      await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]).catch((e) => console.warn('⚠️ [CJ] manual-mark failed for #' + orderId + ': ' + e.message));
     }
     return { success: false, error: err.message };
   }

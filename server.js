@@ -728,7 +728,7 @@ app.post('/api/admin/backfill-categories', async (req, res) => {
 
           await pool.query('UPDATE products SET cj_category_id = $1, category = $2 WHERE id = $3', [cjCategoryId, newCategory, p.id]);
           updatedCount++;
-        } catch (itemErr) {}
+        } catch (itemErr) { console.warn('⚠️ [Recat] product ' + (p && p.id) + ' failed: ' + itemErr.message); }
       }
 
       clearProductsCache();
@@ -955,7 +955,7 @@ async function runCjProductSync(keyword) {
         try {
           const videoRes = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/product/queryVideosByProductId', { productId }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
           if (videoRes.data.code === 200 && videoRes.data.data?.length > 0) videoUrl = videoRes.data.data[0].videoUrl;
-        } catch (e) {}
+        } catch (e) { console.warn('⚠️ [Import] video query failed for ' + productId + ': ' + e.message); }
 
         await pool.query(
           `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id, is_sourced) 
@@ -970,7 +970,7 @@ async function runCjProductSync(keyword) {
         );
 
         importedCount++;
-      } catch (productErr) {}
+      } catch (productErr) { console.error('🔴 [Import] product FAILED: ' + (details?.pid || productId) + ' — ' + productErr.message); }
     }
   }
 
@@ -1272,7 +1272,7 @@ app.post('/api/admin/auto-categorize', async (req, res) => {
       for (const c of changes) {
         try {
           await pool.query('UPDATE products SET category = $1 WHERE id = $2', [c.to, c.id]);
-        } catch (e) {}
+        } catch (e) { console.warn('⚠️ [BgRecat] product ' + (c && c.id) + ' failed: ' + e.message); }
       }
       clearProductsCache();
       console.log(`✅ Finished auto-categorizing ${changes.length} products.`);
@@ -2029,7 +2029,7 @@ cron.schedule('0 3 * * *', async () => {
         const safePrice = parseFloat(sellingPrice.toFixed(2));
 
         await pool.query("UPDATE products SET price = $1, stock_status = $2 WHERE id = $3", [safePrice, details.isGlobalShipping !== false, p.id]);
-      } catch (e) {}
+      } catch (e) { console.error('🔴 [PriceSync] product ' + (p && p.id) + ' FAILED: ' + e.message); }
     }
     clearProductsCache();
     console.log('✅ [Auto-Cron] Daily product update completed!');
@@ -2133,11 +2133,11 @@ cron.schedule('0 * * * *', async () => {
               { headers: { 'CJ-Access-Token': token } }
             )
           );
-        } catch (mergeErr) {}
+        } catch (mergeErr) { console.error('🔴 [Auto-Merge] group submission FAILED: ' + mergeErr.message); }
       }
       console.log('✅ Auto-merge completed successfully!');
     }
-  } catch (err) {}
+  } catch (err) { console.error('🔴 [Auto-Merge] cron FAILED: ' + err.message); }
 });
 
 // 4. فحص وتنظيف المنتجات المحذوفة من CJ (أسبوعياً)
@@ -2161,7 +2161,7 @@ cron.schedule('0 1 * * 0', async () => {
           await pool.query("UPDATE products SET stock_status = false WHERE id = $1", [p.id]);
           hiddenCount++;
         }
-      } catch (e) {} 
+      } catch (e) { console.warn('⚠️ [WeeklyCleanup] product ' + (p && p.id) + ' failed: ' + e.message); } 
     }
     clearProductsCache();
     console.log(`✅ [Auto-Cron] Weekly cleanup completed! Hidden ${hiddenCount} products.`);
@@ -2784,7 +2784,7 @@ process.on('uncaughtException', async (err) => {
 
   try {
     await pool.end();
-  } catch (e) {}
+  } catch (e) {} // ✅ Tenet#14 documented exception: already dying — forceExit timer covers
 
   clearTimeout(forceExit);
   process.exit(1);
@@ -2815,7 +2815,7 @@ const handleShutdown = async (signal) => {
     try {
       await pool.end();
       console.log('✅ DB Pool drained.');
-    } catch (e) {}
+    } catch (e) {} // ✅ Tenet#14 documented exception: exiting anyway
     process.exit(0);
   });
 
