@@ -408,6 +408,7 @@ app.post('/api/validate-coupon', couponLimiter, async (req, res) => {
       message: `Coupon applied! You saved $${discount.toFixed(2)}`
     });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -419,6 +420,7 @@ app.post('/api/admin/add-coupon', async (req, res) => {
     await pool.query('INSERT INTO coupons (code, discount_type, discount_value) VALUES ($1, $2, $3) ON CONFLICT (code) DO NOTHING', [code.toUpperCase(), discount_type || 'percentage', discount_value]);
     res.status(201).json({ message: 'Coupon added successfully!' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -442,6 +444,7 @@ app.get('/api/reviews/:productId', async (req, res) => {
     const result = await pool.query('SELECT * FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [productId]);
     res.json(result.rows);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -453,6 +456,7 @@ app.post('/api/admin/add-review', async (req, res) => {
     await pool.query('INSERT INTO reviews (product_id, author, rating, content, country) VALUES ($1, $2, $3, $4, $5)', [product_id, author, rating || 5, content, country || 'United States']);
     res.status(201).json({ message: 'Review added successfully!' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -584,6 +588,7 @@ app.post('/api/admin/add-product', async (req, res) => {
     clearProductsCache();
     res.status(201).json({ message: 'Product added successfully with Auto-Pricing!', calculatedPrice: safePrice, originalPrice: safeOldPrice });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -595,6 +600,7 @@ app.delete('/api/admin/delete-product/:id', async (req, res) => {
     clearProductsCache();
     res.json({ message: 'Product hidden successfully!' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -612,6 +618,7 @@ app.put('/api/admin/reorder-product/:id', async (req, res) => {
     clearProductsCache();
     res.json({ message: 'Order updated successfully' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -625,6 +632,7 @@ app.put('/api/admin/reorder-products', async (req, res) => {
     clearProductsCache();
     res.json({ message: 'Order updated successfully' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -691,6 +699,7 @@ app.get('/api/categories', async (req, res) => {
     categoryTreeCacheTime = Date.now();
     res.json(tree);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1093,6 +1102,7 @@ app.get('/api/admin/manual-orders', async (req, res) => {
     const result = await pool.query("SELECT * FROM orders WHERE payment_method = 'BaridiMob' ORDER BY id DESC");
     res.json(result.rows);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1164,6 +1174,7 @@ app.put('/api/admin/manual-orders/reject/:id', async (req, res) => {
     await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1", [id]);
     res.json({ message: 'Order rejected successfully.' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1210,6 +1221,7 @@ app.get('/api/admin/failed-orders', async (req, res) => {
     const result = await pool.query("SELECT * FROM orders WHERE status = 'manual' AND payment_method != 'BaridiMob' ORDER BY id DESC");
     res.json(result.rows);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1225,6 +1237,7 @@ app.get('/api/search', async (req, res) => {
     const result = await pool.query("SELECT id, title, price, image_url FROM products WHERE stock_status = true AND (title ILIKE $1 OR description ILIKE $1) ORDER BY id DESC LIMIT 5", [`%${q}%`]);
     res.json(result.rows);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1240,6 +1253,7 @@ app.get('/api/admin/search-products', async (req, res) => {
     }
     res.json(result.rows);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1344,6 +1358,7 @@ app.get('/api/products/deals', async (req, res) => {
     const result = await pool.query("SELECT id, title, price, original_price, image_url FROM products WHERE stock_status = true AND is_sourced = true ORDER BY id DESC LIMIT 10");
     res.json(result.rows);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1420,6 +1435,7 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
     clearProductsCache();
     res.json({ message: 'Deal status updated', is_sourced: newStatus });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1679,6 +1695,7 @@ app.get('/api/orders/:id/items', async (req, res) => {
     );
     res.json(result.rows);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1693,6 +1710,7 @@ app.get('/api/orders/my-orders', authenticateToken, async (req, res) => {
     );
     res.json(result.rows);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1719,6 +1737,7 @@ app.get('/api/orders/track/:identifier', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({ error: 'No orders found' });
     res.json(result.rows);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1730,6 +1749,7 @@ app.get('/api/track/:trackNumber', trackLimiter, async (req, res) => {
     if (response.data.code === 200) res.json(response.data.data);
     else res.status(404).json({ error: 'No tracking info found.' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1771,6 +1791,7 @@ app.put('/api/admin/update-category/:id', async (req, res) => {
     clearProductsCache();
     res.json({ message: 'Category updated successfully' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1789,6 +1810,7 @@ app.get('/api/settings', async (req, res) => {
     }, {});
     res.json(settings);
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1805,6 +1827,7 @@ app.put('/api/admin/settings/:key', async (req, res) => {
     );
     res.json({ success: true, message: 'Setting updated successfully' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1817,6 +1840,7 @@ app.delete('/api/admin/videos/:productId', async (req, res) => {
     clearProductsCache();
     res.json({ success: true, message: 'Video deleted successfully. Product remains in store.' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1832,6 +1856,7 @@ app.put('/api/admin/update-product/:id', async (req, res) => {
     clearProductsCache();
     res.json({ message: 'Product updated successfully' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1889,6 +1914,7 @@ app.post('/api/admin/sourcing/create', async (req, res) => {
     if (response.data.success || response.data.code === 200 || response.data.code === 0) res.status(201).json({ message: 'Sourcing request sent successfully! CJ will review it.' });
     else res.status(400).json({ error: response.data.message || 'Failed to create sourcing request' });
   } catch (err) {
+      logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
