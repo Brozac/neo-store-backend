@@ -281,8 +281,14 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
       }
     } catch (e) {}
 
-    if (forcedLogisticName) logisticsToTry = [forcedLogisticName]; // ⭐ فرض صريح يتقدم على كولش
-    else logisticsToTry = [...new Set([...logisticsToTry, 'CJPacket Ordinary', 'CJPacket Sensitive', 'YunExpress', '4PX'])];
+    if (forcedLogisticName) logisticsToTry = [forcedLogisticName];
+    else {
+      logisticsToTry = [...new Set([...logisticsToTry, 'CJPacket Ordinary', 'CJPacket Sensitive', 'YunExpress', '4PX'])];
+      if (addr.country === 'DZ') {
+        // ⭐ DZ = السوق الأساسي — CJPacket Ordinary مُثبت (SD...#68) — يدخل الأول
+        logisticsToTry = ['CJPacket Ordinary', ...logisticsToTry.filter(l => l !== 'CJPacket Ordinary')];
+      }
+    }
 
     let orderSuccess = false;
     let lastError = null;
@@ -367,15 +373,39 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
           sampleOnce('V3-Create', cjResponse.data?.data);
 
           successfulCJOrderNumber = extractCjNumber(cjResponse.data?.data) || targetOrderNumber;
-          if (cjResponse.data?.data?.logisticsMiss === true) {
-            // 🤖 logisticsMiss: CJ ma-kan-sh binda shipping — auto-repair tawa (1.13+1.14)
-            console.warn('[CJ] #' + orderId + ' logisticsMiss=true — auto-repair...');
+                    if (cjResponse.data?.data?.logisticsMiss === true) {
+            // 🤖 logisticsMiss=true = "نجاح زائف" — CJ قبل الطلب بلا ربط شحن
+            // درس #65/#66: زومبي CREATED ما تتحركش أبداً. البروتوكول:
+            // repair → فشل؟ delete → جرب carrier الموالي → فشل الحذف؟ قبول + إنذار
+            console.warn(`[CJ] #${orderId} logisticsMiss=true (${logisticName}) — repair attempt...`);
             const rep = await autoRepairLogistics(successfulCJOrderNumber);
-            if (rep.repaired) console.log('[CJ] #' + orderId + ' logistics bound: ' + rep.logisticsName + ' ($' + rep.postage + ')');
-            else console.warn('[CJ] #' + orderId + ' auto-repair failed: ' + rep.reason);
+            if (rep.repaired) {
+              console.log(`[CJ] #${orderId} logistics bound: ${rep.logisticsName} ($${rep.postage})`);
+              await saveCjNumber(successfulCJOrderNumber);
+              break; // ✅ نجاح حقيقي — شحن مربوط
+            }
+
+            console.warn(`[CJ] #${orderId} auto-repair failed: ${rep.reason} — zombie risk. delete → next carrier...`);
+            const del = await deleteCJOrder(successfulCJOrderNumber, targetOrderNumber);
+            if (del.ok) {
+              console.log(`🧹 [CJ] #${orderId} zombie (${successfulCJOrderNumber}) deleted — retrying via next carrier`);
+              cjCreated = false;   // ⭐ reset الحاجز: ما بقاتش شي حاجة موجودة عند CJ
+              orderSuccess = false;
+              continue;            // 🔁 الحلقة تكمل — carrier الموالي (CJPacket/YunExpress/4PX)
+            }
+
+            // الحذف فشل = CJ بدا يحرك الطلب — نقبله وننبه الأدمن (ما نقطعوهش)
+            console.error(`[CJ] #${orderId} zombie delete failed — accepting + admin alert`);
+            await saveCjNumber(successfulCJOrderNumber);
+            sendAdminAlert(
+              `⚠️ CJ Zombie Order #${orderId} (${successfulCJOrderNumber}) — logisticsMiss unresolved`,
+              `<p>الطلب منشئ عند CJ بلا شحن والحذف فشل (CJ بدا المعالجة).</p>
+               <p>الـ carrier الفاشل: <code>${logisticName}</code> — راجعه يدوياً من CJ Dashboard.</p>`
+            );
+            break;
           }
           await saveCjNumber(successfulCJOrderNumber);
-          break;
+          break; // ✅ نجاح عادي — logisticsMiss=false
         }
 
         lastError = cjResponse.data;
