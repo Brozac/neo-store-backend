@@ -250,8 +250,7 @@ router.post('/stripe', async (req, res) => {
     res.json({ url: session.url });
   } catch (error) {
     logger.logError('Stripe Checkout Error', error);
-    res.status(500).json({ error: error.message });
-  }
+    res.status(500).json({ error: 'Payment processing failed' });  }
 });
 
 // ==========================================
@@ -304,8 +303,7 @@ router.post('/paysera', async (req, res) => {
     res.json({ url: payseraUrl });
   } catch (error) {
     logger.logError('Paysera Error', error);
-    res.status(500).json({ error: error.message });
-  }
+    res.status(500).json({ error: 'Payment processing failed' });  }
 });
 
 router.get('/paysera/callback', async (req, res) => {
@@ -564,8 +562,7 @@ router.post('/manual', upload.single('receipt'), async (req, res) => {
     res.json({ success: true, message: 'تم استلام طلبك وجاري مراجعته', orderId: orderId });
   } catch (error) {
     logger.logError('Manual Order Error', error);
-    res.status(500).json({ error: error.message });
-  }
+    res.status(500).json({ error: 'Payment processing failed' });  }
 });
 
 // ==========================================

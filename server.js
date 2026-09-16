@@ -1062,7 +1062,7 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/reset-password', async (req, res) => {
+app.post('/api/reset-password', authLimiter, async (req, res) => {
   try {
     const { token, newPassword } = req.body;
     if (!token || !newPassword) return res.status(400).json({ message: 'Token and new password are required.' });
