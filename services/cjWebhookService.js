@@ -24,6 +24,7 @@ const crypto = require('crypto');
 const pool = require('../db');
 const logger = require('../logger');
 const { cjRequest } = require('./cjService');
+const { checkStripeDispute, sendAdminAlert } = require('./cjService');
 const { sendOrderTrackingWhatsApp } = require('./whatsappService');
 
 const CJ_BASE = 'https://developers.cjdropshipping.com/api2.0/v1';
@@ -212,6 +213,30 @@ async function handleOrderUpdate(params = {}) {
     );
     if (!upd.rows.length) return; // ديجا معالج — dedup على مستوى الـ DB
     console.log(`🚀 [ORDER] #${order.id} SHIPPED (${logisticName || '?'}) → ${trackNumber}`);
+
+    // ⚖️ الحارس الأخير (Mission #7) — آخر بوابة قبل إشعار الزبون:
+    // الشحن وقع فعلاً → الحالة تبقى 'fulfilled' (حقيقة، forward-only).
+    // القرار الوحيد هنا: واش الإشعارات تمشي ولا تتجمد + تنبيه أدمن.
+    // lenient (strict:false): فشل فحص Stripe ما يحجبش إشعار زبون شرعي —
+    // الـ watchdog الدوري يغطي الكشف المستمر، هنا غير اللحظة الحاسمة.
+    const dg = await checkStripeDispute(order.id, { strict: false }).catch(e => {
+      console.warn(`⚖️ [SHIPPED-guard] check failed #${order.id}: ${e.message}`);
+      return { disputed: false, reason: 'guard_exception' }; // Tenet #14 — الفشل يتكلم، الإشعار يستمر
+    });
+    if (dg.disputed) {
+      console.error(`⚖️ [SHIPPED-guard] #${order.id} notifications BLOCKED — ${dg.reason} (charge=${dg.chargeId || 'n/a'})`);
+      sendAdminAlert(
+        `⚖️ DISPUTE at SHIPPED gate — Order #${order.id} — notifications held`,
+        `<h3 style="color:#FF6B9D;">Dispute مفتوح — الشحنة عبرت، الإشعارات مجمّدة</h3>
+         <p><b>Order:</b> #${order.id} — ${order.customer_name} (${order.customer_email})</p>
+         <p><b>Track:</b> ${trackNumber} — <b>Charge:</b> ${dg.chargeId || 'n/a'}</p>
+         <p><b>الحالة:</b> 'fulfilled' (حقيقة فيزيائية — ما تبدلش).</p>
+         <p><b>المطلوب منك:</b> استجب للـ dispute فـ Stripe Dashboard — 
+         evidence: رقم التتبع + proof of delivery + مراسلات الزبون + العنوان الموثق.</p>`
+      );
+      return; // 🚫 لا واتساب ولا إيميل — حتى يحسم الأدمن الـ dispute
+    }
+
     await notifyShipment(order, trackNumber, logisticName);
     return;
   }
@@ -267,10 +292,28 @@ async function handleLogistic(params = {}) {
     );
     if (upd.rows.length) {
       console.log(`🛟 [LOGISTIC] Rescue #${order.id} — ORDER/SHIPPED فات، إشعار العميل دابا`);
+
+      // ⚖️ الحارس على مسار الإنقاذ (Mission #7) — الأعلى خطورة للـ disputes:
+      // الطلب قعد مدة طويلة 'paid' بلا شحن = نافذة chargeback موسعة
+      const dg = await checkStripeDispute(order.id, { strict: false }).catch(e => {
+        console.warn(`⚖️ [Rescue-guard] check failed #${order.id}: ${e.message}`);
+        return { disputed: false, reason: 'guard_exception' };
+      });
+      if (dg.disputed) {
+        console.error(`⚖️ [Rescue-guard] #${order.id} notifications BLOCKED — ${dg.reason} (charge=${dg.chargeId || 'n/a'})`);
+        sendAdminAlert(
+          `⚖️ DISPUTE at RESCUE gate — Order #${order.id} — notifications held`,
+          `<p>مسار الإنقاذ (LOGISTIC) لقى شحنة لطلب عليه dispute مفتوح.</p>
+           <p><b>Order:</b> #${order.id} — ${order.customer_name} — <b>Track:</b> ${trackingNumber}</p>
+           <p><b>Charge:</b> ${dg.chargeId || 'n/a'} — الإشعارات موقفة.</p>
+           <p><b>المطلوب:</b> استجابة للـ dispute بـ evidence (delivery proof قوي هنا — الشحنة كانت معلقة طويلاً).</p>`
+        );
+        return;
+      }
+
       await notifyShipment(order, trackingNumber, params.logisticName);
     }
   }
-  // مستقبلاً: events → جدول tracking_events (تتبع لحظي كامل فالحساب)
 }
 
 // ==========================================

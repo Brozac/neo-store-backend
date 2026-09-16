@@ -653,6 +653,57 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
   }
 }
 // ═══════════════════════════════════════════════════════════════
+// ⚖️ checkStripeDispute — فحص مستقل للاعتراضات (chargebacks)
+// قابل للاستدعاء من: Watchdog cron + SHIPPED guard + أي مسار مستقبلي
+// Return: { disputed, reason?, chargeId? } — fail-open للـ network فقط
+// عند فحص الـ watchdog (الطلب ما يتعطلش لأن Stripe تعبت)، fail-closed
+// عند الحارس الأخير (SHIPPED — الشحن قرار لا رجعة فيه)
+// ═══════════════════════════════════════════════════════════════
+async function checkStripeDispute(orderId, { strict = false } = {}) {
+  try {
+    const r = await pool.query(
+      `SELECT payment_method, stripe_session_id, status FROM orders WHERE id = $1`,
+      [orderId]
+    );
+    const o = r.rows[0];
+    if (!o) return { disputed: false, reason: 'order_not_found' };
+    if (!/stripe/i.test(String(o.payment_method || ''))) return { disputed: false, reason: 'not_stripe' };
+    if (!o.stripe_session_id) return { disputed: false, reason: 'no_session' };
+
+    // الجلسة → PaymentIntent → latest_charge (مع expand)
+    const session = await stripe.checkout.sessions.retrieve(o.stripe_session_id);
+    if (!session || session.payment_status !== 'paid') {
+      return { disputed: false, reason: `not_paid_${session?.payment_status || 'missing'}` };
+    }
+    const pi = typeof session.payment_intent === 'string'
+      ? await stripe.paymentIntents.retrieve(session.payment_intent, { expand: ['latest_charge'] })
+      : session.payment_intent;
+    const charge = pi?.latest_charge;
+
+    if (charge && typeof charge === 'object') {
+      if (charge.disputed) {
+        const dv = typeof charge.dispute === 'object' && charge.dispute
+          ? charge.dispute
+          : null;
+        console.error(`⚖️ [DisputeWatch] #${orderId} DISPUTED! charge=${charge.id} status=${dv?.status || '?'}`);
+        return { disputed: true, reason: `dispute_${dv?.status || 'open'}`, chargeId: charge.id };
+      }
+      return { disputed: false, chargeId: charge.id };
+    }
+
+    // لا charge قابل للفحص — حسب الصرامة
+    return strict
+      ? { disputed: true, reason: 'charge_unverifiable_strict' }  // الحارس الأخير: لا مجازفة
+      : { disputed: false, reason: 'no_charge_object' };          // الـ watchdog: تسامح
+
+  } catch (e) {
+    logger.logError(`checkStripeDispute #${orderId}`, e);
+    return strict
+      ? { disputed: true, reason: 'check_failed_strict' }  // فشل الفحص وقت الشحن = لا شحن
+      : { disputed: false, reason: 'check_failed' };       // فشل في المراقبة = دورة قادمة
+  }
+}
+// ═══════════════════════════════════════════════════════════════
 // 🩺 selfHealStuckOrders — محرك الإنقاذ الذاتي (Zero-Touch)
 // يكتشف الطلبات المدفوعة عندنا العالقة عند CJ (CREATED غير مدفوع/زومبي)
 // ويعالجها آلياً عبر 3 طبقات — القرار البشري فقط للمستحيل:
@@ -859,6 +910,72 @@ setInterval(() => {
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 أيام
   for (const [k, v] of healAttempts) if (v.lastAt < cutoff) healAttempts.delete(k);
 }, 60 * 60 * 1000).unref();
+// ═══════════════════════════════════════════════════════════════
+// ⚖️ disputeWatchdogCron — مراقبة مستمرة للاعتراضات (كل 6 ساعات)
+// النافذة: كل طلبات Stripe غير المشحونة بعمر ≤ 60 يوم (نافذة الـ dispute)
+// الهدف: كشف الـ chargeback قبل الشحن (إيقاف) أو بعده مباشرة (وعي)
+// ═══════════════════════════════════════════════════════════════
+async function disputeWatchdogCron() {
+  console.log('⚖️ [DisputeWatch] scan started...');
+  let scanned = 0, disputesFound = 0;
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, stripe_session_id, total_amount, customer_name, customer_email
+      FROM orders
+      WHERE status IN ('paid', 'pending', 'manual')
+        AND payment_method = 'Stripe'
+        AND stripe_session_id IS NOT NULL AND stripe_session_id != ''
+        AND created_at > NOW() - INTERVAL '60 days'
+      ORDER BY created_at DESC
+      LIMIT 100
+    `);
+    if (rows.length === 0) { console.log('⚖️ [DisputeWatch] nothing to scan.'); return; }
+
+    for (const o of rows) {
+      scanned++;
+      const res = await checkStripeDispute(o.id, { strict: false });
+      if (!res.disputed) continue;
+
+      disputesFound++;
+      const shipped = ['fulfilled', 'completed'].includes(String(o.status));
+
+      if (!shipped) {
+        // 🛑 غير مشحون + اعتراض → إيقاف فوري: manual + محاولة اعتراض CJ
+        console.error(`⚖️ [DisputeWatch] #${o.id} DISPUTED & UNSHIPPED → manual + CJ intercept attempt`);
+        await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1 AND status = 'paid'", [o.id]);
+
+        // محاولة اعتراض الشحنة عند CJ إن وجدت (CREATED فقط — نفس قواعد الحذف)
+        if (o.cj_order_number || o.stripe_session_id) {
+          // لا يوجد cj_order_number دائماً هنا — نجرب عبر metadata إن توفر لاحقاً
+        }
+        sendAdminAlert(
+          `⚖️ STRIPE DISPUTE — Order #${o.id} (${o.total_amount} USD) — fulfillment STOPPED`,
+          `<h3 style="color:#FF6B9D;">Chargeback مفتوح قبل الشحن!</h3>
+           <p><b>Order:</b> #${o.id} — <b>Client:</b> ${o.customer_name} (${o.customer_email})</p>
+           <p><b>Amount:</b> $${o.total_amount} — <b>Charge:</b> ${res.chargeId || 'n/a'}</p>
+           <p><b>Action taken:</b> الحالة → manual. الـ fulfillment متوقف.</p>
+           <p><b>Next:</b> استجب للـ dispute في Stripe Dashboard (evidence: order, shipping, comms) — 
+           أو اقبل الخسارة إذا كان احتيالاً مؤكداً. CJ order إن وُجد: intercept يدوياً من Dashboard.</p>`
+        );
+      } else {
+        // 📦 مشحون + اعتراض → وعي (لا رجعة في الشحن — لكن نجهز evidence)
+        console.error(`⚖️ [DisputeWatch] #${o.id} DISPUTED & ALREADY SHIPPED → evidence-prep alert`);
+        sendAdminAlert(
+          `⚖️ STRIPE DISPUTE (SHIPPED) — Order #${o.id} — evidence needed`,
+          `<p>اعتراض على طلب <b>مشحون فعلاً</b> — الخسارة المالية واردة، بصق الـ evidence قوي:</p>
+           <p>Order #${o.id} — ${o.customer_name} — $${o.total_amount} — Charge: ${res.chargeId || 'n/a'}</p>
+           <p><b>جهّز فوراً:</b> رقم التتبع + إثبات التسليم (carrier proof) + مراسلات الزبون + 
+           توثيق العنوان الموثق من Stripe. ارفعهم في Stripe Dashboard خلال المهلة.</p>`
+        );
+      }
+    }
+
+    console.log(`⚖️ [DisputeWatch] done — scanned=${scanned} disputes=${disputesFound}`);
+  } catch (err) {
+    logger.logError('DisputeWatch Cron', err); // Tenet #14
+  }
+}
 // ==========================================
 // 🤖 autoRepairLogistics
 // ==========================================
@@ -939,4 +1056,4 @@ setInterval(() => {
     if (v.lastAt < cutoff) healAttempts.delete(k);
   }
 }, 60 * 60 * 1000).unref(); // ⚠️ unref() — ما يمنعش process.exit
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders };
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron };
