@@ -3,7 +3,10 @@ require('dotenv').config();
 const axios = require('axios');
 const pool = require('../db');
 const logger = require('../logger');
+const Stripe = require('stripe');
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const { sendPurchaseConversion } = require('./conversionService');
+
 
 let cachedCjToken = null;
 let cachedCjTokenExpiry = null;
@@ -165,32 +168,96 @@ async function probeOrderStatus(targetOrderNumber, tag) {
   }
 }
 
-// ==========================================
-// 3. محرك الـ Fulfillment المحصّن (V3 API) — v2.1
-// ==========================================
+// ═══════════════════════════════════════════════════════════════
+// 🏦 financialGate — العقود المالي المطلق (Tenet مؤسس)
+// "قبل ما يبعث لـ CJ — الدراهم مؤكدة في الحساب. مهما كان المسار، مهما كان متى."
+// نقطة تفتيش مالية واحدة: كل نداء fulfillCJOrder (webhook/JIT/cron/self-heal)
+// يعيد التحقق المباشر من مصدر الدفع نفسه — لا ثقة في DB ولا في الحالة الوسطى.
+// fail-closed: أي فشل/شذوذ = رفض + لوج. (Tenet #14: كل فشل يكلّم)
+// ═══════════════════════════════════════════════════════════════
 
-// 🛡️ cryptoPaymentGuard — fail-closed
-async function cryptoPaymentGuard(orderId) {
+async function financialGate(orderId) {
   try {
-    const r = await pool.query('SELECT payment_method, payment_ref, total_amount FROM orders WHERE id = $1', [orderId]);
+    const r = await pool.query(
+      'SELECT payment_method, payment_ref, total_amount, stripe_session_id, payment_status FROM orders WHERE id = $1',
+      [orderId]
+    );
     const o = r.rows[0];
     if (!o) return { allow: false, reason: 'order_not_found' };
-    if (!/crypto|nowpayments/i.test(o.payment_method || '')) return { allow: true, reason: 'not_crypto' };
-    if (!o.payment_ref) { console.warn('[NP-Guard] #' + orderId + ' بلا payment_ref — رفض احتياطي'); return { allow: false, reason: 'no_payment_ref' }; }
-    const key = process.env.NOWPAYMENTS_API_KEY;
-    if (!key) { console.error('[NP-Guard] NOWPAYMENTS_API_KEY ناقص'); return { allow: false, reason: 'no_api_key' }; }
-    const res = await axios.get('https://api.nowpayments.io/v1/payment/' + o.payment_ref, {
-      headers: { 'x-api-key': key }, timeout: 15000
-    });
-    const p = res.data || {};
-    const paidUsd = Number(p.actually_paid_usd ?? 0);
-    const status = String(p.payment_status || '');
-    const ok = (status === 'finished' || status === 'confirmed') && paidUsd + 0.01 >= Number(o.total_amount);
-    console.log('[NP-Guard] #' + orderId + ' status=' + status + ' paid_usd=' + paidUsd + ' total=' + o.total_amount + ' => ' + (ok ? 'ALLOW' : 'DENY'));
-    return ok ? { allow: true } : { allow: false, reason: 'payment_' + status + '_' + paidUsd };
+
+    const expectedUsd = Number(o.total_amount);
+    const method = String(o.payment_method || '').toLowerCase();
+
+    // ─── Crypto / NowPayments: استجواب مباشر — الأصل المثبت ───
+    if (/crypto|nowpayments/i.test(method)) {
+      if (!o.payment_ref) { console.warn(`[FinGate] #${orderId} crypto بلا payment_ref — رفض احتياطي`); return { allow: false, reason: 'no_payment_ref' }; }
+      const key = process.env.NOWPAYMENTS_API_KEY;
+      if (!key) { console.error(`[FinGate] #${orderId} NOWPAYMENTS_API_KEY ناقص`); return { allow: false, reason: 'no_api_key' }; }
+      const res = await axios.get(`https://api.nowpayments.io/v1/payment/${o.payment_ref}`, {
+        headers: { 'x-api-key': key }, timeout: 15000
+      });
+      const p = res.data || {};
+      const paidUsd = Number(p.actually_paid_usd ?? 0);
+      const st = String(p.payment_status || '');
+      const ok = (st === 'finished' || st === 'confirmed') && paidUsd + 0.01 >= expectedUsd;
+      console.log(`[FinGate] #${orderId} CRYPTO status=${st} paid_usd=${paidUsd} total=${expectedUsd} => ${ok ? 'ALLOW' : 'DENY'}`);
+      return ok ? { allow: true } : { allow: false, reason: `crypto_${st}_${paidUsd}` };
+    }
+
+    // ─── Stripe: استجواب الجلسة مباشرة + فحص الـ dispute (وحش أقصى) ───
+    if (/stripe/i.test(method)) {
+      if (!o.stripe_session_id) { console.warn(`[FinGate] #${orderId} stripe بلا session_id — رفض احتياطي`); return { allow: false, reason: 'no_session_id' }; }
+      const session = await stripe.checkout.sessions.retrieve(o.stripe_session_id);
+      if (!session || session.payment_status !== 'paid') {
+        console.warn(`[FinGate] #${orderId} STRIPE payment_status=${session?.payment_status} => DENY`);
+        return { allow: false, reason: `stripe_${session?.payment_status || 'missing'}` };
+      }
+      const paidUsd = session.amount_total / 100;
+      // مطابقة المبلغ بالسنت — حماية ضد أي تعديل DB خارجي
+      if (Math.abs(paidUsd - expectedUsd) > 0.011) {
+        console.error(`[FinGate] #${orderId} STRIPE amount mismatch: stripe=${paidUsd} db=${expectedUsd} => DENY`);
+        return { allow: false, reason: `stripe_amount_mismatch_${paidUsd}` };
+      }
+      // فحص dispute على الـ charge الأحدث (وحش أقصى — chargeback قبل الشحن)
+      try {
+        const pi = typeof session.payment_intent === 'string'
+          ? await stripe.paymentIntents.retrieve(session.payment_intent, { expand: ['latest_charge'] })
+          : session.payment_intent;
+        const charge = pi?.latest_charge;
+        if (charge && typeof charge === 'object' && charge.disputed) {
+          console.error(`[FinGate] #${orderId} STRIPE DISPUTED charge => DENY`);
+          return { allow: false, reason: 'stripe_disputed' };
+        }
+      } catch (dispErr) {
+        // فحص الـ dispute تحسيني — فشله لا يمنع (paid من Stripe يكفي)، بصق يُسجل (Tenet #14)
+        console.warn(`[FinGate] #${orderId} dispute-check skipped: ${dispErr.message}`);
+      }
+      console.log(`[FinGate] #${orderId} STRIPE paid=${paidUsd} => ALLOW`);
+      return { allow: true };
+    }
+
+    // ─── Paysera: التأكيد الموثق = callback الموقّع (md5 signature) المسجل في DB ───
+    if (/paysera/i.test(method)) {
+      // لا استجواب لحظي متاح بجودة مقابلة — الـ callback الموقع هو العقد (التحقق المزدوج: status paid + وجود سجل)
+      const ok = o.payment_status === 'paid' || String(o.status) === 'paid';
+      console.log(`[FinGate] #${orderId} PAYSERA db_status=${o.status}/${o.payment_status} => ${ok ? 'ALLOW (callback-signed)' : 'DENY'}`);
+      return ok ? { allow: true } : { allow: false, reason: 'paysera_not_paid' };
+    }
+
+    // ─── BaridiMob: approval بشري موثق (dossier مُدقق) هو التوقيع المالي ───
+    if (/baridi|manual/i.test(method)) {
+      const approved = /paid|approved/i.test(String(o.payment_status || '')) || String(o.status) === 'paid';
+      console.log(`[FinGate] #${orderId} BARIDIMOB payment_status=${o.payment_status} => ${approved ? 'ALLOW (admin-approved)' : 'DENY'}`);
+      return approved ? { allow: true } : { allow: false, reason: 'baridimob_not_approved' };
+    }
+
+    // ─── طريقة غير معروفة: رفض صارم (fail-closed — لا مسارات مجهولة للمال) ───
+    console.error(`[FinGate] #${orderId} UNKNOWN payment_method="${o.payment_method}" => DENY`);
+    return { allow: false, reason: `unknown_method_${o.payment_method}` };
+
   } catch (e) {
-    logger.logError('cryptoPaymentGuard #' + orderId, e);
-    return { allow: false, reason: 'guard_error' };
+    logger.logError(`financialGate #${orderId}`, e);
+    return { allow: false, reason: 'gate_error' }; // فشل التحقق = رفض. دوماً.
   }
 }
 
@@ -212,10 +279,11 @@ async function sendAdminAlert(subject, html) {
 
 async function fulfillCJOrder(orderId, customerName, customerDetails, items, orderNumberOverride = null, forcedLogisticName = null) {
   let cjCreated = false;
-  const _guard = await cryptoPaymentGuard(orderId);
-  if (!_guard.allow) {
-    console.error('[NP-Guard] رفض إرسال #' + orderId + ' لـ CJ: ' + _guard.reason);
-    return { success: false, reason: 'PAYMENT_NOT_CONFIRMED', detail: _guard.reason };
+  // 🏦 financialGate — العقود المالي المطلق: كل المسارات، كل الأزمنة (Tenet مؤسس)
+  const _gate = await financialGate(orderId);
+  if (!_gate.allow) {
+    console.error('[FinGate] رفض إرسال #' + orderId + ' لـ CJ: ' + _gate.reason);
+    return { success: false, reason: 'PAYMENT_NOT_CONFIRMED', detail: _gate.reason };
   }
   try {
     const addr = customerDetails?.address || {};
@@ -302,7 +370,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
       if (freightRes.data.code === 200 && freightRes.data.data?.length > 0) {
         logisticsToTry = freightRes.data.data.sort((a, b) => a.logisticPrice - b.logisticPrice).map(l => l.logisticName);
       }
-    } catch (e) {}
+    } catch (e) { console.warn("⚠️ [Fulfill] freightCalculate failed #" + orderId + ": " + e.message); }
 
     if (forcedLogisticName) logisticsToTry = [forcedLogisticName];
     // 🆕 Patch 4 (درس #69): لا فرض جغرافي — freightCalculate المرتب بالسعر هو الأصدق لكل SKU
@@ -584,7 +652,213 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
     return { success: false, error: err.message };
   }
 }
+// ═══════════════════════════════════════════════════════════════
+// 🩺 selfHealStuckOrders — محرك الإنقاذ الذاتي (Zero-Touch)
+// يكتشف الطلبات المدفوعة عندنا العالقة عند CJ (CREATED غير مدفوع/زومبي)
+// ويعالجها آلياً عبر 3 طبقات — القرار البشري فقط للمستحيل:
+//   L1: حذف الزومبي → إعادة fulfillment (المحرك المجرب كامل)
+//   L2: payBalance (الدراهم مستحقة أصلاً — بلا سقف: COGS مستحق)
+//   L3: manual + إيميل (فقط لما تنفد كل الحلول الآلية)
+// حالات خاصة: نفاد محفظة CJ → إيميل تشغيلي (تزويد مورد — الحل الوحيد بشري)
+// ═══════════════════════════════════════════════════════════════
+const healAttempts = new Map();   // orderId → { count, lastAt }
+const HEAL_MAX_ATTEMPTS = 3;
 
+async function selfHealStuckOrders() {
+  console.log('🩺 [SelfHeal] Stuck-orders audit started...');
+  let scanned = 0, healed1 = 0, healed2 = 0, manualized = 0, walletAlerted = false;
+
+  try {
+    // 1. الاصطياد: مدفوع عندنا + مُسنَد لـ CJ + عمره > 24h (القديم أولاً)
+    const { rows: candidates } = await pool.query(`
+      SELECT id, cj_order_number, total_amount, customer_name, customer_email, created_at
+      FROM orders
+      WHERE status = 'paid'
+        AND cj_order_number IS NOT NULL AND cj_order_number != ''
+        AND created_at < NOW() - INTERVAL '24 hours'
+      ORDER BY created_at ASC
+      LIMIT 20
+    `);
+    if (candidates.length === 0) { console.log('🩺 [SelfHeal] clean — no candidates.'); return; }
+
+    // 2. فحص الحالة عند CJ — batch (1 نداء/50) مع fallback فردي
+    let detailsMap = new Map();
+    const codes = candidates.map(c => c.cj_order_number);
+    try {
+      const batch = await cjRequest((token) =>
+        axios.post(`${CJ_API}/shopping/order/getOrderDetailBatch`, { orderIds: codes }, 
+          { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } })
+      );
+      if (batch.data?.code === 200) {
+        for (const d of (batch.data.data?.list || batch.data.data || [])) {
+          const key = d.cjOrderCode || d.orderId || d.orderNumber;
+          if (key) detailsMap.set(String(key), d);
+        }
+      }
+    } catch (batchErr) {
+      console.warn(`🩺 [SelfHeal] batch failed (${batchErr.message}) — falling back to individual probes`);
+    }
+
+    // 3. المعالجة حسب الحالة
+    for (const cand of candidates) {
+      scanned++;
+      const oid = cand.id;
+      const code = cand.cj_order_number;
+
+      // عدّاد المحاولات — الحارس ضد الحلقات اللانهائية
+      const att = healAttempts.get(oid) || { count: 0, lastAt: 0 };
+      if (att.count >= HEAL_MAX_ATTEMPTS) {
+        // L3: المستحيل — استنفد كل شيء
+        await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1 AND status = 'paid'", [oid]);
+        manualized++;
+        console.error(`🩺 [SelfHeal] #${oid} exhausted ${HEAL_MAX_ATTEMPTS} attempts → manual + admin alert`);
+        sendAdminAlert(
+          `🚨 SelfHeal exhausted — Order #${oid} (${code})`,
+          `<p>استنفد ${HEAL_MAX_ATTEMPTS} محاولات إنقاذ آلية. تدخل بشري مطلوب.</p>
+           <p>العميل: ${cand.customer_name} — ${cand.total_amount} USD — SD: ${code}</p>`
+        );
+        continue;
+      }
+
+      // جلب التفاصيل (batch أو فردي)
+      let info = detailsMap.get(String(code));
+      if (!info) {
+        try {
+          const probe = await probeOrderStatus(code, 'SelfHeal');
+          info = { orderStatus: probe.status, cjOrderCode: probe.realCj || code, paymentDate: null };
+          // probeOrderStatus لا يجيب paymentDate — نستكمله بنداء مفصل فقط عند الحاجة (Layer 2)
+        } catch (e) {
+          console.warn(`🩺 [SelfHeal] #${oid} probe failed: ${e.message} — skipped this cycle`);
+          continue;
+        }
+      }
+
+      const cjStatus = String(info.orderStatus || '').toUpperCase();
+      const isAlive = !DEAD_CJ_STATUSES.includes(cjStatus) && cjStatus !== 'CREATED_UNPAID';
+      const paymentDate = info.paymentDate ?? null;
+
+      // ✅ حي ومتحرك (فوق CREATED) — سكت. لا ضجيج.
+      if (cjStatus && cjStatus !== 'CREATED' && !DEAD_CJ_STATUSES.includes(cjStatus)) {
+        healAttempts.delete(oid); // نشاط حي = عداد reset
+        continue;
+      }
+
+      // 🔴 ميت (TRASH/CANCELLED...) — مصيره مختلف عن الزومبي: تصحيح حالة + إعادة fulfillment نظيفة
+      if (DEAD_CJ_STATUSES.includes(cjStatus)) {
+        console.warn(`🩺 [SelfHeal] #${oid} DEAD at CJ (${cjStatus}) — clearing code, re-fulfilling fresh...`);
+        await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
+        await attemptRefulfill(oid, cand, 'dead-order');
+        att.count++; healAttempts.set(oid, att);
+        continue;
+      }
+
+      // 🧟 زومبي (CREATED فقط) — الفرع الرئيسي
+      // L1: حذف الزومبي → إعادة fulfillment بالمحرك المجرب
+      console.log(`🩺 [SelfHeal] #${oid} zombie CREATED (${code}) — L1: delete → re-fulfill (attempt ${att.count + 1}/${HEAL_MAX_ATTEMPTS})`);
+      const del = await deleteCJOrder(code, `STORE-${oid}`);
+      if (del.ok) {
+        console.log(`🧹 [SelfHeal] #${oid} zombie deleted — re-fulfilling...`);
+        await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
+        const ok = await attemptRefulfill(oid, cand, 'zombie-recreate');
+        if (ok) { healed1++; att.count++; healAttempts.set(oid, att); continue; }
+      }
+
+      // L2: الحذف فشل (CJ بدا يحرك) أو الـ re-fulfill فشل → payBalance (الدراهم مستحقة — بلا سقف)
+      console.log(`🩺 [SelfHeal] #${oid} L2: payBalance route (${code})...`);
+      // فحص paymentDate مباشر قبل الدفع (حماية مزدوجة الدفع)
+      let pd = null;
+      try {
+        const tk = await getCJToken();
+        const det = await axios.get(`${CJ_API}/shopping/order/getOrderDetail`, {
+          params: { orderId: code }, headers: { 'CJ-Access-Token': tk }, timeout: 20000 });
+        const ii = det.data?.data?.orderInfo || det.data?.data || {};
+        pd = ii.paymentDate || null;
+        if (String(ii.orderStatus || '').toUpperCase() === 'TRASH') {
+          console.warn(`🩺 [SelfHeal] #${oid} is TRASH at detail-level — clearing + re-fulfill`);
+          await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
+          await attemptRefulfill(oid, cand, 'trash-recreate');
+          att.count++; healAttempts.set(oid, att);
+          continue;
+        }
+      } catch (e) { console.warn(`🩺 [SelfHeal] #${oid} detail-probe failed: ${e.message}`); }
+
+      if (pd) {
+        console.log(`✅ [SelfHeal] #${oid} already paid at CJ (paymentDate=${pd}) — CJ سيكمل عادي، لا دفع مزدوج`);
+        healAttempts.delete(oid);
+        continue;
+      }
+
+      const pay = await payCJOrderBalance(code, `STORE-${oid}`);
+      if (pay.ok) {
+        healed2++;
+        console.log(`💳 [SelfHeal] #${oid} payBalance OK — CJ سيكمل → SHIPPED webhook قادم`);
+        att.count++; healAttempts.set(oid, att);
+        continue;
+      }
+
+      // 💸 فشل الدفع — نفاد المحفظة هو الاحتمال الأكبر → إشعار تشغيلي وحيد
+      if (!walletAlerted) {
+        sendAdminAlert(
+          '💳 CJ Wallet — Top-up required (SelfHeal)',
+          `<p>النظام يحاول إنقاذ طلبات عالقة بالدفع الذاتي لكن المحفظة لا تكفي.</p>
+           <p>الطلبات المنتظرة: ${candidates.filter(c => c.status === 'paid').length}</p>
+           <p>الأفعال الوحيدة البشرية المطلوبة: عمّر المحفظة — النظام يكمل الباقي أوتوماتيكياً.</p>`
+        );
+        walletAlerted = true; // مرة واحدة لكل دورة — لا إيميلات متتالية
+      }
+      console.warn(`🩺 [SelfHeal] #${oid} payBalance failed: ${pay.reason} — retried next cycle`);
+      att.count++; healAttempts.set(oid, att);
+    }
+
+    console.log(`🩺 [SelfHeal] done — scanned=${scanned} L1=${healed1} L2=${healed2} manual=${manualized}`);
+  } catch (err) {
+    logger.logError('SelfHeal Cron', err); // Tenet #14
+  }
+}
+
+// 🔄 إعادة fulfillment عبر المحرك المجرب كامل — لا محرك جديد
+async function attemptRefulfill(oid, cand, tag) {
+  try {
+    const itemsRes = await pool.query(`
+      SELECT oi.*, p.title, p.image_url
+      FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id
+      WHERE oi.order_id = $1`, [oid]);
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [oid]);
+    const ord = orderRes.rows[0];
+    if (!ord) return false;
+
+    // 🏦 العقد المالي: حتى الإنقاذ يمر عبر البوابة — الدراهم مؤكدة قبل أي إرسال
+    // (مزدوج متعمد مع فحص fulfillCJOrder الداخلي — belt-and-suspenders على العقود المالي:
+    //  الـ self-heal يرفض مبكراً بلوج أوضح، و fulfillCJOrder يحفظ استقلاليته لكل متصل آخر)
+    const gate = await financialGate(oid);
+    if (!gate.allow) {
+      console.error(`🩺 [SelfHeal] #${oid} re-fulfill DENIED by financialGate: ${gate.reason}`);
+      return false;
+    }
+
+    const customerDetails = {
+      email: ord.customer_email || undefined,
+      phone: ord.customer_phone || undefined,
+      address: (() => {
+        try { return JSON.parse(ord.shipping_address || '{}'); }
+        catch { return { line1: ord.shipping_address || 'N/A', country: 'DZ' }; }
+      })(),
+    };
+
+    const resp = await fulfillCJOrder(oid, ord.customer_name, customerDetails, itemsRes.rows);
+    console.log(`🩺 [SelfHeal] #${oid} re-fulfill (${tag}) => ${resp.success ? '✅ ' + (resp.orderNumber || '') : '❌ ' + (resp.reason || resp.error || 'unknown')}`);
+    return !!resp.success;
+  } catch (e) {
+    console.warn(`🩺 [SelfHeal] #${oid} re-fulfill exception: ${e.message}`);
+    return false;
+  }
+}
+
+// 🧹 تنظيف ذاكرة العداد — منع التسرب (نفس نمط ctxMap)
+setInterval(() => {
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 أيام
+  for (const [k, v] of healAttempts) if (v.lastAt < cutoff) healAttempts.delete(k);
+}, 60 * 60 * 1000).unref();
 // ==========================================
 // 🤖 autoRepairLogistics
 // ==========================================
@@ -658,4 +932,11 @@ async function payCJOrderBalance(...candidates) {
   }
   return { ok: false, reason: lastReason };
 }
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance };
+// 🧹 GC: تنظيف عدّادات المحاولات القديمة (memory-leak defense — نفس نمط ctxMap)
+setInterval(() => {
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // أقدم من 7 أيام
+  for (const [k, v] of healAttempts) {
+    if (v.lastAt < cutoff) healAttempts.delete(k);
+  }
+}, 60 * 60 * 1000).unref(); // ⚠️ unref() — ما يمنعش process.exit
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders };

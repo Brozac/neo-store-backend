@@ -102,7 +102,6 @@ function setConversionContext(orderId, { clientIp, userAgent, fbp, fbc } = {}) {
 
 // ─── Meta CAPI v18 ───
 async function sendMeta({ eventId, eventTime, value, contentIds, contents, p }) {
-  console.log(`🔬 [sendMeta ENTRY] id=${eventId} fbp_in=${p.fbp} fbc_in=${p.fbc}`);  // 🔬 مؤقت
   if (!META_PIXEL_ID || !META_TOKEN) return { ok: false, detail: 'Meta env missing — skipped' };
 
   const userData = {};
@@ -116,7 +115,6 @@ async function sendMeta({ eventId, eventTime, value, contentIds, contents, p }) 
   // 🆕 Mission #4: بصمات المتصفح — أقوى رابط مطابقة بين البكسل والسيرفر
   if (p.fbp) userData.fbp = String(p.fbp).slice(0, 200);
   if (p.fbc) userData.fbc = String(p.fbc).slice(0, 500);
-console.log(`🔬 [sendMeta UD] fbp=${userData.fbp} fbc=${userData.fbc}`);  // 🔬 مؤقت
   const event = {
     event_name: 'Purchase',
     event_time: eventTime,

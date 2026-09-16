@@ -19,6 +19,7 @@ const { setConversionContext } = require('./services/conversionService');
 const { fulfillCJOrder, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
+const { selfHealStuckOrders } = require('./services/cjService');
 const logger = require('./logger');
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
 const multer = require('multer');
@@ -2200,7 +2201,9 @@ cron.schedule('0 1 * * 0', async () => {
 cron.schedule('0 11,18 * * *', async () => {
   await postDailyProductToFacebook();
 });
-
+cron.schedule('0 */2 * * *', async () => {
+       try { await selfHealStuckOrders(); } catch (e) { logger.logError('SelfHeal Scheduler', e); }
+     });
 // 6. كرون مطابقة مدفوعات Stripe v2 (كل 15 دقيقة)
 // الهدف الحقيقي: طلب paid اللي fulfillment فشل قبل ما يوصل CJ (crash شبكي...)
 // ✅ v2: guard cj_order_number — الطلب المقبول فـ CJ عندو رقم → عمرو ما يتعاود
