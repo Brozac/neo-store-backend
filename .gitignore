@@ -28,6 +28,7 @@ rescue_*.js
 cleanup_*.js
 preflight_*.js
 preflight_check_*.js
+load_test_*.js
 # ─── Backups ───
 *.bak
 *.bak2

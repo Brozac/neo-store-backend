@@ -149,18 +149,15 @@ async function notifyShipment(order, trackNumber, logisticName) {
 }
 
 async function handleOrderUpdate(params = {}) {
-  const cjOrderId    = String(params.cjOrderId || '').trim();                       // ✅ من العينة (BT...)
-  const orderNum     = String(params.orderNum || params.orderNumber || '').trim();  // ✅ orderNum
-  const statusRaw    = String(params.orderStatus || params.status || '').trim().toUpperCase(); // ✅ orderStatus
-  const trackNumber  = String(params.trackNumber || '').trim();                     // ✅ trackNumber هنا
+  const cjOrderId    = String(params.cjOrderId || '').trim();
+  const orderNum     = String(params.orderNum || params.orderNumber || '').trim();
+  const statusRaw    = String(params.orderStatus || params.status || '').trim().toUpperCase();
+  const trackNumber  = String(params.trackNumber || '').trim();
   const logisticName = params.logisticName || null;
-  const postage      = Number.isFinite(Number(params.postage)) ? Number(params.postage) : null; // مراقبة مالية
+  const postage      = Number.isFinite(Number(params.postage)) ? Number(params.postage) : null;
 
-  // STORE-{id} أو split STORE-{id}-S{n} — أحداث Test ("test") كيموتو هنا بهدوء
   const storeMatch = orderNum.match(/^STORE-(\d+)(?:-S\d+)?$/i);
   if (!storeMatch && !cjOrderId) return;
-
-  console.log(`📦 [ORDER] orderNum=${orderNum} cj=${cjOrderId} status=${statusRaw} track=${trackNumber || '—'} carrier=${logisticName || '—'} postage=${postage ?? '—'}`);
 
   const mapped = CJ_ORDER_STATUS_MAP[statusRaw];
   if (!mapped) {
@@ -168,10 +165,27 @@ async function handleOrderUpdate(params = {}) {
     return;
   }
 
-  // معلومات ضعيفة — الطلب كيتصاوب عندنا غير بعد الدفع → ديجا paid
+  // معلومات ضعيفة — ديجا paid
   if (mapped === 'paid') { console.log(`ℹ️ [ORDER] ${statusRaw} — تجاهل (ديجا paid عندنا)`); return; }
 
   const orderId = storeMatch ? Number(storeMatch[1]) : null;
+
+  // 🛡️ Mission #8 Hardening — الرفض المبكر: CJ لا يوقّع ORDER/LOGISTIC،
+  // فالـ "هوية" الحدث = وجود الطلب في DB. مجهول = drop + علامة (لا لوج-spam).
+  const knownRes = await pool.query(
+    `SELECT id FROM orders
+     WHERE ($1::int IS NOT NULL AND id = $1)
+        OR (NULLIF($2,'') IS NOT NULL AND cj_order_number = $2)
+     LIMIT 1`,
+    [orderId, cjOrderId || null]
+  );
+  if (knownRes.rows.length === 0) {
+    console.warn(`🛡️ [ORDER] Unrecognized order dropped (orderNum=${orderNum}, cj=${cjOrderId}, status=${statusRaw}) — possible spoof/scan`);
+    return;
+  }
+
+  console.log(`📦 [ORDER] orderNum=${orderNum} cj=${cjOrderId} status=${statusRaw} track=${trackNumber || '—'} carrier=${logisticName || '—'} postage=${postage ?? '—'}`);
+
   const orderRes = await pool.query(
     `SELECT * FROM orders
      WHERE ($1::int IS NOT NULL AND id = $1)
@@ -185,7 +199,7 @@ async function handleOrderUpdate(params = {}) {
   }
   const order = orderRes.rows[0];
 
-  // ⚠️ إلغاء — transition جانبي (استثناء على forward-only) — علّم الأدمن
+  // ⚠️ إلغاء — transition جانبي
   if (mapped === 'manual') {
     if (order.status === 'pending') return;
     await pool.query(
@@ -196,10 +210,10 @@ async function handleOrderUpdate(params = {}) {
     return;
   }
 
-  // 🛡️ forward-only — DELIVERED ما كيرجعش SHIPPED (invariant #7)
+  // 🛡️ forward-only
   if ((STATUS_RANK[order.status] ?? -1) >= (STATUS_RANK[mapped] ?? -1)) return;
 
-  // 🚚 SHIPPED — اللحظة الذهبية: DB + واتساب + إيميل فوراً
+  // 🚚 SHIPPED — اللحظة الذهبية
   if (mapped === 'fulfilled' && trackNumber) {
     const upd = await pool.query(
       `UPDATE orders
@@ -211,17 +225,13 @@ async function handleOrderUpdate(params = {}) {
        RETURNING id`,
       [trackNumber, order.id, cjOrderId || null]
     );
-    if (!upd.rows.length) return; // ديجا معالج — dedup على مستوى الـ DB
+    if (!upd.rows.length) return;
     console.log(`🚀 [ORDER] #${order.id} SHIPPED (${logisticName || '?'}) → ${trackNumber}`);
 
-    // ⚖️ الحارس الأخير (Mission #7) — آخر بوابة قبل إشعار الزبون:
-    // الشحن وقع فعلاً → الحالة تبقى 'fulfilled' (حقيقة، forward-only).
-    // القرار الوحيد هنا: واش الإشعارات تمشي ولا تتجمد + تنبيه أدمن.
-    // lenient (strict:false): فشل فحص Stripe ما يحجبش إشعار زبون شرعي —
-    // الـ watchdog الدوري يغطي الكشف المستمر، هنا غير اللحظة الحاسمة.
+    // ⚖️ الحارس الأخير (Mission #7)
     const dg = await checkStripeDispute(order.id, { strict: false }).catch(e => {
       console.warn(`⚖️ [SHIPPED-guard] check failed #${order.id}: ${e.message}`);
-      return { disputed: false, reason: 'guard_exception' }; // Tenet #14 — الفشل يتكلم، الإشعار يستمر
+      return { disputed: false, reason: 'guard_exception' };
     });
     if (dg.disputed) {
       console.error(`⚖️ [SHIPPED-guard] #${order.id} notifications BLOCKED — ${dg.reason} (charge=${dg.chargeId || 'n/a'})`);
@@ -234,14 +244,14 @@ async function handleOrderUpdate(params = {}) {
          <p><b>المطلوب منك:</b> استجب للـ dispute فـ Stripe Dashboard — 
          evidence: رقم التتبع + proof of delivery + مراسلات الزبون + العنوان الموثق.</p>`
       );
-      return; // 🚫 لا واتساب ولا إيميل — حتى يحسم الأدمن الـ dispute
+      return;
     }
 
     await notifyShipment(order, trackNumber, logisticName);
     return;
   }
 
-  // ✅ completed وغيره — + أول تسجيل ديال cj_order_number (LOGISTIC/MMAKEUP غادي يحتاجوه)
+  // ✅ completed وغيره
   await pool.query(
     `UPDATE orders
        SET status = $1,
@@ -262,6 +272,19 @@ async function handleLogistic(params = {}) {
   const trackingNumber = String(params.trackingNumber || params.trackNumber || '').trim();
   const cjOrderId = String(params.orderId || '').trim();
   if (!trackingNumber && !cjOrderId) return;
+
+  // 🛡️ Mission #8 Hardening — نفس منطق الرفض المبكر
+  const knownRes = await pool.query(
+    `SELECT id FROM orders
+     WHERE tracking_number = $1
+        OR (NULLIF($2,'') IS NOT NULL AND cj_order_number = $2)
+     LIMIT 1`,
+    [trackingNumber, cjOrderId]
+  );
+  if (knownRes.rows.length === 0) {
+    console.warn(`🛡️ [LOGISTIC] Unrecognized event dropped (track=${trackingNumber}, cj=${cjOrderId}) — possible spoof/scan`);
+    return;
+  }
 
   let eventsCount = 0;
   if (params.logisticsTrackEvents) {
