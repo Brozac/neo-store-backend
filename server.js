@@ -1956,7 +1956,28 @@ app.post('/api/admin/sourcing/create', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+// ═══ 📋 System Events API — سجل القرارات الآلية (Mission #9) ═══
+app.get('/api/admin/system-events', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const type = req.query.type ? String(req.query.type) : null;
 
+    const { rows } = type
+      ? await pool.query(
+          'SELECT * FROM system_events WHERE event_type = $1 ORDER BY created_at DESC LIMIT $2',
+          [type, limit]
+        )
+      : await pool.query(
+          'SELECT * FROM system_events ORDER BY created_at DESC LIMIT $1',
+          [limit]
+        );
+
+    res.json({ events: rows });
+  } catch (e) {
+    logger.logError('system-events API', e);
+    res.status(500).json({ error: 'Failed to fetch system events' });
+  }
+});
 // ==========================================
 // قالب إيميل تأكيد الطلب
 // ==========================================

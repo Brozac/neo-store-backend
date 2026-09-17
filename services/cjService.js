@@ -167,7 +167,17 @@ async function probeOrderStatus(targetOrderNumber, tag) {
     return { status: 'UNKNOWN', realCj: null };
   }
 }
-
+// 📋 auditEvent — كل قرار آلي يترك أثراً دائماً (الشفافية للنظام الذاتي)
+async function auditEvent(eventType, orderId, details = {}, severity = 'info') {
+  try {
+    await pool.query(
+      `INSERT INTO system_events (event_type, order_id, details, severity) VALUES ($1, $2, $3, $4)`,
+      [eventType, orderId || null, JSON.stringify(details), severity]
+    );
+  } catch (e) {
+    console.warn(`⚠️ [Audit] فشل تسجيل ${eventType}#${orderId}: ${e.message}`); // Tenet #14
+  }
+}
 // ═══════════════════════════════════════════════════════════════
 // 🏦 financialGate — العقود المالي المطلق (Tenet مؤسس)
 // "قبل ما يبعث لـ CJ — الدراهم مؤكدة في الحساب. مهما كان المسار، مهما كان متى."
@@ -190,9 +200,17 @@ async function financialGate(orderId) {
 
     // ─── Crypto / NowPayments: استجواب مباشر — الأصل المثبت ───
     if (/crypto|nowpayments/i.test(method)) {
-      if (!o.payment_ref) { console.warn(`[FinGate] #${orderId} crypto بلا payment_ref — رفض احتياطي`); return { allow: false, reason: 'no_payment_ref' }; }
+      if (!o.payment_ref) { 
+        await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'crypto', reason: 'no_payment_ref' }, 'warning');
+        console.warn(`[FinGate] #${orderId} crypto بلا payment_ref — رفض احتياطي`); 
+        return { allow: false, reason: 'no_payment_ref' }; 
+      }
       const key = process.env.NOWPAYMENTS_API_KEY;
-      if (!key) { console.error(`[FinGate] #${orderId} NOWPAYMENTS_API_KEY ناقص`); return { allow: false, reason: 'no_api_key' }; }
+      if (!key) { 
+        await auditEvent('FINANCIAL_GATE_ERROR', orderId, { method: 'crypto', reason: 'no_api_key' }, 'critical');
+        console.error(`[FinGate] #${orderId} NOWPAYMENTS_API_KEY ناقص`); 
+        return { allow: false, reason: 'no_api_key' }; 
+      }
       const res = await axios.get(`https://api.nowpayments.io/v1/payment/${o.payment_ref}`, {
         headers: { 'x-api-key': key }, timeout: 15000
       });
@@ -201,20 +219,27 @@ async function financialGate(orderId) {
       const st = String(p.payment_status || '');
       const ok = (st === 'finished' || st === 'confirmed') && paidUsd + 0.01 >= expectedUsd;
       console.log(`[FinGate] #${orderId} CRYPTO status=${st} paid_usd=${paidUsd} total=${expectedUsd} => ${ok ? 'ALLOW' : 'DENY'}`);
+      if (!ok) await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'crypto', status: st, paidUsd, expectedUsd }, 'warning');
       return ok ? { allow: true } : { allow: false, reason: `crypto_${st}_${paidUsd}` };
     }
 
     // ─── Stripe: استجواب الجلسة مباشرة + فحص الـ dispute (وحش أقصى) ───
     if (/stripe/i.test(method)) {
-      if (!o.stripe_session_id) { console.warn(`[FinGate] #${orderId} stripe بلا session_id — رفض احتياطي`); return { allow: false, reason: 'no_session_id' }; }
+      if (!o.stripe_session_id) { 
+        await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'stripe', reason: 'no_session_id' }, 'warning');
+        console.warn(`[FinGate] #${orderId} stripe بلا session_id — رفض احتياطي`); 
+        return { allow: false, reason: 'no_session_id' }; 
+      }
       const session = await stripe.checkout.sessions.retrieve(o.stripe_session_id);
       if (!session || session.payment_status !== 'paid') {
+        await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'stripe', reason: session?.payment_status || 'missing' }, 'warning');
         console.warn(`[FinGate] #${orderId} STRIPE payment_status=${session?.payment_status} => DENY`);
         return { allow: false, reason: `stripe_${session?.payment_status || 'missing'}` };
       }
       const paidUsd = session.amount_total / 100;
       // مطابقة المبلغ بالسنت — حماية ضد أي تعديل DB خارجي
       if (Math.abs(paidUsd - expectedUsd) > 0.011) {
+        await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'stripe', reason: 'amount_mismatch', stripeAmt: paidUsd, dbAmt: expectedUsd }, 'critical');
         console.error(`[FinGate] #${orderId} STRIPE amount mismatch: stripe=${paidUsd} db=${expectedUsd} => DENY`);
         return { allow: false, reason: `stripe_amount_mismatch_${paidUsd}` };
       }
@@ -225,6 +250,7 @@ async function financialGate(orderId) {
           : session.payment_intent;
         const charge = pi?.latest_charge;
         if (charge && typeof charge === 'object' && charge.disputed) {
+          await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'stripe', reason: 'disputed', chargeId: charge.id }, 'critical');
           console.error(`[FinGate] #${orderId} STRIPE DISPUTED charge => DENY`);
           return { allow: false, reason: 'stripe_disputed' };
         }
@@ -238,9 +264,9 @@ async function financialGate(orderId) {
 
     // ─── Paysera: التأكيد الموثق = callback الموقّع (md5 signature) المسجل في DB ───
     if (/paysera/i.test(method)) {
-      // لا استجواب لحظي متاح بجودة مقابلة — الـ callback الموقع هو العقد (التحقق المزدوج: status paid + وجود سجل)
       const ok = o.payment_status === 'paid' || String(o.status) === 'paid';
       console.log(`[FinGate] #${orderId} PAYSERA db_status=${o.status}/${o.payment_status} => ${ok ? 'ALLOW (callback-signed)' : 'DENY'}`);
+      if (!ok) await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'paysera', dbStatus: o.status, payStatus: o.payment_status }, 'warning');
       return ok ? { allow: true } : { allow: false, reason: 'paysera_not_paid' };
     }
 
@@ -248,15 +274,18 @@ async function financialGate(orderId) {
     if (/baridi|manual/i.test(method)) {
       const approved = /paid|approved/i.test(String(o.payment_status || '')) || String(o.status) === 'paid';
       console.log(`[FinGate] #${orderId} BARIDIMOB payment_status=${o.payment_status} => ${approved ? 'ALLOW (admin-approved)' : 'DENY'}`);
+      if (!approved) await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'baridimob', payStatus: o.payment_status }, 'warning');
       return approved ? { allow: true } : { allow: false, reason: 'baridimob_not_approved' };
     }
 
     // ─── طريقة غير معروفة: رفض صارم (fail-closed — لا مسارات مجهولة للمال) ───
+    await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: o.payment_method, reason: 'unknown_method' }, 'critical');
     console.error(`[FinGate] #${orderId} UNKNOWN payment_method="${o.payment_method}" => DENY`);
     return { allow: false, reason: `unknown_method_${o.payment_method}` };
 
   } catch (e) {
     logger.logError(`financialGate #${orderId}`, e);
+    await auditEvent('FINANCIAL_GATE_ERROR', orderId, { error: e.message }, 'critical');
     return { allow: false, reason: 'gate_error' }; // فشل التحقق = رفض. دوماً.
   }
 }
@@ -809,6 +838,7 @@ async function selfHealStuckOrders() {
       const del = await deleteCJOrder(code, `STORE-${oid}`);
       if (del.ok) {
         console.log(`🧹 [SelfHeal] #${oid} zombie deleted — re-fulfilling...`);
+        await auditEvent('SELFHEAL_MANUALIZED', oid, { code, attempts: att.count }, 'critical');
         await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
         const ok = await attemptRefulfill(oid, cand, 'zombie-recreate');
         if (ok) { healed1++; att.count++; healAttempts.set(oid, att); continue; }
@@ -842,6 +872,7 @@ async function selfHealStuckOrders() {
       const pay = await payCJOrderBalance(code, `STORE-${oid}`);
       if (pay.ok) {
         healed2++;
+        await auditEvent('SELFHEAL_PAYBALANCE', oid, { code, amount: cand.total_amount }, 'warning');
         console.log(`💳 [SelfHeal] #${oid} payBalance OK — CJ سيكمل → SHIPPED webhook قادم`);
         att.count++; healAttempts.set(oid, att);
         continue;
@@ -856,6 +887,7 @@ async function selfHealStuckOrders() {
            <p>الأفعال الوحيدة البشرية المطلوبة: عمّر المحفظة — النظام يكمل الباقي أوتوماتيكياً.</p>`
         );
         walletAlerted = true; // مرة واحدة لكل دورة — لا إيميلات متتالية
+        await auditEvent('WALLET_EMPTY', null, { pending: candidates.filter(c => c.status === 'paid').length }, 'warning');
       }
       console.warn(`🩺 [SelfHeal] #${oid} payBalance failed: ${pay.reason} — retried next cycle`);
       att.count++; healAttempts.set(oid, att);
@@ -905,11 +937,6 @@ async function attemptRefulfill(oid, cand, tag) {
   }
 }
 
-// 🧹 تنظيف ذاكرة العداد — منع التسرب (نفس نمط ctxMap)
-setInterval(() => {
-  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 أيام
-  for (const [k, v] of healAttempts) if (v.lastAt < cutoff) healAttempts.delete(k);
-}, 60 * 60 * 1000).unref();
 // ═══════════════════════════════════════════════════════════════
 // ⚖️ disputeWatchdogCron — مراقبة مستمرة للاعتراضات (كل 6 ساعات)
 // النافذة: كل طلبات Stripe غير المشحونة بعمر ≤ 60 يوم (نافذة الـ dispute)
@@ -921,7 +948,7 @@ async function disputeWatchdogCron() {
 
   try {
     const { rows } = await pool.query(`
-      SELECT id, stripe_session_id, total_amount, customer_name, customer_email
+      SELECT id, stripe_session_id, total_amount, customer_name, customer_email, cj_order_number
       FROM orders
       WHERE status IN ('paid', 'pending', 'manual')
         AND payment_method = 'Stripe'
@@ -945,10 +972,13 @@ async function disputeWatchdogCron() {
         console.error(`⚖️ [DisputeWatch] #${o.id} DISPUTED & UNSHIPPED → manual + CJ intercept attempt`);
         await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1 AND status = 'paid'", [o.id]);
 
-        // محاولة اعتراض الشحنة عند CJ إن وجدت (CREATED فقط — نفس قواعد الحذف)
-        if (o.cj_order_number || o.stripe_session_id) {
-          // لا يوجد cj_order_number دائماً هنا — نجرب عبر metadata إن توفر لاحقاً
+        // ⚖️ اعتراض فعلي: إن كانت الشحنة عند CJ مازالت CREATED — نمسحها (لا نرسل بضاعة لاحتيال)
+        if (o.cj_order_number) {
+          const icpt = await deleteCJOrder(o.cj_order_number);
+          console.log(`⚖️ [DisputeWatch] #${o.id} CJ intercept => ${icpt.ok ? '✅ deleted' : 'ℹ️ not deletable (moved past CREATED) — Dashboard manual'}`);
+          await auditEvent('DISPUTE_INTERCEPT', o.id, { code: o.cj_order_number, deleted: icpt.ok }, 'warning');
         }
+        await auditEvent('DISPUTE_FOUND', o.id, { charge: res.chargeId, shipped: false, amount: o.total_amount }, 'critical');
         sendAdminAlert(
           `⚖️ STRIPE DISPUTE — Order #${o.id} (${o.total_amount} USD) — fulfillment STOPPED`,
           `<h3 style="color:#FF6B9D;">Chargeback مفتوح قبل الشحن!</h3>
@@ -961,6 +991,7 @@ async function disputeWatchdogCron() {
       } else {
         // 📦 مشحون + اعتراض → وعي (لا رجعة في الشحن — لكن نجهز evidence)
         console.error(`⚖️ [DisputeWatch] #${o.id} DISPUTED & ALREADY SHIPPED → evidence-prep alert`);
+        await auditEvent('DISPUTE_FOUND', o.id, { charge: res.chargeId, shipped: true, amount: o.total_amount }, 'warning');
         sendAdminAlert(
           `⚖️ STRIPE DISPUTE (SHIPPED) — Order #${o.id} — evidence needed`,
           `<p>اعتراض على طلب <b>مشحون فعلاً</b> — الخسارة المالية واردة، بصق الـ evidence قوي:</p>
@@ -1056,4 +1087,4 @@ setInterval(() => {
     if (v.lastAt < cutoff) healAttempts.delete(k);
   }
 }, 60 * 60 * 1000).unref(); // ⚠️ unref() — ما يمنعش process.exit
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron };
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron ,auditEvent};

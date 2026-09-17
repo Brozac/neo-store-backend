@@ -1,0 +1,15 @@
+# ═══ نهايات الأسطر — سياسة موحدة نهائياً ═══
+# LF دائماً في الـ repo — Git ما يتدخلش في الـ working copy
+* text=auto eol=lf
+
+# Windows-specific scripts تبقى CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binaries — لا تحويل
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
