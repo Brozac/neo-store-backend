@@ -86,12 +86,15 @@ function postJSON(url, extraHeaders, body) {
 
 // ─── Context Stash: الـ JIT يخبّئ IP/UA + بصمات Meta (Mission #4) قبل الـ fulfillment ───
 const ctxMap = new Map();
-function setConversionContext(orderId, { clientIp, userAgent, fbp, fbc } = {}) {
+function setConversionContext(orderId, { clientIp, userAgent, fbp, fbc, utmSource, utmCampaign, clickId } = {}) {
   if (!orderId) return;
   ctxMap.set(String(orderId), {
     clientIp, userAgent,
-    fbp: typeof fbp === 'string' ? fbp : undefined,   // 🆕 Mission #4
-    fbc: typeof fbc === 'string' ? fbc : undefined,   // 🆕 Mission #4
+    fbp: typeof fbp === 'string' ? fbp : undefined,
+    fbc: typeof fbc === 'string' ? fbc : undefined,
+    utmSource:   typeof utmSource === 'string' ? utmSource : undefined,   // 🆕 #12
+    utmCampaign: typeof utmCampaign === 'string' ? utmCampaign : undefined,
+    clickId:     typeof clickId === 'string' ? clickId : undefined,
     ts: Date.now(),
   });
   if (ctxMap.size > 500) {
@@ -129,6 +132,9 @@ async function sendMeta({ eventId, eventTime, value, contentIds, contents, p }) 
       content_ids: contentIds,
       contents,
       order_id: eventId,
+      ...(p.utmSource ? { utm_source: String(p.utmSource).slice(0, 100) } : {}),
+      ...(p.utmCampaign ? { utm_campaign: String(p.utmCampaign).slice(0, 150) } : {}),
+      ...(p.clickId ? { click_id: String(p.clickId).slice(0, 255) } : {}),
     },
   };
 
@@ -193,14 +199,17 @@ async function sendPurchaseConversion(p) {
   const eventId   = `purch_${orderId}`;              // 🔒 صيغة ثابتة — ممنوع تغييرها
   const eventTime = Math.floor(Date.now() / 1000);
 
-  // دمج Context تاع JIT إذا متوفرش فالمعاملات — 🆕 Mission #4: + fbp/fbc
+  // دمج Context تاع JIT إذا متوفرش فالمعاملات — 🆕 Mission #12: + UTM
   const ctx = ctxMap.get(String(orderId));
   const enriched = {
     ...p,
-    clientIp:  p.clientIp  || ctx?.clientIp,
-    userAgent: p.userAgent || ctx?.userAgent,
-    fbp: p.fbp || ctx?.fbp,
-    fbc: p.fbc || ctx?.fbc,
+    clientIp:    p.clientIp    || ctx?.clientIp,
+    userAgent:   p.userAgent   || ctx?.userAgent,
+    fbp:         p.fbp         || ctx?.fbp,
+    fbc:         p.fbc         || ctx?.fbc,
+    utmSource:   p.utmSource   || ctx?.utmSource,
+    utmCampaign: p.utmCampaign || ctx?.utmCampaign,
+    clickId:     p.clickId     || ctx?.clickId,
   };
 
   const items = (Array.isArray(p.items) && p.items.length)
@@ -230,5 +239,51 @@ async function sendPurchaseConversion(p) {
   }
   return summary;
 }
+/**
+ * 🩹 Second-Shot — إعادة إرسال Purchase بعد وصول الزبون لـ /success
+ * نفس event_id purch_{orderId} → Meta dedup يضمن عدم مضاعفة العد،
+ * والأحداث اللي فاتت من مسار أسرع (webhook) تاخذ بصماتها المفقودة (fbp/fbc).
+ * Fire-and-forget — فشلها non-fatal بالكامل.
+ */
+async function secondShotConversion(orderId) {
+  try {
+    const ctx = ctxMap.get(String(orderId));
+    if (!ctx || (!ctx.fbp && !ctx.fbc)) {
+      return { skipped: true, reason: 'no_fingerprints' }; // ما فاتش عبر /success ولا ما فيهش بصمات
+    }
 
-module.exports = { sendPurchaseConversion, setConversionContext };
+    // نحتاج قيمة وitems من DB — الـ ctx ما يحتاجهم
+    const { rows } = await pool.query(
+      'SELECT total_amount, customer_email, customer_phone, customer_name, customer_city, utm_source, utm_campaign, click_id FROM orders WHERE id = $1',
+      [orderId]
+    );
+    const ord = rows[0];
+    if (!ord) return { skipped: true, reason: 'order_missing' };
+
+    const summary = await sendPurchaseConversion({
+      orderId,
+      value: parseFloat(ord.total_amount),
+      items: [], // fallback داخلي: LACLARC_ORDER — المهم هو الـ match، مش الـ contents
+      email:        ord.customer_email,
+      phone:        ord.customer_phone,
+      customerName: ord.customer_name,
+      city:         ord.customer_city,
+      utmSource:    ord.utm_source,
+      utmCampaign:  ord.utm_campaign,
+      clickId:      ord.click_id,
+      clientIp:     ctx.clientIp,
+      userAgent:    ctx.userAgent,
+      fbp:          ctx.fbp,
+      fbc:          ctx.fbc,
+    });
+
+    await auditEvent('CAPI_SECOND_SHOT', orderId, summary, 'info');
+    console.log(`🎯 [CAPI] second-shot purch_${orderId} dispatched ✓ — fingerprints enriched`);
+    return { ok: true, summary };
+  } catch (e) {
+    console.warn(`🎯 [CAPI] second-shot purch_${orderId} non-fatal: ${e.message}`);
+    await auditEvent('CAPI_SECOND_SHOT_FAIL', orderId, { error: e.message }, 'warning');
+    return { ok: false, error: e.message };
+  }
+}
+module.exports = { sendPurchaseConversion, setConversionContext ,secondShotConversion};

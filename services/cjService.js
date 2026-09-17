@@ -330,7 +330,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
     (async () => {
       try {
         const { rows } = await pool.query(
-          'SELECT total_amount, customer_email, customer_phone, customer_name, customer_city FROM orders WHERE id = $1',
+          'SELECT total_amount, customer_email, customer_phone, customer_name, customer_city, utm_source, utm_campaign, click_id FROM orders WHERE id = $1',
           [orderId]
         );
         const order = rows[0];
@@ -344,7 +344,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
             }))
           : [];
 
-        sendPurchaseConversion({
+                sendPurchaseConversion({
           orderId,
           value: parseFloat(order.total_amount),
           items: capiItems,
@@ -352,6 +352,10 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
           phone:        order.customer_phone,
           customerName: order.customer_name,
           city:         order.customer_city,
+          // 🆕 Mission #12: الإسناد يسافر مع الحدث
+          utmSource:    order.utm_source,
+          utmCampaign:  order.utm_campaign,
+          clickId:      order.click_id,
         })
           .then((s) => console.log(`[CAPI] purch_${orderId} dispatched ✓`, JSON.stringify(s)))
           .catch((e) => console.warn(`[CAPI] purch_${orderId} non-fatal: ${e.message}`));

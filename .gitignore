@@ -26,7 +26,8 @@ audit_*.js
 debug_*.js
 rescue_*.js
 cleanup_*.js
-
+preflight_*.js
+preflight_check_*.js
 # ─── Backups ───
 *.bak
 *.bak2

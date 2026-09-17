@@ -16,6 +16,7 @@ const { applyCouponToTotal } = require('./utils/couponHelper'); // ✨ التع�
 const requireAdmin = require('./middleware/requireAdmin');
 const rateLimit = require('express-rate-limit');
 const { setConversionContext } = require('./services/conversionService');
+const { secondShotConversion } = require('./services/conversionService');
 const { fulfillCJOrder, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
@@ -1977,6 +1978,14 @@ app.get('/api/admin/system-events', requireAdmin, async (req, res) => {
     logger.logError('system-events API', e);
     res.status(500).json({ error: 'Failed to fetch system events' });
   }
+});
+// ═══ 🩹 Mission #13 — CAPI Second-Shot (fingerprint enrichment) ═══
+app.post('/api/payment/second-shot', async (req, res) => {
+  const { orderId } = req.body;
+  if (!orderId) return res.status(400).json({ success: false, error: 'orderId required' });
+  // Fire-and-forget — الزبون ما يستناش
+  secondShotConversion(orderId).catch(e => console.warn(`[SecondShot] #${orderId}: ${e.message}`));
+  res.json({ accepted: true });
 });
 // ==========================================
 // قالب إيميل تأكيد الطلب
