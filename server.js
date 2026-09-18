@@ -1987,6 +1987,67 @@ app.post('/api/payment/second-shot', async (req, res) => {
   secondShotConversion(orderId).catch(e => console.warn(`[SecondShot] #${orderId}: ${e.message}`));
   res.json({ accepted: true });
 });
+// ═══ 🧬 Mission #16 — Customer Exchange Page API ═══
+app.post('/api/exchange/:orderId', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { pick } = req.body;
+    
+    // تأكد الطلب فـ awaiting_exchange
+    const { rows } = await pool.query(
+      "SELECT * FROM orders WHERE id = $1 AND status = 'awaiting_exchange'",
+      [orderId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Exchange not available for this order' });
+    
+    const options = rows[0].exchange_options || [];
+    const chosen = options.find(s => String(s.id) === String(pick));
+    if (!chosen) return res.status(400).json({ error: 'Invalid selection' });
+
+    // استبدل الـ order_items بالبديل المختار بسعره
+    await pool.query('DELETE FROM order_items WHERE order_id = $1', [orderId]);
+    await pool.query(
+      'INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase) VALUES ($1, $2, 1, $3)',
+      [orderId, chosen.id, Number(chosen.price)]
+    );
+    
+    // أعد الـ fulfillment عبر المحرك الكامل
+    const itemsRes = await pool.query('SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1', [orderId]);
+    const ord = rows[0];
+    const customerDetails = {
+      email: ord.customer_email, phone: ord.customer_phone,
+      address: (() => { try { return JSON.parse(ord.shipping_address); } catch { return { line1: 'N/A', country: 'DZ' }; } })(),
+    };
+    const result = await fulfillCJOrder(orderId, ord.customer_name, customerDetails, itemsRes.rows);
+    
+    if (result.success) {
+      await auditEvent('EXCHANGE_SUCCESS', orderId, { newProduct: chosen.id, title: chosen.title }, 'info');
+      res.json({ success: true, message: 'تم استبدال المنتج وإعادة الإرسال — ستصلك رسالة شحن قريباً!' });
+    } else {
+      // البديل أيضاً غير قابل للشحن → نرجع للاسترداد
+      await auditEvent('EXCHANGE_FAIL', orderId, { chosen: chosen.id }, 'warning');
+      res.json({ success: false, message: 'البديل غير متوفر للشحن حالياً — سيتم استرداد المبلغ تلقائياً.' });
+    }
+  } catch (e) {
+    logger.logError('Exchange API', e);
+    res.status(500).json({ error: 'Exchange failed' });
+  }
+});
+// ═══ 🧬 Exchange — جلب الخيارات (قراءة) ═══
+app.get('/api/exchange/:orderId/options', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { rows } = await pool.query(
+      "SELECT exchange_options FROM orders WHERE id = $1 AND status = 'awaiting_exchange'",
+      [orderId]
+    );
+    if (!rows[0]) return res.status(404).json({ options: [] });
+    res.json({ options: rows[0].exchange_options || [] });
+  } catch (e) {
+    logger.logError('exchange-options', e);
+    res.status(500).json({ options: [] });
+  }
+});
 // ==========================================
 // قالب إيميل تأكيد الطلب
 // ==========================================

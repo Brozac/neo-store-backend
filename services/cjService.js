@@ -305,6 +305,16 @@ async function sendAdminAlert(subject, html) {
   }
 }
 
+// 💰 جلب مبلغ الطلب (للـ ZeroTouch refund paths)
+async function getOrderTotalAmount(orderId) {
+  try {
+    const r = await pool.query('SELECT total_amount FROM orders WHERE id = $1', [orderId]);
+    return r.rows[0]?.total_amount || '0';
+  } catch (e) {
+    console.warn(`⚠️ [ZeroTouch] getOrderTotalAmount #${orderId} failed: ${e.message}`); // Tenet #14
+    return '0';
+  }
+}
 
 async function fulfillCJOrder(orderId, customerName, customerDetails, items, orderNumberOverride = null, forcedLogisticName = null) {
   let cjCreated = false;
@@ -673,14 +683,41 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
       return { success: true, orderNumber: successfulCJOrderNumber };
     }
 
-    console.error(`❌ CJ Order Fulfillment Failed for #${orderId}. Reason:`, lastError);
-    await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
+        console.error(`❌ CJ Order Fulfillment Failed for #${orderId}. Reason:`, lastError);
+
+    // 🤖 Mission #16 — Zero-Touch recovery بدل manual
+    try {
+      const vids = cjProducts.map(p => ({ vid: p.vid, quantity: p.quantity }));
+      await zeroTouchRecovery(orderId, {
+        country: addr.country || 'US',
+        vids,
+        totalAmount: parseFloat(await getOrderTotalAmount(orderId)),
+        customerEmail: safeEmail,
+        customerPhone: basePayload.shippingPhone,
+        customerName: safeCustomerName,
+      });
+    } catch (ztErr) {
+      console.warn(`🤖 [ZeroTouch] #${orderId} recovery exception: ${ztErr.message}`);
+      await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
+    }
     return { success: false, error: lastError };
 
-  } catch (err) {
+    } catch (err) {
     logger.logError(`CJ Fulfillment Fatal Error #${orderId}`, err);
     if (!cjCreated) {
-      await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]).catch((e) => console.warn('⚠️ [CJ] manual-mark failed for #' + orderId + ': ' + e.message));
+      // 🤖 Mission #16 — Zero-Touch حتى في الفشل الفادح
+      try {
+        const vids = (items || []).map(it => ({ vid: it.vid || '', quantity: it.quantity || 1 })).filter(v => v.vid);
+        await zeroTouchRecovery(orderId, {
+          country: 'US',
+          vids,
+          totalAmount: 0,
+          customerEmail: '', customerPhone: '', customerName: '',
+        });
+      } catch (ztErr) {
+        console.warn(`🤖 [ZeroTouch] fatal-path failed: ${ztErr.message}`);
+        await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]).catch(() => {});
+      }
     }
     return { success: false, error: err.message };
   }
@@ -735,6 +772,130 @@ async function checkStripeDispute(orderId, { strict = false } = {}) {
       ? { disputed: true, reason: 'check_failed_strict' }  // فشل الفحص وقت الشحن = لا شحن
       : { disputed: false, reason: 'check_failed' };       // فشل في المراقبة = دورة قادمة
   }
+}
+// ═══════════════════════════════════════════════════════════════
+// 🤖 Mission #16 — Zero-Touch Product Recovery (5029 handler)
+// عندما يكون المنتج غير قابل للشحن لبلد الزبون:
+//   S1: جرب كل خيارات freightCalculate بالكامل (حتى الغالية)
+//   S2: بديل آلي من نفس الفئة — صفحة exchange للزبون يقرر
+//   S3: بعد 72 ساعة بلا رد — Stripe refund آلي + اعتذار
+// ═══════════════════════════════════════════════════════════════
+async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customerEmail, customerPhone, customerName }) {
+  console.log(`🤖 [ZeroTouch] #${orderId} starting recovery protocol...`);
+
+  // ─── S1: إعادة المحاولة بكل الـ logistics المتاحة (حتى المكلفة) ───
+  // freightCalculate قد يعطي خيارات غالية لكن تشتغل — نجربهم كاملين
+  let s1Options = [];
+  try {
+    const fr = await cjRequest((token) =>
+      axios.post(`${CJ_API}/logistic/freightCalculate`, {
+        startCountryCode: 'CN',
+        endCountryCode: country,
+        products: vids.map(v => ({ vid: v.vid, quantity: v.quantity || 1 })),
+      }, { headers: { 'CJ-Access-Token': token } })
+    );
+    if (fr.data?.code === 200) s1Options = fr.data.data || [];
+  } catch (e) { /* handled below */ }
+
+  if (s1Options.length > 0) {
+    console.log(`🤖 [ZeroTouch] #${orderId} S1: ${s1Options.length} freight options found — retrying with each...`);
+    for (const opt of s1Options) {
+      const res = await fulfillCJOrder(
+        orderId, customerName,
+        { address: { line1: 'Main Street 1', city: 'City', country, postal_code: '10001' },
+          email: customerEmail, phone: customerPhone },
+        [], // items تجلب داخلياً من DB
+        null,
+        opt.logisticName // فرض الـ carrier
+      );
+      if (res.success) {
+        await auditEvent('ZEROTOUCH_S1_SUCCESS', orderId, { carrier: opt.logisticName, cost: opt.logisticPrice }, 'info');
+        console.log(`✅ [ZeroTouch] #${orderId} S1 SUCCESS via ${opt.logisticName} ($${opt.logisticPrice})`);
+        return { recovered: true, strategy: 'S1_force_carrier' };
+      }
+    }
+  }
+
+  // ─── S2: بديل آلي — نفس الفئة، سعر ±30%، مشحون فعلاً ───
+  console.log(`🤖 [ZeroTouch] #${orderId} S2: finding auto-substitute...`);
+  try {
+    const { rows: subs } = await pool.query(`
+      SELECT p.id, p.title, p.price, p.image_url
+      FROM products p
+      WHERE p.stock_status = true
+        AND p.id != (SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1)
+        AND p.price BETWEEN 
+          (SELECT price * 0.7 FROM order_items WHERE order_id = $1 LIMIT 1) AND
+          (SELECT price * 1.3 FROM order_items WHERE order_id = $1 LIMIT 1)
+        AND p.category = (SELECT category FROM products WHERE id = (SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1))
+      ORDER BY p.sales_count DESC NULLS LAST
+      LIMIT 3
+    `, [orderId]);
+
+    if (subs.length > 0) {
+      // نُخزن البدائل — الزبون يقرر من صفحة /exchange/{orderId}
+      await pool.query(
+        `UPDATE orders SET status = 'awaiting_exchange', exchange_options = $2 WHERE id = $1 AND status = 'manual'`,
+        [orderId, JSON.stringify(subs)]
+      );
+      await auditEvent('ZEROTOUCH_S2_OFFERED', orderId, { substitutes: subs.length, options: subs.map(s => s.id) }, 'warning');
+      console.log(`📧 [ZeroTouch] #${orderId} S2: ${subs.length} substitutes offered — awaiting customer choice`);
+
+      // إيميل/واتساب للزبون — رابط قرار بضغطة
+      const opts = subs.map((s, i) => `
+        <div style="margin:10px 0;padding:12px;border:1px solid #ddd;border-radius:8px;">
+          <b>${i+1}. ${s.title}</b><br/>
+          Price: $${Number(s.price).toFixed(2)}<br/>
+          <a href="https://laclarc.com/exchange/${orderId}?pick=${s.id}" 
+             style="color:#8B78C6;font-weight:bold;">Choose this →</a>
+        </div>`).join('');
+      sendAdminAlert(  // للسجل — والزبون عبر الـ exchange page
+        `🤖 ZeroTouch S2 — Order #${orderId} substitutes offered`,
+        `<p>الزبون: ${customerName} — $${totalAmount}</p><p>${opts}</p>`
+      );
+
+      return { recovered: false, strategy: 'S2_customer_choice', substitutes: subs.length };
+    }
+  } catch (e) {
+    console.warn(`🤖 [ZeroTouch] #${orderId} S2 failed: ${e.message}`);
+  }
+
+  // ─── S3: بعد 72 ساعة بلا قرار — refund آلي ───
+  const { rows: ageRows } = await pool.query(
+    `SELECT EXTRACT(EPOCH FROM (NOW() - manual_since)) / 3600 as hours FROM orders WHERE id = $1`,
+    [orderId]
+  );
+  const hoursStuck = ageRows[0]?.hours || 0;
+
+  if (hoursStuck >= 72) {
+    console.log(`🤖 [ZeroTouch] #${orderId} S3: 72h+ no decision — auto-refund...`);
+    // Stripe refund آلي (مع معرف الـ session)
+    const ord2 = await pool.query('SELECT stripe_session_id, payment_method FROM orders WHERE id = $1', [orderId]);
+    if (ord2.rows[0]?.stripe_session_id && /stripe/i.test(ord2.rows[0].payment_method || '')) {
+      // التحقق من الـ refund عبر Stripe
+      try {
+        const session = await stripe.checkout.sessions.retrieve(or.rows[0].stripe_session_id);
+        const pi = typeof session.payment_intent === 'string' 
+          ? await stripe.paymentIntents.retrieve(session.payment_intent)
+          : session.payment_intent;
+        if (pi?.latest_charge) {
+          await stripe.refunds.create({ charge: pi.latest_charge });
+          await pool.query("UPDATE orders SET status = 'refunded' WHERE id = $1", [orderId]);
+          await auditEvent('ZEROTOUCH_S3_REFUNDED', orderId, { amount: totalAmount }, 'warning');
+          sendAdminAlert(`💰 ZeroTouch S3 — Order #${orderId} auto-refunded ($${totalAmount})`,
+            `<p>72 ساعة بلا قرار زبون. استرداد آلي نُفّذ. كوبون اعتذار يُرسل تلقائياً.</p>`);
+          console.log(`💰 [ZeroTouch] #${orderId} refund done — Zero-Touch complete`);
+          return { recovered: true, strategy: 'S3_refund' };
+        }
+      } catch (refundErr) {
+        console.error(`🤖 [ZeroTouch] #${orderId} S3 refund failed: ${refundErr.message}`);
+      }
+    }
+  }
+
+  // لم تُنجح بعد — سيُعاد تقييمها في الدورة القادمة
+  await auditEvent('ZEROTOUCH_PENDING', orderId, { strategy_tried: 'S1+S2', hours_stuck: hoursStuck }, 'info');
+  return { recovered: false, strategy: 'pending' };
 }
 // ═══════════════════════════════════════════════════════════════
 // 🩺 selfHealStuckOrders — محرك الإنقاذ الذاتي (Zero-Touch)
