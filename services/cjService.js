@@ -1,4 +1,4 @@
-// services/cjService.js - Laclarc Enterprise Dropshipping Engine (v2.1 FINAL)
+// services/cjService.js - Laclarc Enterprise Dropshipping Engine (v3 FINAL)
 require('dotenv').config();
 const axios = require('axios');
 const pool = require('../db');
@@ -11,7 +11,7 @@ const { sendPurchaseConversion } = require('./conversionService');
 let cachedCjToken = null;
 let cachedCjTokenExpiry = null;
 let cachedCjRefreshToken = null;
-let tokenRefreshPromise = null; // ✨ حماية ضد تسابق التوكن (Mutex Lock)
+let tokenRefreshPromise = null; // ✨ Mutex — حماية ضد تسابق التوكن
 
 // ==========================================
 // 1. نظام إدارة وتجديد التوكن المحصن (Thread-Safe)
@@ -124,11 +124,10 @@ const parseNumeric = (val) => {
 };
 
 // ==========================================
-// 🔧 Helpers على مستوى الملف — مصدر واحد للحقيقة (مستعملين من fulfillCJOrder + probeOrderStatus)
+// 🔧 Helpers — مستوى الملف
 // ==========================================
 const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
 
-// 🆕 Fix#4 — الحالات الميتة: الرقم محتجز لقمامة → ترقية إجبارية
 const DEAD_CJ_STATUSES = ['TRASH', 'CANCELLED', 'CLOSED', 'INTERCEPTED'];
 
 function extractCjNumber(dataObj) {
@@ -148,7 +147,6 @@ function sampleOnce(tag, obj) {
   }
 }
 
-// 🆕 Fix#4 — فحص حيوية الطلب الموجود عند CJ (مستعمل في معالجي 1603003)
 async function probeOrderStatus(targetOrderNumber, tag) {
   try {
     await new Promise(r => setTimeout(r, 1200));
@@ -167,7 +165,9 @@ async function probeOrderStatus(targetOrderNumber, tag) {
     return { status: 'UNKNOWN', realCj: null };
   }
 }
-// 📋 auditEvent — كل قرار آلي يترك أثراً دائماً (الشفافية للنظام الذاتي)
+
+// 📋 auditEvent — كل قرار آلي يترك أثراً دائماً
+// ⚠️ TODO (backlog): مركزية عبر lib/audit بعد توحيد CJS/ESM — النسخة المحلية مؤقتاً
 async function auditEvent(eventType, orderId, details = {}, severity = 'info') {
   try {
     await pool.query(
@@ -178,12 +178,9 @@ async function auditEvent(eventType, orderId, details = {}, severity = 'info') {
     console.warn(`⚠️ [Audit] فشل تسجيل ${eventType}#${orderId}: ${e.message}`); // Tenet #14
   }
 }
+
 // ═══════════════════════════════════════════════════════════════
-// 🏦 financialGate — العقود المالي المطلق (Tenet مؤسس)
-// "قبل ما يبعث لـ CJ — الدراهم مؤكدة في الحساب. مهما كان المسار، مهما كان متى."
-// نقطة تفتيش مالية واحدة: كل نداء fulfillCJOrder (webhook/JIT/cron/self-heal)
-// يعيد التحقق المباشر من مصدر الدفع نفسه — لا ثقة في DB ولا في الحالة الوسطى.
-// fail-closed: أي فشل/شذوذ = رفض + لوج. (Tenet #14: كل فشل يكلّم)
+// 🏦 financialGate — العقد المالي المطلق (Tenet #15)
 // ═══════════════════════════════════════════════════════════════
 
 async function financialGate(orderId) {
@@ -198,18 +195,18 @@ async function financialGate(orderId) {
     const expectedUsd = Number(o.total_amount);
     const method = String(o.payment_method || '').toLowerCase();
 
-    // ─── Crypto / NowPayments: استجواب مباشر — الأصل المثبت ───
+    // ─── Crypto / NowPayments ───
     if (/crypto|nowpayments/i.test(method)) {
-      if (!o.payment_ref) { 
+      if (!o.payment_ref) {
         await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'crypto', reason: 'no_payment_ref' }, 'warning');
-        console.warn(`[FinGate] #${orderId} crypto بلا payment_ref — رفض احتياطي`); 
-        return { allow: false, reason: 'no_payment_ref' }; 
+        console.warn(`[FinGate] #${orderId} crypto بلا payment_ref — رفض احتياطي`);
+        return { allow: false, reason: 'no_payment_ref' };
       }
       const key = process.env.NOWPAYMENTS_API_KEY;
-      if (!key) { 
+      if (!key) {
         await auditEvent('FINANCIAL_GATE_ERROR', orderId, { method: 'crypto', reason: 'no_api_key' }, 'critical');
-        console.error(`[FinGate] #${orderId} NOWPAYMENTS_API_KEY ناقص`); 
-        return { allow: false, reason: 'no_api_key' }; 
+        console.error(`[FinGate] #${orderId} NOWPAYMENTS_API_KEY ناقص`);
+        return { allow: false, reason: 'no_api_key' };
       }
       const res = await axios.get(`https://api.nowpayments.io/v1/payment/${o.payment_ref}`, {
         headers: { 'x-api-key': key }, timeout: 15000
@@ -223,12 +220,12 @@ async function financialGate(orderId) {
       return ok ? { allow: true } : { allow: false, reason: `crypto_${st}_${paidUsd}` };
     }
 
-    // ─── Stripe: استجواب الجلسة مباشرة + فحص الـ dispute (وحش أقصى) ───
+    // ─── Stripe ───
     if (/stripe/i.test(method)) {
-      if (!o.stripe_session_id) { 
+      if (!o.stripe_session_id) {
         await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'stripe', reason: 'no_session_id' }, 'warning');
-        console.warn(`[FinGate] #${orderId} stripe بلا session_id — رفض احتياطي`); 
-        return { allow: false, reason: 'no_session_id' }; 
+        console.warn(`[FinGate] #${orderId} stripe بلا session_id — رفض احتياطي`);
+        return { allow: false, reason: 'no_session_id' };
       }
       const session = await stripe.checkout.sessions.retrieve(o.stripe_session_id);
       if (!session || session.payment_status !== 'paid') {
@@ -237,13 +234,11 @@ async function financialGate(orderId) {
         return { allow: false, reason: `stripe_${session?.payment_status || 'missing'}` };
       }
       const paidUsd = session.amount_total / 100;
-      // مطابقة المبلغ بالسنت — حماية ضد أي تعديل DB خارجي
       if (Math.abs(paidUsd - expectedUsd) > 0.011) {
         await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'stripe', reason: 'amount_mismatch', stripeAmt: paidUsd, dbAmt: expectedUsd }, 'critical');
         console.error(`[FinGate] #${orderId} STRIPE amount mismatch: stripe=${paidUsd} db=${expectedUsd} => DENY`);
         return { allow: false, reason: `stripe_amount_mismatch_${paidUsd}` };
       }
-      // فحص dispute على الـ charge الأحدث (وحش أقصى — chargeback قبل الشحن)
       try {
         const pi = typeof session.payment_intent === 'string'
           ? await stripe.paymentIntents.retrieve(session.payment_intent, { expand: ['latest_charge'] })
@@ -255,14 +250,13 @@ async function financialGate(orderId) {
           return { allow: false, reason: 'stripe_disputed' };
         }
       } catch (dispErr) {
-        // فحص الـ dispute تحسيني — فشله لا يمنع (paid من Stripe يكفي)، بصق يُسجل (Tenet #14)
         console.warn(`[FinGate] #${orderId} dispute-check skipped: ${dispErr.message}`);
       }
       console.log(`[FinGate] #${orderId} STRIPE paid=${paidUsd} => ALLOW`);
       return { allow: true };
     }
 
-    // ─── Paysera: التأكيد الموثق = callback الموقّع (md5 signature) المسجل في DB ───
+    // ─── Paysera ───
     if (/paysera/i.test(method)) {
       const ok = o.payment_status === 'paid' || String(o.status) === 'paid';
       console.log(`[FinGate] #${orderId} PAYSERA db_status=${o.status}/${o.payment_status} => ${ok ? 'ALLOW (callback-signed)' : 'DENY'}`);
@@ -270,7 +264,7 @@ async function financialGate(orderId) {
       return ok ? { allow: true } : { allow: false, reason: 'paysera_not_paid' };
     }
 
-    // ─── BaridiMob: approval بشري موثق (dossier مُدقق) هو التوقيع المالي ───
+    // ─── BaridiMob ───
     if (/baridi|manual/i.test(method)) {
       const approved = /paid|approved/i.test(String(o.payment_status || '')) || String(o.status) === 'paid';
       console.log(`[FinGate] #${orderId} BARIDIMOB payment_status=${o.payment_status} => ${approved ? 'ALLOW (admin-approved)' : 'DENY'}`);
@@ -278,7 +272,7 @@ async function financialGate(orderId) {
       return approved ? { allow: true } : { allow: false, reason: 'baridimob_not_approved' };
     }
 
-    // ─── طريقة غير معروفة: رفض صارم (fail-closed — لا مسارات مجهولة للمال) ───
+    // ─── Unknown ───
     await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: o.payment_method, reason: 'unknown_method' }, 'critical');
     console.error(`[FinGate] #${orderId} UNKNOWN payment_method="${o.payment_method}" => DENY`);
     return { allow: false, reason: `unknown_method_${o.payment_method}` };
@@ -286,7 +280,7 @@ async function financialGate(orderId) {
   } catch (e) {
     logger.logError(`financialGate #${orderId}`, e);
     await auditEvent('FINANCIAL_GATE_ERROR', orderId, { error: e.message }, 'critical');
-    return { allow: false, reason: 'gate_error' }; // فشل التحقق = رفض. دوماً.
+    return { allow: false, reason: 'gate_error' };
   }
 }
 
@@ -316,9 +310,9 @@ async function getOrderTotalAmount(orderId) {
   }
 }
 
-async function fulfillCJOrder(orderId, customerName, customerDetails, items, orderNumberOverride = null, forcedLogisticName = null) {
+async function fulfillCJOrder(orderId, customerName, customerDetails, items, orderNumberOverride = null, forcedLogisticName = null, flags = {}) {
   let cjCreated = false;
-  // 🏦 financialGate — العقود المالي المطلق: كل المسارات، كل الأزمنة (Tenet مؤسس)
+  // 🏦 financialGate — Tenet #15
   const _gate = await financialGate(orderId);
   if (!_gate.allow) {
     console.error('[FinGate] رفض إرسال #' + orderId + ' لـ CJ: ' + _gate.reason);
@@ -354,7 +348,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
             }))
           : [];
 
-                sendPurchaseConversion({
+        sendPurchaseConversion({
           orderId,
           value: parseFloat(order.total_amount),
           items: capiItems,
@@ -362,7 +356,6 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
           phone:        order.customer_phone,
           customerName: order.customer_name,
           city:         order.customer_city,
-          // 🆕 Mission #12: الإسناد يسافر مع الحدث
           utmSource:    order.utm_source,
           utmCampaign:  order.utm_campaign,
           clickId:      order.click_id,
@@ -374,7 +367,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
       }
     })();
 
-    // استخراج الـ vid المؤكد + storeLineItemId
+    // استخراج الـ vid + storeLineItemId
     const cjProducts = [];
     for (const item of items) {
       let vid = item.vid;
@@ -396,11 +389,11 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
 
     if (cjProducts.length === 0) {
       console.warn(`⚠️ Order #${orderId} contains no valid CJ variants. Marked as manual.`);
-      await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
+      await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
       return { success: false, reason: 'NO_CJ_VARIANTS' };
     }
 
-    // استعلام أفضل شركات الشحن
+    // استعلام شركات الشحن
     let logisticsToTry = [];
     try {
       const freightRes = await cjRequest((token) =>
@@ -416,7 +409,6 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
     } catch (e) { console.warn("⚠️ [Fulfill] freightCalculate failed #" + orderId + ": " + e.message); }
 
     if (forcedLogisticName) logisticsToTry = [forcedLogisticName];
-    // 🆕 Patch 4 (درس #69): لا فرض جغرافي — freightCalculate المرتب بالسعر هو الأصدق لكل SKU
     else logisticsToTry = [...new Set([...logisticsToTry, 'CJPacket Ordinary', 'CJPacket Sensitive', 'YunExpress', '4PX'])];
 
     let orderSuccess = false;
@@ -424,7 +416,6 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
     let needsSplitting = false;
     let successfulCJOrderNumber = null;
 
-    // 🆕 Fix#4: رقم قابل للترقية — القمامة تحتجز STORE-{id} (درس #69)
     let orderNumberSeed = orderNumberOverride || `STORE-${orderId}`;
     let numberBump = 1;
 
@@ -460,7 +451,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
 
     // 1. محاولة الإرسال المجمّع
     for (const logisticName of logisticsToTry) {
-      const targetOrderNumber = orderNumberSeed; // 🆕 Fix#4: من الـ seed القابل للترقية
+      const targetOrderNumber = orderNumberSeed;
       const cjOrderPayload = {
         ...basePayload,
         orderNumber: targetOrderNumber,
@@ -469,7 +460,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
       };
 
       try {
-        await new Promise(r => setTimeout(r, 1200)); // invariant #6 — QPS=1
+        await new Promise(r => setTimeout(r, 1200)); // Tenet #6
         const cjResponse = await cjRequest((token) =>
           axios.post(`${CJ_API}/shopping/order/createOrderV3`,
             cjOrderPayload,
@@ -487,20 +478,18 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
           successfulCJOrderNumber = extractCjNumber(cjResponse.data?.data) || targetOrderNumber;
 
           if (cjResponse.data?.data?.logisticsMiss === true) {
-            // 🤖 logisticsMiss=true = "نجاح زائف" — بروتوكول:
-            // repair → فشل؟ delete + ترقية → carrier الموالي → فشل الحذف؟ قبول + إنذار
             console.warn(`[CJ] #${orderId} logisticsMiss=true (${logisticName}) — repair attempt...`);
             const rep = await autoRepairLogistics(successfulCJOrderNumber);
             if (rep.repaired) {
               console.log(`[CJ] #${orderId} logistics bound: ${rep.logisticsName} ($${rep.postage})`);
               await saveCjNumber(successfulCJOrderNumber);
-              break; // ✅ نجاح حقيقي
+              await auditEvent('SELFHEAL_LOGISTICS_BOUND', orderId, { carrier: rep.logisticsName, postage: rep.postage }, 'info');
+              break;
             }
 
             console.warn(`[CJ] #${orderId} auto-repair failed: ${rep.reason} — zombie risk. delete → next carrier...`);
             const del = await deleteCJOrder(successfulCJOrderNumber, targetOrderNumber);
             if (del.ok) {
-              // 🆕 Fix#4: رقم جديد — STORE-{id} محتجز للقمامة (درس #69)
               console.log(`🧹 [CJ] #${orderId} zombie (${successfulCJOrderNumber}) deleted — bumping number → next carrier`);
               cjCreated = false;
               orderSuccess = false;
@@ -519,7 +508,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
             break;
           }
           await saveCjNumber(successfulCJOrderNumber);
-          break; // ✅ نجاح عادي — logisticsMiss=false
+          break; // ✅ نجاح عادي
         }
 
         lastError = cjResponse.data;
@@ -530,7 +519,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
           break;
         }
 
-        // ✨ 1603003 = موجود أصلاً — 🆕 Fix#4: نجاح منطقي فقط إلا كان حياً
+        // ✨ 1603003 — Fix#4: نجاح منطقي فقط إلا كان حياً
         if (lastError.code === 1603003) {
           const probe = await probeOrderStatus(targetOrderNumber, 'OrderDetail');
 
@@ -552,9 +541,9 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
           break;
         }
 
-        // 💰 1605001 = محفظة فارغة → orderFlow:0
+        // 💰 1605001 — محفظة فارغة → orderFlow:0
         if (lastError.code === 1605001) {
-          console.warn(`💰 [CJ] #${orderId} محفظة فارغة — محاولة orderFlow:0 (انتظار الداع فالـ dashboard)...`);
+          console.warn(`💰 [CJ] #${orderId} محفظة فارغة — محاولة orderFlow:0...`);
           try {
             await new Promise(r => setTimeout(r, 1200));
             const retry = await cjRequest((token) =>
@@ -570,13 +559,12 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
               await saveCjNumber(successfulCJOrderNumber);
               console.log(`✅ [CJ] #${orderId} تسجل بـ orderFlow=0 — عمّر المحفظة باش يمشي للشحن`);
             }
-          } catch (e) { /* كنطيحو للفشل العادي تحت */ }
+          } catch (e) { /* للفشل العادي تحت */ }
           break;
         }
 
-        if (lastError.code === 1600200) break; // QPS — backoff موجود أصلاً فـ cjRequest
+        if (lastError.code === 1600200) break;
       } catch (err) {
-        // ✨ 1603003 كـ HTTP exception — 🆕 Fix#4: نفس فحص الموت
         if (err.response?.data?.code === 1603003) {
           const probe = await probeOrderStatus(targetOrderNumber, 'OrderDetail');
 
@@ -663,7 +651,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
         successfulCJOrderNumber = splitOrdersCreated.join(', ');
       } else if (successfulSplits > 0) {
         console.error(`🚨 Partial fulfillment on Order #${orderId}: ${successfulSplits}/${cjProducts.length} shipped.`);
-        await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [orderId]);
+        await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
         sendAdminAlert(
           `🚨 CJ Partial Fulfillment — Order #${orderId} (${successfulSplits}/${cjProducts.length})`,
           `<p>Splits الناجحين: <code>${splitOrdersCreated.join(', ')}</code></p>
@@ -683,51 +671,59 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
       return { success: true, orderNumber: successfulCJOrderNumber };
     }
 
-        console.error(`❌ CJ Order Fulfillment Failed for #${orderId}. Reason:`, lastError);
+    console.error(`❌ CJ Order Fulfillment Failed for #${orderId}. Reason:`, lastError);
 
     // 🤖 Mission #16 — Zero-Touch recovery بدل manual
-    try {
-      const vids = cjProducts.map(p => ({ vid: p.vid, quantity: p.quantity }));
-      await zeroTouchRecovery(orderId, {
-        country: addr.country || 'US',
-        vids,
-        totalAmount: parseFloat(await getOrderTotalAmount(orderId)),
-        customerEmail: safeEmail,
-        customerPhone: basePayload.shippingPhone,
-        customerName: safeCustomerName,
-      });
-    } catch (ztErr) {
-      console.warn(`🤖 [ZeroTouch] #${orderId} recovery exception: ${ztErr.message}`);
-      await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
+    // 🆕 Mission #17 — skipZeroTouch: من الحلقات الذاتية (inner S1 attempts)
+    if (!flags.skipZeroTouch) {
+      try {
+        const vids = cjProducts.map(p => ({ vid: p.vid, quantity: p.quantity }));
+        await zeroTouchRecovery(orderId, {
+          country: addr.country || 'US',
+          vids,
+          totalAmount: parseFloat(await getOrderTotalAmount(orderId)),
+          customerEmail: safeEmail,
+          customerPhone: basePayload.shippingPhone,
+          customerName: safeCustomerName,
+        });
+      } catch (ztErr) {
+        console.warn(`🤖 [ZeroTouch] #${orderId} recovery exception: ${ztErr.message}`);
+        await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
+      }
+    } else {
+      console.warn(`🤖 [ZeroTouch] #${orderId} skipped (inner S1 attempt)`);
     }
     return { success: false, error: lastError };
 
-    } catch (err) {
+  } catch (err) {
     logger.logError(`CJ Fulfillment Fatal Error #${orderId}`, err);
     if (!cjCreated) {
-      // 🤖 Mission #16 — Zero-Touch حتى في الفشل الفادح
-      try {
-        const vids = (items || []).map(it => ({ vid: it.vid || '', quantity: it.quantity || 1 })).filter(v => v.vid);
-        await zeroTouchRecovery(orderId, {
-          country: 'US',
-          vids,
-          totalAmount: 0,
-          customerEmail: '', customerPhone: '', customerName: '',
-        });
-      } catch (ztErr) {
-        console.warn(`🤖 [ZeroTouch] fatal-path failed: ${ztErr.message}`);
+      // 🤖 Mission #16 + #17 — Zero-Touch في الفشل الفادح (مع loop-guard عبر flags)
+      if (!flags.skipZeroTouch) {
+        try {
+          const vids = (items || []).map(it => ({ vid: it.vid || '', quantity: it.quantity || 1 })).filter(v => v.vid);
+          await zeroTouchRecovery(orderId, {
+            country: 'US',
+            vids,
+            totalAmount: parseFloat(await getOrderTotalAmount(orderId)),
+            customerEmail: customerDetails?.email || '',
+            customerPhone: customerDetails?.phone || '',
+            customerName: customerName || '',
+          });
+        } catch (ztErr) {
+          console.warn(`🤖 [ZeroTouch] fatal-path failed: ${ztErr.message}`);
+          await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]).catch(() => {});
+        }
+      } else {
         await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]).catch(() => {});
       }
     }
     return { success: false, error: err.message };
   }
 }
+
 // ═══════════════════════════════════════════════════════════════
-// ⚖️ checkStripeDispute — فحص مستقل للاعتراضات (chargebacks)
-// قابل للاستدعاء من: Watchdog cron + SHIPPED guard + أي مسار مستقبلي
-// Return: { disputed, reason?, chargeId? } — fail-open للـ network فقط
-// عند فحص الـ watchdog (الطلب ما يتعطلش لأن Stripe تعبت)، fail-closed
-// عند الحارس الأخير (SHIPPED — الشحن قرار لا رجعة فيه)
+// ⚖️ checkStripeDispute
 // ═══════════════════════════════════════════════════════════════
 async function checkStripeDispute(orderId, { strict = false } = {}) {
   try {
@@ -740,7 +736,6 @@ async function checkStripeDispute(orderId, { strict = false } = {}) {
     if (!/stripe/i.test(String(o.payment_method || ''))) return { disputed: false, reason: 'not_stripe' };
     if (!o.stripe_session_id) return { disputed: false, reason: 'no_session' };
 
-    // الجلسة → PaymentIntent → latest_charge (مع expand)
     const session = await stripe.checkout.sessions.retrieve(o.stripe_session_id);
     if (!session || session.payment_status !== 'paid') {
       return { disputed: false, reason: `not_paid_${session?.payment_status || 'missing'}` };
@@ -752,161 +747,179 @@ async function checkStripeDispute(orderId, { strict = false } = {}) {
 
     if (charge && typeof charge === 'object') {
       if (charge.disputed) {
-        const dv = typeof charge.dispute === 'object' && charge.dispute
-          ? charge.dispute
-          : null;
+        const dv = typeof charge.dispute === 'object' && charge.dispute ? charge.dispute : null;
         console.error(`⚖️ [DisputeWatch] #${orderId} DISPUTED! charge=${charge.id} status=${dv?.status || '?'}`);
         return { disputed: true, reason: `dispute_${dv?.status || 'open'}`, chargeId: charge.id };
       }
       return { disputed: false, chargeId: charge.id };
     }
 
-    // لا charge قابل للفحص — حسب الصرامة
     return strict
-      ? { disputed: true, reason: 'charge_unverifiable_strict' }  // الحارس الأخير: لا مجازفة
-      : { disputed: false, reason: 'no_charge_object' };          // الـ watchdog: تسامح
+      ? { disputed: true, reason: 'charge_unverifiable_strict' }
+      : { disputed: false, reason: 'no_charge_object' };
 
   } catch (e) {
     logger.logError(`checkStripeDispute #${orderId}`, e);
     return strict
-      ? { disputed: true, reason: 'check_failed_strict' }  // فشل الفحص وقت الشحن = لا شحن
-      : { disputed: false, reason: 'check_failed' };       // فشل في المراقبة = دورة قادمة
+      ? { disputed: true, reason: 'check_failed_strict' }
+      : { disputed: false, reason: 'check_failed' };
   }
 }
+
 // ═══════════════════════════════════════════════════════════════
-// 🤖 Mission #16 — Zero-Touch Product Recovery (5029 handler)
-// عندما يكون المنتج غير قابل للشحن لبلد الزبون:
-//   S1: جرب كل خيارات freightCalculate بالكامل (حتى الغالية)
-//   S2: بديل آلي من نفس الفئة — صفحة exchange للزبون يقرر
-//   S3: بعد 72 ساعة بلا رد — Stripe refund آلي + اعتذار
+// 🤖 zeroTouchRecovery — Mission #16 (S1→S2→S3) — محصّن ضد الحلقات
 // ═══════════════════════════════════════════════════════════════
+const zeroTouchGuard = new Set(); // 🆕 Mission #17 — loop guard
+
 async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customerEmail, customerPhone, customerName }) {
-  console.log(`🤖 [ZeroTouch] #${orderId} starting recovery protocol...`);
-
-  // ─── S1: إعادة المحاولة بكل الـ logistics المتاحة (حتى المكلفة) ───
-  // freightCalculate قد يعطي خيارات غالية لكن تشتغل — نجربهم كاملين
-  let s1Options = [];
-  try {
-    const fr = await cjRequest((token) =>
-      axios.post(`${CJ_API}/logistic/freightCalculate`, {
-        startCountryCode: 'CN',
-        endCountryCode: country,
-        products: vids.map(v => ({ vid: v.vid, quantity: v.quantity || 1 })),
-      }, { headers: { 'CJ-Access-Token': token } })
-    );
-    if (fr.data?.code === 200) s1Options = fr.data.data || [];
-  } catch (e) { /* handled below */ }
-
-  if (s1Options.length > 0) {
-    console.log(`🤖 [ZeroTouch] #${orderId} S1: ${s1Options.length} freight options found — retrying with each...`);
-    for (const opt of s1Options) {
-      const res = await fulfillCJOrder(
-        orderId, customerName,
-        { address: { line1: 'Main Street 1', city: 'City', country, postal_code: '10001' },
-          email: customerEmail, phone: customerPhone },
-        [], // items تجلب داخلياً من DB
-        null,
-        opt.logisticName // فرض الـ carrier
-      );
-      if (res.success) {
-        await auditEvent('ZEROTOUCH_S1_SUCCESS', orderId, { carrier: opt.logisticName, cost: opt.logisticPrice }, 'info');
-        console.log(`✅ [ZeroTouch] #${orderId} S1 SUCCESS via ${opt.logisticName} ($${opt.logisticPrice})`);
-        return { recovered: true, strategy: 'S1_force_carrier' };
-      }
-    }
+  // 🛡️ حلقة استدعاء ذاتية: recovery → fulfillCJOrder → recovery = ∞ — ممنوعة
+  if (zeroTouchGuard.has(orderId)) {
+    console.warn(`🤖 [ZeroTouch] #${orderId} already in recovery cycle — skipped (loop guard)`);
+    return { recovered: false, strategy: 'loop_guard' };
   }
+  zeroTouchGuard.add(orderId);
 
-  // ─── S2: بديل آلي — نفس الفئة، سعر ±30%، مشحون فعلاً ───
-  console.log(`🤖 [ZeroTouch] #${orderId} S2: finding auto-substitute...`);
   try {
-    const { rows: subs } = await pool.query(`
-      SELECT p.id, p.title, p.price, p.image_url
-      FROM products p
-      WHERE p.stock_status = true
-        AND p.id != (SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1)
-        AND p.price BETWEEN 
-          (SELECT price * 0.7 FROM order_items WHERE order_id = $1 LIMIT 1) AND
-          (SELECT price * 1.3 FROM order_items WHERE order_id = $1 LIMIT 1)
-        AND p.category = (SELECT category FROM products WHERE id = (SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1))
-      ORDER BY p.sales_count DESC NULLS LAST
-      LIMIT 3
-    `, [orderId]);
+    console.log(`🤖 [ZeroTouch] #${orderId} starting recovery protocol...`);
 
-    if (subs.length > 0) {
-      // نُخزن البدائل — الزبون يقرر من صفحة /exchange/{orderId}
-      await pool.query(
-        `UPDATE orders SET status = 'awaiting_exchange', exchange_options = $2 WHERE id = $1 AND status = 'manual'`,
-        [orderId, JSON.stringify(subs)]
+    // ─── S1: كل خيارات الشحن (حتى المكلفة) ───
+    let s1Options = [];
+    try {
+      const fr = await cjRequest((token) =>
+        axios.post(`${CJ_API}/logistic/freightCalculate`, {
+          startCountryCode: 'CN',
+          endCountryCode: country,
+          products: vids.map(v => ({ vid: v.vid, quantity: v.quantity || 1 })),
+        }, { headers: { 'CJ-Access-Token': token } })
       );
-      await auditEvent('ZEROTOUCH_S2_OFFERED', orderId, { substitutes: subs.length, options: subs.map(s => s.id) }, 'warning');
-      console.log(`📧 [ZeroTouch] #${orderId} S2: ${subs.length} substitutes offered — awaiting customer choice`);
+      if (fr.data?.code === 200) s1Options = fr.data.data || [];
+    } catch (e) { console.warn(`🤖 [ZeroTouch] S1 freight failed: ${e.message}`); }
 
-      // إيميل/واتساب للزبون — رابط قرار بضغطة
-      const opts = subs.map((s, i) => `
-        <div style="margin:10px 0;padding:12px;border:1px solid #ddd;border-radius:8px;">
-          <b>${i+1}. ${s.title}</b><br/>
-          Price: $${Number(s.price).toFixed(2)}<br/>
-          <a href="https://laclarc.com/exchange/${orderId}?pick=${s.id}" 
-             style="color:#8B78C6;font-weight:bold;">Choose this →</a>
-        </div>`).join('');
-      sendAdminAlert(  // للسجل — والزبون عبر الـ exchange page
-        `🤖 ZeroTouch S2 — Order #${orderId} substitutes offered`,
-        `<p>الزبون: ${customerName} — $${totalAmount}</p><p>${opts}</p>`
-      );
+    if (s1Options.length > 0) {
+      console.log(`🤖 [ZeroTouch] #${orderId} S1: ${s1Options.length} freight options — retrying with each...`);
+      for (const opt of s1Options) {
+        // نحتاج العناصر الكاملة من DB — attemptRefulfill-style لكن بفرض carrier
+        try {
+          const itemsRes = await pool.query(`
+            SELECT oi.*, p.title, p.image_url
+            FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id
+            WHERE oi.order_id = $1`, [orderId]);
+          const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+          const ord = orderRes.rows[0];
+          if (!ord) continue;
 
-      return { recovered: false, strategy: 'S2_customer_choice', substitutes: subs.length };
-    }
-  } catch (e) {
-    console.warn(`🤖 [ZeroTouch] #${orderId} S2 failed: ${e.message}`);
-  }
+          const customerDetails = {
+            email: customerEmail || ord.customer_email || undefined,
+            phone: customerPhone || ord.customer_phone || undefined,
+            address: (() => {
+              try { return JSON.parse(ord.shipping_address || '{}'); }
+              catch { return { line1: ord.shipping_address || 'N/A', country }; }
+            })(),
+          };
 
-  // ─── S3: بعد 72 ساعة بلا قرار — refund آلي ───
-  const { rows: ageRows } = await pool.query(
-    `SELECT EXTRACT(EPOCH FROM (NOW() - manual_since)) / 3600 as hours FROM orders WHERE id = $1`,
-    [orderId]
-  );
-  const hoursStuck = ageRows[0]?.hours || 0;
-
-  if (hoursStuck >= 72) {
-    console.log(`🤖 [ZeroTouch] #${orderId} S3: 72h+ no decision — auto-refund...`);
-    // Stripe refund آلي (مع معرف الـ session)
-    const ord2 = await pool.query('SELECT stripe_session_id, payment_method FROM orders WHERE id = $1', [orderId]);
-    if (ord2.rows[0]?.stripe_session_id && /stripe/i.test(ord2.rows[0].payment_method || '')) {
-      // التحقق من الـ refund عبر Stripe
-      try {
-        const session = await stripe.checkout.sessions.retrieve(or.rows[0].stripe_session_id);
-        const pi = typeof session.payment_intent === 'string' 
-          ? await stripe.paymentIntents.retrieve(session.payment_intent)
-          : session.payment_intent;
-        if (pi?.latest_charge) {
-          await stripe.refunds.create({ charge: pi.latest_charge });
-          await pool.query("UPDATE orders SET status = 'refunded' WHERE id = $1", [orderId]);
-          await auditEvent('ZEROTOUCH_S3_REFUNDED', orderId, { amount: totalAmount }, 'warning');
-          sendAdminAlert(`💰 ZeroTouch S3 — Order #${orderId} auto-refunded ($${totalAmount})`,
-            `<p>72 ساعة بلا قرار زبون. استرداد آلي نُفّذ. كوبون اعتذار يُرسل تلقائياً.</p>`);
-          console.log(`💰 [ZeroTouch] #${orderId} refund done — Zero-Touch complete`);
-          return { recovered: true, strategy: 'S3_refund' };
+          const res = await fulfillCJOrder(
+            orderId, customerName || ord.customer_name,
+            customerDetails,
+            itemsRes.rows,
+            null,
+            opt.logisticName,
+            { skipZeroTouch: true }   // 🆕 #17 — لا استدعاء ذاتي
+          );
+          if (res.success) {
+            await auditEvent('ZEROTOUCH_S1_SUCCESS', orderId, { carrier: opt.logisticName, cost: opt.logisticPrice }, 'info');
+            console.log(`✅ [ZeroTouch] #${orderId} S1 SUCCESS via ${opt.logisticName} ($${opt.logisticPrice})`);
+            return { recovered: true, strategy: 'S1_force_carrier' };
+          }
+        } catch (e) {
+          console.warn(`🤖 [ZeroTouch] #${orderId} S1 attempt (${opt.logisticName}) failed: ${e.message}`);
         }
-      } catch (refundErr) {
-        console.error(`🤖 [ZeroTouch] #${orderId} S3 refund failed: ${refundErr.message}`);
       }
     }
-  }
 
-  // لم تُنجح بعد — سيُعاد تقييمها في الدورة القادمة
-  await auditEvent('ZEROTOUCH_PENDING', orderId, { strategy_tried: 'S1+S2', hours_stuck: hoursStuck }, 'info');
-  return { recovered: false, strategy: 'pending' };
+    // ─── S2: بديل آلي — نفس الفئة، سعر ±30% ───
+    console.log(`🤖 [ZeroTouch] #${orderId} S2: finding auto-substitute...`);
+    try {
+      const { rows: subs } = await pool.query(`
+        SELECT p.id, p.title, p.price, p.image_url
+        FROM products p
+        WHERE p.stock_status = true
+          AND p.id != (SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1)
+          AND p.price BETWEEN 
+            (SELECT price * 0.7 FROM order_items WHERE order_id = $1 LIMIT 1) AND
+            (SELECT price * 1.3 FROM order_items WHERE order_id = $1 LIMIT 1)
+          AND p.category = (SELECT category FROM products WHERE id = (SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1))
+        ORDER BY p.sales_count DESC NULLS LAST
+        LIMIT 3
+      `, [orderId]);
+
+      if (subs.length > 0) {
+        await pool.query(
+          `UPDATE orders SET status = 'awaiting_exchange', exchange_options = $2, manual_since = NOW() WHERE id = $1 AND status IN ('manual', 'paid')`,
+          [orderId, JSON.stringify(subs)]
+        );
+        await auditEvent('ZEROTOUCH_S2_OFFERED', orderId, { substitutes: subs.length, options: subs.map(s => s.id) }, 'warning');
+        console.log(`📧 [ZeroTouch] #${orderId} S2: ${subs.length} substitutes offered — awaiting customer choice`);
+
+        const optsHtml = subs.map((s, i) => `
+          <div style="margin:10px 0;padding:12px;border:1px solid #ddd;border-radius:8px;">
+            <b>${i+1}. ${s.title}</b><br/>
+            Price: $${Number(s.price).toFixed(2)}<br/>
+            <a href="https://laclarc.com/exchange/${orderId}" 
+               style="color:#8B78C6;font-weight:bold;">Choose your replacement →</a>
+          </div>`).join('');
+        sendAdminAlert(
+          `🤖 ZeroTouch S2 — Order #${orderId} substitutes offered`,
+          `<p>الزبون: ${customerName} — $${totalAmount}</p>${optsHtml}`
+        );
+
+        return { recovered: false, strategy: 'S2_customer_choice', substitutes: subs.length };
+      }
+    } catch (e) {
+      console.warn(`🤖 [ZeroTouch] #${orderId} S2 failed: ${e.message}`);
+    }
+
+    // ─── S3: بعد 72 ساعة بلا قرار — refund آلي ───
+    const { rows: ageRows } = await pool.query(
+      `SELECT EXTRACT(EPOCH FROM (NOW() - COALESCE(manual_since, created_at))) / 3600 as hours FROM orders WHERE id = $1`,
+      [orderId]
+    );
+    const hoursStuck = ageRows[0]?.hours || 0;
+
+    if (hoursStuck >= 72) {
+      console.log(`🤖 [ZeroTouch] #${orderId} S3: 72h+ no decision — auto-refund...`);
+      const ord2 = await pool.query('SELECT stripe_session_id, payment_method FROM orders WHERE id = $1', [orderId]);
+      if (ord2.rows[0]?.stripe_session_id && /stripe/i.test(ord2.rows[0].payment_method || '')) {
+        try {
+          const session = await stripe.checkout.sessions.retrieve(ord2.rows[0].stripe_session_id);
+          const pi = typeof session.payment_intent === 'string'
+            ? await stripe.paymentIntents.retrieve(session.payment_intent)
+            : session.payment_intent;
+          if (pi?.latest_charge) {
+            await stripe.refunds.create({ charge: pi.latest_charge });
+            await pool.query("UPDATE orders SET status = 'refunded' WHERE id = $1", [orderId]);
+            await auditEvent('ZEROTOUCH_S3_REFUNDED', orderId, { amount: totalAmount }, 'warning');
+            sendAdminAlert(`💰 ZeroTouch S3 — Order #${orderId} auto-refunded ($${totalAmount})`,
+              `<p>72 ساعة بلا قرار زبون. استرداد آلي نُفّذ.</p>`);
+            console.log(`💰 [ZeroTouch] #${orderId} refund done — Zero-Touch complete`);
+            return { recovered: true, strategy: 'S3_refund' };
+          }
+        } catch (refundErr) {
+          console.error(`🤖 [ZeroTouch] #${orderId} S3 refund failed: ${refundErr.message}`);
+        }
+      }
+    }
+
+    await auditEvent('ZEROTOUCH_PENDING', orderId, { strategy_tried: 'S1+S2', hours_stuck: hoursStuck }, 'info');
+    return { recovered: false, strategy: 'pending' };
+  } finally {
+    zeroTouchGuard.delete(orderId); // 🛡️ دائماً — نظافة الحارس
+  }
 }
+
 // ═══════════════════════════════════════════════════════════════
-// 🩺 selfHealStuckOrders — محرك الإنقاذ الذاتي (Zero-Touch)
-// يكتشف الطلبات المدفوعة عندنا العالقة عند CJ (CREATED غير مدفوع/زومبي)
-// ويعالجها آلياً عبر 3 طبقات — القرار البشري فقط للمستحيل:
-//   L1: حذف الزومبي → إعادة fulfillment (المحرك المجرب كامل)
-//   L2: payBalance (الدراهم مستحقة أصلاً — بلا سقف: COGS مستحق)
-//   L3: manual + إيميل (فقط لما تنفد كل الحلول الآلية)
-// حالات خاصة: نفاد محفظة CJ → إيميل تشغيلي (تزويد مورد — الحل الوحيد بشري)
+// 🩺 selfHealStuckOrders — محصّن (لا مسح بلا شهادة موت — Tenet #18)
 // ═══════════════════════════════════════════════════════════════
-const healAttempts = new Map();   // orderId → { count, lastAt }
+const healAttempts = new Map();
 const HEAL_MAX_ATTEMPTS = 3;
 
 async function selfHealStuckOrders() {
@@ -914,7 +927,6 @@ async function selfHealStuckOrders() {
   let scanned = 0, healed1 = 0, healed2 = 0, manualized = 0, walletAlerted = false;
 
   try {
-    // 1. الاصطياد: مدفوع عندنا + مُسنَد لـ CJ + عمره > 24h (القديم أولاً)
     const { rows: candidates } = await pool.query(`
       SELECT id, cj_order_number, total_amount, customer_name, customer_email, created_at
       FROM orders
@@ -926,12 +938,11 @@ async function selfHealStuckOrders() {
     `);
     if (candidates.length === 0) { console.log('🩺 [SelfHeal] clean — no candidates.'); return; }
 
-    // 2. فحص الحالة عند CJ — batch (1 نداء/50) مع fallback فردي
     let detailsMap = new Map();
     const codes = candidates.map(c => c.cj_order_number);
     try {
       const batch = await cjRequest((token) =>
-        axios.post(`${CJ_API}/shopping/order/getOrderDetailBatch`, { orderIds: codes }, 
+        axios.post(`${CJ_API}/shopping/order/getOrderDetailBatch`, { orderIds: codes },
           { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } })
       );
       if (batch.data?.code === 200) {
@@ -944,18 +955,16 @@ async function selfHealStuckOrders() {
       console.warn(`🩺 [SelfHeal] batch failed (${batchErr.message}) — falling back to individual probes`);
     }
 
-    // 3. المعالجة حسب الحالة
     for (const cand of candidates) {
       scanned++;
       const oid = cand.id;
       const code = cand.cj_order_number;
 
-      // عدّاد المحاولات — الحارس ضد الحلقات اللانهائية
-      const att = healAttempts.get(oid) || { count: 0, lastAt: 0 };
+      const att = healAttempts.get(oid) || { count: 0, lastAt: Date.now() };
       if (att.count >= HEAL_MAX_ATTEMPTS) {
-        // L3: المستحيل — استنفد كل شيء
-        await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1 AND status = 'paid'", [oid]);
+        await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'paid'", [oid]);
         manualized++;
+        await auditEvent('SELFHEAL_MANUALIZED', oid, { code, attempts: att.count }, 'critical');
         console.error(`🩺 [SelfHeal] #${oid} exhausted ${HEAL_MAX_ATTEMPTS} attempts → manual + admin alert`);
         sendAdminAlert(
           `🚨 SelfHeal exhausted — Order #${oid} (${code})`,
@@ -965,13 +974,11 @@ async function selfHealStuckOrders() {
         continue;
       }
 
-      // جلب التفاصيل (batch أو فردي)
       let info = detailsMap.get(String(code));
       if (!info) {
         try {
           const probe = await probeOrderStatus(code, 'SelfHeal');
           info = { orderStatus: probe.status, cjOrderCode: probe.realCj || code, paymentDate: null };
-          // probeOrderStatus لا يجيب paymentDate — نستكمله بنداء مفصل فقط عند الحاجة (Layer 2)
         } catch (e) {
           console.warn(`🩺 [SelfHeal] #${oid} probe failed: ${e.message} — skipped this cycle`);
           continue;
@@ -979,39 +986,42 @@ async function selfHealStuckOrders() {
       }
 
       const cjStatus = String(info.orderStatus || '').toUpperCase();
-      const isAlive = !DEAD_CJ_STATUSES.includes(cjStatus) && cjStatus !== 'CREATED_UNPAID';
       const paymentDate = info.paymentDate ?? null;
 
-      // ✅ حي ومتحرك (فوق CREATED) — سكت. لا ضجيج.
-      if (cjStatus && cjStatus !== 'CREATED' && !DEAD_CJ_STATUSES.includes(cjStatus)) {
-        healAttempts.delete(oid); // نشاط حي = عداد reset
+      // 🛡️ Tenet #18 — probe UNKNOWN ≠ زومبي: skip بلا مسح
+      if (!cjStatus || cjStatus === 'UNKNOWN') {
+        console.warn(`🩺 [SelfHeal] #${oid} probe UNKNOWN — skip cycle (no destruction)`);
         continue;
       }
 
-      // 🔴 ميت (TRASH/CANCELLED...) — مصيره مختلف عن الزومبي: تصحيح حالة + إعادة fulfillment نظيفة
+      // ✅ حي ومتحرك — سكت
+      if (cjStatus !== 'CREATED' && !DEAD_CJ_STATUSES.includes(cjStatus)) {
+        healAttempts.delete(oid);
+        continue;
+      }
+
+      // 🔴 DEAD مؤكد — تصحيح + إعادة fulfillment نظيفة
       if (DEAD_CJ_STATUSES.includes(cjStatus)) {
         console.warn(`🩺 [SelfHeal] #${oid} DEAD at CJ (${cjStatus}) — clearing code, re-fulfilling fresh...`);
         await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
         await attemptRefulfill(oid, cand, 'dead-order');
-        att.count++; healAttempts.set(oid, att);
+        att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att);
         continue;
       }
 
-      // 🧟 زومبي (CREATED فقط) — الفرع الرئيسي
-      // L1: حذف الزومبي → إعادة fulfillment بالمحرك المجرب
+      // 🧟 زومبي CREATED مؤكد — L1
       console.log(`🩺 [SelfHeal] #${oid} zombie CREATED (${code}) — L1: delete → re-fulfill (attempt ${att.count + 1}/${HEAL_MAX_ATTEMPTS})`);
       const del = await deleteCJOrder(code, `STORE-${oid}`);
       if (del.ok) {
         console.log(`🧹 [SelfHeal] #${oid} zombie deleted — re-fulfilling...`);
-        await auditEvent('SELFHEAL_MANUALIZED', oid, { code, attempts: att.count }, 'critical');
+        await auditEvent('SELFHEAL_DELETE', oid, { code }, 'info');
         await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
         const ok = await attemptRefulfill(oid, cand, 'zombie-recreate');
-        if (ok) { healed1++; att.count++; healAttempts.set(oid, att); continue; }
+        if (ok) { healed1++; att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att); continue; }
       }
 
-      // L2: الحذف فشل (CJ بدا يحرك) أو الـ re-fulfill فشل → payBalance (الدراهم مستحقة — بلا سقف)
+      // L2 — payBalance
       console.log(`🩺 [SelfHeal] #${oid} L2: payBalance route (${code})...`);
-      // فحص paymentDate مباشر قبل الدفع (حماية مزدوجة الدفع)
       let pd = null;
       try {
         const tk = await getCJToken();
@@ -1019,17 +1029,18 @@ async function selfHealStuckOrders() {
           params: { orderId: code }, headers: { 'CJ-Access-Token': tk }, timeout: 20000 });
         const ii = det.data?.data?.orderInfo || det.data?.data || {};
         pd = ii.paymentDate || null;
-        if (String(ii.orderStatus || '').toUpperCase() === 'TRASH') {
-          console.warn(`🩺 [SelfHeal] #${oid} is TRASH at detail-level — clearing + re-fulfill`);
+        const detailStatus = String(ii.orderStatus || '').toUpperCase();
+        if (DEAD_CJ_STATUSES.includes(detailStatus)) {
+          console.warn(`🩺 [SelfHeal] #${oid} is ${detailStatus} at detail-level — clearing + re-fulfill`);
           await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
-          await attemptRefulfill(oid, cand, 'trash-recreate');
-          att.count++; healAttempts.set(oid, att);
+          await attemptRefulfill(oid, cand, 'dead-detail-recreate');
+          att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att);
           continue;
         }
       } catch (e) { console.warn(`🩺 [SelfHeal] #${oid} detail-probe failed: ${e.message}`); }
 
       if (pd) {
-        console.log(`✅ [SelfHeal] #${oid} already paid at CJ (paymentDate=${pd}) — CJ سيكمل عادي، لا دفع مزدوج`);
+        console.log(`✅ [SelfHeal] #${oid} already paid at CJ (paymentDate=${pd}) — لا دفع مزدوج`);
         healAttempts.delete(oid);
         continue;
       }
@@ -1038,33 +1049,32 @@ async function selfHealStuckOrders() {
       if (pay.ok) {
         healed2++;
         await auditEvent('SELFHEAL_PAYBALANCE', oid, { code, amount: cand.total_amount }, 'warning');
-        console.log(`💳 [SelfHeal] #${oid} payBalance OK — CJ سيكمل → SHIPPED webhook قادم`);
-        att.count++; healAttempts.set(oid, att);
+        console.log(`💳 [SelfHeal] #${oid} payBalance OK — SHIPPED webhook قادم`);
+        att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att);
         continue;
       }
 
-      // 💸 فشل الدفع — نفاد المحفظة هو الاحتمال الأكبر → إشعار تشغيلي وحيد
       if (!walletAlerted) {
         sendAdminAlert(
           '💳 CJ Wallet — Top-up required (SelfHeal)',
           `<p>النظام يحاول إنقاذ طلبات عالقة بالدفع الذاتي لكن المحفظة لا تكفي.</p>
            <p>الطلبات المنتظرة: ${candidates.filter(c => c.status === 'paid').length}</p>
-           <p>الأفعال الوحيدة البشرية المطلوبة: عمّر المحفظة — النظام يكمل الباقي أوتوماتيكياً.</p>`
+           <p>الإجراء البشري الوحيد: عمّر المحفظة — النظام يكمل الباقي أوتوماتيكياً.</p>`
         );
-        walletAlerted = true; // مرة واحدة لكل دورة — لا إيميلات متتالية
+        walletAlerted = true;
         await auditEvent('WALLET_EMPTY', null, { pending: candidates.filter(c => c.status === 'paid').length }, 'warning');
       }
       console.warn(`🩺 [SelfHeal] #${oid} payBalance failed: ${pay.reason} — retried next cycle`);
-      att.count++; healAttempts.set(oid, att);
+      att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att);
     }
 
     console.log(`🩺 [SelfHeal] done — scanned=${scanned} L1=${healed1} L2=${healed2} manual=${manualized}`);
   } catch (err) {
-    logger.logError('SelfHeal Cron', err); // Tenet #14
+    logger.logError('SelfHeal Cron', err);
   }
 }
 
-// 🔄 إعادة fulfillment عبر المحرك المجرب كامل — لا محرك جديد
+// 🔄 إعادة fulfillment — عبر financialGate (belt-and-suspenders)
 async function attemptRefulfill(oid, cand, tag) {
   try {
     const itemsRes = await pool.query(`
@@ -1075,9 +1085,6 @@ async function attemptRefulfill(oid, cand, tag) {
     const ord = orderRes.rows[0];
     if (!ord) return false;
 
-    // 🏦 العقد المالي: حتى الإنقاذ يمر عبر البوابة — الدراهم مؤكدة قبل أي إرسال
-    // (مزدوج متعمد مع فحص fulfillCJOrder الداخلي — belt-and-suspenders على العقود المالي:
-    //  الـ self-heal يرفض مبكراً بلوج أوضح، و fulfillCJOrder يحفظ استقلاليته لكل متصل آخر)
     const gate = await financialGate(oid);
     if (!gate.allow) {
       console.error(`🩺 [SelfHeal] #${oid} re-fulfill DENIED by financialGate: ${gate.reason}`);
@@ -1093,7 +1100,11 @@ async function attemptRefulfill(oid, cand, tag) {
       })(),
     };
 
-    const resp = await fulfillCJOrder(oid, ord.customer_name, customerDetails, itemsRes.rows);
+    const resp = await fulfillCJOrder(
+      oid, ord.customer_name, customerDetails, itemsRes.rows,
+      null, null,
+      { skipZeroTouch: true }  // 🆕 #17 — recovery داخلي بالفعل، لا استدعاء ذاتي
+    );
     console.log(`🩺 [SelfHeal] #${oid} re-fulfill (${tag}) => ${resp.success ? '✅ ' + (resp.orderNumber || '') : '❌ ' + (resp.reason || resp.error || 'unknown')}`);
     return !!resp.success;
   } catch (e) {
@@ -1102,10 +1113,16 @@ async function attemptRefulfill(oid, cand, tag) {
   }
 }
 
+// 🧹 GC واحد فقط — المكرر انمسح
+setInterval(() => {
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  for (const [k, v] of healAttempts) {
+    if (v.lastAt < cutoff) healAttempts.delete(k);
+  }
+}, 60 * 60 * 1000).unref();
+
 // ═══════════════════════════════════════════════════════════════
-// ⚖️ disputeWatchdogCron — مراقبة مستمرة للاعتراضات (كل 6 ساعات)
-// النافذة: كل طلبات Stripe غير المشحونة بعمر ≤ 60 يوم (نافذة الـ dispute)
-// الهدف: كشف الـ chargeback قبل الشحن (إيقاف) أو بعده مباشرة (وعي)
+// ⚖️ disputeWatchdogCron
 // ═══════════════════════════════════════════════════════════════
 async function disputeWatchdogCron() {
   console.log('⚖️ [DisputeWatch] scan started...');
@@ -1133,14 +1150,12 @@ async function disputeWatchdogCron() {
       const shipped = ['fulfilled', 'completed'].includes(String(o.status));
 
       if (!shipped) {
-        // 🛑 غير مشحون + اعتراض → إيقاف فوري: manual + محاولة اعتراض CJ
         console.error(`⚖️ [DisputeWatch] #${o.id} DISPUTED & UNSHIPPED → manual + CJ intercept attempt`);
-        await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1 AND status = 'paid'", [o.id]);
+        await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'paid'", [o.id]);
 
-        // ⚖️ اعتراض فعلي: إن كانت الشحنة عند CJ مازالت CREATED — نمسحها (لا نرسل بضاعة لاحتيال)
         if (o.cj_order_number) {
           const icpt = await deleteCJOrder(o.cj_order_number);
-          console.log(`⚖️ [DisputeWatch] #${o.id} CJ intercept => ${icpt.ok ? '✅ deleted' : 'ℹ️ not deletable (moved past CREATED) — Dashboard manual'}`);
+          console.log(`⚖️ [DisputeWatch] #${o.id} CJ intercept => ${icpt.ok ? '✅ deleted' : 'ℹ️ not deletable — Dashboard manual'}`);
           await auditEvent('DISPUTE_INTERCEPT', o.id, { code: o.cj_order_number, deleted: icpt.ok }, 'warning');
         }
         await auditEvent('DISPUTE_FOUND', o.id, { charge: res.chargeId, shipped: false, amount: o.total_amount }, 'critical');
@@ -1150,28 +1165,26 @@ async function disputeWatchdogCron() {
            <p><b>Order:</b> #${o.id} — <b>Client:</b> ${o.customer_name} (${o.customer_email})</p>
            <p><b>Amount:</b> $${o.total_amount} — <b>Charge:</b> ${res.chargeId || 'n/a'}</p>
            <p><b>Action taken:</b> الحالة → manual. الـ fulfillment متوقف.</p>
-           <p><b>Next:</b> استجب للـ dispute في Stripe Dashboard (evidence: order, shipping, comms) — 
-           أو اقبل الخسارة إذا كان احتيالاً مؤكداً. CJ order إن وُجد: intercept يدوياً من Dashboard.</p>`
+           <p><b>Next:</b> استجب للـ dispute في Stripe Dashboard (evidence: order, shipping, comms).</p>`
         );
       } else {
-        // 📦 مشحون + اعتراض → وعي (لا رجعة في الشحن — لكن نجهز evidence)
         console.error(`⚖️ [DisputeWatch] #${o.id} DISPUTED & ALREADY SHIPPED → evidence-prep alert`);
         await auditEvent('DISPUTE_FOUND', o.id, { charge: res.chargeId, shipped: true, amount: o.total_amount }, 'warning');
         sendAdminAlert(
           `⚖️ STRIPE DISPUTE (SHIPPED) — Order #${o.id} — evidence needed`,
           `<p>اعتراض على طلب <b>مشحون فعلاً</b> — الخسارة المالية واردة، بصق الـ evidence قوي:</p>
            <p>Order #${o.id} — ${o.customer_name} — $${o.total_amount} — Charge: ${res.chargeId || 'n/a'}</p>
-           <p><b>جهّز فوراً:</b> رقم التتبع + إثبات التسليم (carrier proof) + مراسلات الزبون + 
-           توثيق العنوان الموثق من Stripe. ارفعهم في Stripe Dashboard خلال المهلة.</p>`
+           <p><b>جهّز فوراً:</b> رقم التتبع + إثبات التسليم + مراسلات الزبون + العنوان الموثق.</p>`
         );
       }
     }
 
     console.log(`⚖️ [DisputeWatch] done — scanned=${scanned} disputes=${disputesFound}`);
   } catch (err) {
-    logger.logError('DisputeWatch Cron', err); // Tenet #14
+    logger.logError('DisputeWatch Cron', err);
   }
 }
+
 // ==========================================
 // 🤖 autoRepairLogistics
 // ==========================================
@@ -1206,8 +1219,9 @@ async function autoRepairLogistics(cjOrderCode) {
     return { repaired: false, reason: e.message };
   }
 }
+
 // ==========================================
-// 🗑️ deleteCJOrder - 1.8: DELETE (CREATED/IN_CART only, per docs)
+// 🗑️ deleteCJOrder
 // ==========================================
 async function deleteCJOrder(...candidates) {
   for (const v of candidates.filter(Boolean)) {
@@ -1225,7 +1239,7 @@ async function deleteCJOrder(...candidates) {
 }
 
 // ==========================================
-// 💳 payCJOrderBalance - 2.2
+// 💳 payCJOrderBalance
 // ==========================================
 async function payCJOrderBalance(...candidates) {
   let lastReason = 'no_candidates';
@@ -1245,11 +1259,5 @@ async function payCJOrderBalance(...candidates) {
   }
   return { ok: false, reason: lastReason };
 }
-// 🧹 GC: تنظيف عدّادات المحاولات القديمة (memory-leak defense — نفس نمط ctxMap)
-setInterval(() => {
-  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // أقدم من 7 أيام
-  for (const [k, v] of healAttempts) {
-    if (v.lastAt < cutoff) healAttempts.delete(k);
-  }
-}, 60 * 60 * 1000).unref(); // ⚠️ unref() — ما يمنعش process.exit
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron ,auditEvent};
+
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent };
