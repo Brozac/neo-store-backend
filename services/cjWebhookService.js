@@ -431,11 +431,19 @@ async function handleVariantUpdate(params = {}, messageType) {
 }
 
 // ==========================================
-// 📦 STOCK — params: { "<vid>": [ { pid, vid, storageNum, ... } ] }
-// الكمية الحقيقية = storageNum — تجميع لكل pid عبر المستودعات/الـ variants
+// 📦 STOCK — Debounced Batch Writer (Quota Defense)
+// مئات الرسائل من CJ → تجميع في الذاكرة → كتابة واحدة كل 5 دقائق
+// يقلل DB writes بـ 95%+ (درس Quota Wall — الجولة #11)
 // ==========================================
+const stockUpdateBuffer = new Map();   // pid → aggregated qty
+const stockSeenSignature = new Map();  // pid → last qty (تجاهل القيم المتطابقة)
+let stockFlushScheduled = false;
+
+const STOCK_FLUSH_INTERVAL_MS = 5 * 60 * 1000;  // 5 دقائق
+const STOCK_MAX_BUFFER = 500;                    // حد أمان الذاكرة
+
 async function handleStockUpdate(params = {}) {
-  const stockByPid = new Map();
+  let buffered = 0;
 
   for (const [key, records] of Object.entries(params)) {
     if (!Array.isArray(records)) continue;
@@ -443,21 +451,67 @@ async function handleStockUpdate(params = {}) {
       const pid = String(rec.pid || key);
       const qty = Number(rec.storageNum ?? rec.stockQuantity ?? rec.quantity ?? rec.stock ?? rec.qty);
       if (!Number.isFinite(qty)) continue;
-      stockByPid.set(pid, (stockByPid.get(pid) || 0) + qty);
+
+      // ✨ Dedup: نفس القيمة السابقة = لا كتابة جديدة (أغلب الرسائل لا تغير شيئًا)
+      const lastQty = stockSeenSignature.get(pid);
+      if (lastQty !== undefined && lastQty === qty) continue;
+
+      stockSeenSignature.set(pid, qty);
+      stockUpdateBuffer.set(pid, qty);
+      buffered++;
     }
   }
 
-  // تحديث واحد لكل منتج (أداء أنظف — كافي لمستوى متوفر/غير متوفر)
-  for (const [pid, totalQty] of stockByPid) {
-    const available = totalQty > 0;
-    const res = await pool.query(
-      'UPDATE products SET stock_status = $1 WHERE cj_product_id = $2 RETURNING id',
-      [available, pid]
-    );
-    if (res.rows.length > 0 && !available) {
-      console.log(`📉 [CJ Webhook] Product ${pid} OUT OF STOCK (${totalQty} left) — hidden from store.`);
+  if (buffered === 0) return;
+  console.log(`📦 [Stock] buffered ${buffered} updates (pending flush: ${stockUpdateBuffer.size})`);
+
+  // 🛡️ حد أمان الذاكرة — إذا فاض، اضغط فورًا (debounce قسري)
+  if (stockUpdateBuffer.size >= STOCK_MAX_BUFFER) {
+    console.warn(`📦 [Stock] buffer overflow (${stockUpdateBuffer.size}) — forcing immediate flush`);
+    await flushStockUpdates();
+    return;
+  }
+
+  // ⏰ جدولة الـ flush الوحيد (debounce)
+  if (!stockFlushScheduled) {
+    stockFlushScheduled = true;
+    setTimeout(async () => {
+      stockFlushScheduled = false;
+      await flushStockUpdates();
+    }, STOCK_FLUSH_INTERVAL_MS).unref?.(); // لا يمنع الإغلاق الرشيق
+  }
+}
+
+// 💾 الكاتب الفعلي — batch واحد أنيق
+async function flushStockUpdates() {
+  const updates = Array.from(stockUpdateBuffer.entries());
+  stockUpdateBuffer.clear();
+  if (updates.length === 0) return;
+
+  console.log(`📦 [Stock] flushing ${updates.length} batched stock updates...`);
+  let hidden = 0, failed = 0;
+
+  for (const [pid, totalQty] of updates) {
+    try {
+      const available = totalQty > 0;
+      const res = await pool.query(
+        'UPDATE products SET stock_status = $1 WHERE cj_product_id = $2 RETURNING id',
+        [available, pid]
+      );
+      if (res.rows.length > 0 && !available) {
+        hidden++;
+        console.log(`📉 [Stock] Product ${pid} OUT OF STOCK (${totalQty} left) — hidden from store.`);
+      }
+    } catch (e) {
+      failed++;
+      // Tenet #14 — لكن لا نغرق اللوج: ملخص كل 10 أخطاء
+      if (failed % 10 === 1) {
+        logger.logError(`Stock flush (and ${failed > 1 ? failed - 1 : 0} similar)`, e);
+      }
     }
   }
+
+  console.log(`📦 [Stock] flush done — ${updates.length} processed, ${hidden} hidden, ${failed} failed`);
 }
 
 // ==========================================
