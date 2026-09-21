@@ -2048,6 +2048,33 @@ app.get('/api/exchange/:orderId/options', async (req, res) => {
     res.status(500).json({ options: [] });
   }
 });
+// ═══ 🗺️ Ship Truth Engine — Journey API ═══
+// 🛡️ IDOR defense: يتطلب orderId + customerEmail (نفس عقد التتبع)
+app.get('/api/tracking/:orderId/journey', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { email } = req.query;
+    
+    if (!orderId || !email) {
+      return res.status(400).json({ error: 'orderId and email required' });
+    }
+
+    const journey = await shipTruth.getJourney(parseInt(orderId), email);
+    if (!journey) {
+      return res.status(403).json({ error: 'Order not found or email mismatch' });
+    }
+
+    // Edge caching للطلبات القديمة فقط (الحية تُجلب حية)
+    if (journey.currentStage === 'DELIVERED') {
+      res.set('Cache-Control', 'public, s-maxage=86400, stale-while-revalidate=86400');
+    }
+
+    res.json(journey);
+  } catch (e) {
+    logger.logError('ShipTruth API', e);
+    res.status(500).json({ error: 'Journey fetch failed' });
+  }
+});
 // ==========================================
 // قالب إيميل تأكيد الطلب
 // ==========================================

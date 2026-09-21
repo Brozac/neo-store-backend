@@ -26,6 +26,7 @@ const logger = require('../logger');
 const { cjRequest } = require('./cjService');
 const { checkStripeDispute, sendAdminAlert } = require('./cjService');
 const { sendOrderTrackingWhatsApp } = require('./whatsappService');
+const { syncShipmentEvents } = require('./shipTruth');
 
 const CJ_BASE = 'https://developers.cjdropshipping.com/api2.0/v1';
 
@@ -261,6 +262,8 @@ async function handleOrderUpdate(params = {}) {
     [mapped, cjOrderId || '', trackNumber, order.id]
   );
   console.log(`✅ [ORDER] #${order.id}: ${order.status} → ${mapped}`);
+
+  syncShipmentEvents(order.id || orderId).catch(() => {}); // fire-and-forget
 }
 
 // ==========================================
@@ -337,6 +340,8 @@ async function handleLogistic(params = {}) {
       await notifyShipment(order, trackingNumber, params.logisticName);
     }
   }
+
+  syncShipmentEvents(order.id || orderId).catch(() => {}); // fire-and-forget
 }
 
 // ==========================================
