@@ -12,6 +12,8 @@ puppeteer.use(StealthPlugin());
 const { parseVariants, getCategorySlug, phoneAccRegex, pcBlacklistRegex } = require('./utils/parser');
 const { prepareSecureItems } = require('./utils/secureCheckout');
 const { applyCouponToTotal } = require('./utils/couponHelper'); // ✨ التعديل 1: Helper الكوبون الموحد
+const { detectAndConvert, SUPPORTED } = require('./lib/currency');
+
 
 const requireAdmin = require('./middleware/requireAdmin');
 const rateLimit = require('express-rate-limit');
@@ -400,6 +402,20 @@ app.post('/api/admin/scrape-product', scraperLimiter, async (req, res) => {
   }
 });
 
+
+// ═══ 💱 Currency Detection — حسب بلد الزائر (Cloudflare header مجاني) ═══
+
+app.get('/api/currency/detect', async (req, res) => {
+  try {
+    const country = (req.headers['cf-ipcountry'] || req.query.country || 'US').toUpperCase();
+    const usd = parseFloat(req.query.usd) || 0;
+    const data = await detectAndConvert(usd, country);
+    res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=1800');
+    res.json({ ...data, supported: SUPPORTED.map(s => s.code) });
+  } catch (e) {
+    res.json({ currency: 'USD', rate: 1, symbol: '$', localAmount: usd || 0 });
+  }
+});
 // ==========================================
 // 📊 مسار تقارير أرباح الإعلانات (Ad Attribution & ROI Analytics)
 // ==========================================

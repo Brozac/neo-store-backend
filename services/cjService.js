@@ -8,6 +8,7 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const { sendPurchaseConversion } = require('./conversionService');
 
 
+
 let cachedCjToken = null;
 let cachedCjTokenExpiry = null;
 let cachedCjRefreshToken = null;
@@ -195,7 +196,7 @@ async function financialGate(orderId) {
     const expectedUsd = Number(o.total_amount);
     const method = String(o.payment_method || '').toLowerCase();
 
-    // ─── Crypto / NowPayments ───
+        // ─── Crypto / NowPayments — Stablecoins only (USDT/USDC على TRC-20 + BEP-20) ───
     if (/crypto|nowpayments/i.test(method)) {
       if (!o.payment_ref) {
         await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'crypto', reason: 'no_payment_ref' }, 'warning');
@@ -214,8 +215,27 @@ async function financialGate(orderId) {
       const p = res.data || {};
       const paidUsd = Number(p.actually_paid_usd ?? 0);
       const st = String(p.payment_status || '');
+
+      // 🆕 Mission #19 — whitelist العملات والشبكات المسموحة فقط
+      const payCurrency = String(p.pay_currency || '').toLowerCase();          // usdt / usdc
+      const payNetwork = String(p.network || p.network_id || '').toLowerCase(); // trc20 / bsc-bep20
+      const ALLOWED_CRYPTO = ['usdt', 'usdc'];
+      const ALLOWED_NETWORKS = ['trc20', 'tron', 'bsc', 'bep20', 'bnb'];
+
+      const isAllowedCoin = ALLOWED_CRYPTO.includes(payCurrency);
+      const isAllowedNetwork = ALLOWED_NETWORKS.some(n => payNetwork.includes(n)) || !payNetwork;
+
+      if (!isAllowedCoin || !isAllowedNetwork) {
+        await auditEvent('FINANCIAL_GATE_DENY', orderId, {
+          method: 'crypto', reason: 'unsupported_currency_network',
+          payCurrency, payNetwork
+        }, 'warning');
+        console.warn(`[FinGate] #${orderId} crypto "${payCurrency}/${payNetwork}" خارج القائمة المسموحة => DENY`);
+        return { allow: false, reason: `crypto_unsupported_${payCurrency}_${payNetwork}` };
+      }
+
       const ok = (st === 'finished' || st === 'confirmed') && paidUsd + 0.01 >= expectedUsd;
-      console.log(`[FinGate] #${orderId} CRYPTO status=${st} paid_usd=${paidUsd} total=${expectedUsd} => ${ok ? 'ALLOW' : 'DENY'}`);
+      console.log(`[FinGate] #${orderId} CRYPTO ${payCurrency}/${payNetwork} status=${st} paid_usd=${paidUsd} total=${expectedUsd} => ${ok ? 'ALLOW' : 'DENY'}`);
       if (!ok) await auditEvent('FINANCIAL_GATE_DENY', orderId, { method: 'crypto', status: st, paidUsd, expectedUsd }, 'warning');
       return ok ? { allow: true } : { allow: false, reason: `crypto_${st}_${paidUsd}` };
     }
