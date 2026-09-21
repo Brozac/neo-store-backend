@@ -13,7 +13,7 @@ const { parseVariants, getCategorySlug, phoneAccRegex, pcBlacklistRegex } = requ
 const { prepareSecureItems } = require('./utils/secureCheckout');
 const { applyCouponToTotal } = require('./utils/couponHelper'); // ✨ التعديل 1: Helper الكوبون الموحد
 const { detectAndConvert, SUPPORTED } = require('./lib/currency');
-
+const { translateProduct, getLangFromCountry } = require('./lib/i18nEngine');
 
 const requireAdmin = require('./middleware/requireAdmin');
 const rateLimit = require('express-rate-limit');
@@ -1428,7 +1428,20 @@ app.get('/api/products/:id', async (req, res) => {
     if (product.images && typeof product.images === 'string') {
       try { product.images = JSON.parse(product.images); } catch (e) {}
     }
-    
+     const visitorCountry = (req.headers['cf-ipcountry'] || '').toUpperCase();
+    const targetLang = getLangFromCountry(visitorCountry);
+
+    if (targetLang) {
+      try {
+        const translated = await translateProduct(product.id, targetLang);
+        if (translated) {
+          product = { ...product, title: translated.title, description: translated.description };
+          res.set('X-Laclarc-Lang', targetLang); // شارة التصحيح
+        }
+      } catch (e) {
+        console.warn(`🌐 [i18n] product #${product.id} translation skipped: ${e.message}`);
+      }
+    }
     res.json(product);
   } catch (err) {
     res.status(500).json({ error: 'Internal Server Error' });
