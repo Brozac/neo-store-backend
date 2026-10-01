@@ -787,11 +787,119 @@ async function checkStripeDispute(orderId, { strict = false } = {}) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// ═══ 📧 مُرسل زبون (Brevo — نفس نمط cjWebhookService) ═══
+async function sendCustomerExchangeEmail(to, subject, html) {
+  if (!to) return;
+  await axios.post('https://api.brevo.com/v3/smtp/email', {
+    sender: { name: 'Laclarc Support', email: process.env.BREVO_USER },
+    to: [{ email: to }],
+    subject,
+    htmlContent: html,
+  }, {
+    headers: { 'api-key': process.env.BREVO_API_KEY, 'Content-Type': 'application/json' },
+    timeout: 8000,
+  });
+}
+
+// ═══ 💸 executeS3 — المصدر الوحيد لمنطق الاسترداد بعد 72h ═══
+// يستدعيه المسار الرئيسي (hoursStuck>=72) ومسار الـ sweep (vids فارغة + 72h+)
+async function executeS3(orderId, { totalAmount, customerEmail }) {
+  const ord2 = await pool.query('SELECT stripe_session_id, payment_method FROM orders WHERE id = $1', [orderId]);
+  const pm = ord2.rows[0]?.payment_method || '';
+
+  if (ord2.rows[0]?.stripe_session_id && /stripe/i.test(pm)) {
+    // ⚖️ dispute gate (strict): أي شك أو فشل فحص = manual — الـ chargeback هو الاسترداد
+    const d = await checkStripeDispute(orderId, { strict: true });
+    if (d.disputed) {
+      const manz = await pool.query(
+        "UPDATE orders SET status = 'manual' WHERE id = $1 AND status = 'awaiting_exchange' RETURNING id",
+        [orderId]
+      );
+      if (manz.rowCount) {
+        await auditEvent('DISPUTE_FOUND', orderId, { stage: 'S3', reason: d.reason }, 'warning');
+        sendAdminAlert(`⚖️ S3 — Order #${orderId}: chargeback مفتوح — manual`,
+          `<p>الاسترداد سيرد عبر الـ chargeback نفسه — لا refund يدوي. (${d.reason})</p>`);
+        return { recovered: false, strategy: 'S3_dispute_manualized' };
+      }
+      console.log(`🤖 [ZeroTouch] #${orderId} S3 lost race (disputed) — fulfillment gates تتابع`);
+      return { recovered: false, strategy: 'S3_lost_race' };
+    }
+
+    // 🔒 قفل ذري ضد سباق الاختيار — S3 يفوز أو يتنازل للزبون، لا الاثنان
+    const lock = await pool.query(
+      "UPDATE orders SET status = 'manual' WHERE id = $1 AND status = 'awaiting_exchange' RETURNING id",
+      [orderId]
+    );
+    if (!lock.rowCount) {
+      console.log(`🤖 [ZeroTouch] #${orderId} S3 lost race — customer just picked`);
+      return { recovered: false, strategy: 'S3_customer_picked' };
+    }
+
+    try {
+      const session = await stripe.checkout.sessions.retrieve(ord2.rows[0].stripe_session_id);
+      const pi = typeof session.payment_intent === 'string'
+        ? await stripe.paymentIntents.retrieve(session.payment_intent)
+        : session.payment_intent;
+      if (!pi?.latest_charge) throw new Error('no latest_charge — لا شهادة دفع قابلة للاسترداد');
+      await stripe.refunds.create({ charge: pi.latest_charge });
+      await pool.query("UPDATE orders SET status = 'refunded' WHERE id = $1", [orderId]);
+      await auditEvent('ZEROTOUCH_S3_REFUNDED', orderId, { amount: totalAmount }, 'warning');
+      sendAdminAlert(`💰 ZeroTouch S3 — Order #${orderId} auto-refunded ($${totalAmount})`,
+        `<p>72 ساعة بلا قرار زبون. استرداد آلي نُفّذ.</p>`);
+      sendCustomerExchangeEmail(
+        customerEmail,
+        `طلبك #${orderId} — تم استرداد مبلغك 💰`,
+        `<div style="direction:rtl;text-align:right;font-family:Arial,sans-serif"><p>نعتذر — انتهت مهلة اختيار البديل ونُفّذ الاسترداد الكامل ($${totalAmount}). المبلغ يظهر حسب جهة الدفع خلال أيام.</p></div>`
+      ).catch(e => console.error(`📧 S3 email FAILED #${orderId}: ${e.message}`));
+      console.log(`💰 [ZeroTouch] #${orderId} refund done — Zero-Touch complete`);
+      return { recovered: true, strategy: 'S3_refund' };
+    } catch (refundErr) {
+      await auditEvent('ZEROTOUCH_S3_FAILED', orderId, { error: refundErr.message }, 'error');
+      sendAdminAlert(`🚨 S3 refund FAILED — Order #${orderId}`, `<p>${refundErr.message}</p>`);
+      return { recovered: false, strategy: 'S3_refund_failed_manual' };
+    }
+  }
+
+  // NowPayments/Paysera/BaridiMob — لا refund API مربوط → fail-closed يدوي موثق
+  const manz = await pool.query(
+    "UPDATE orders SET status = 'manual' WHERE id = $1 AND status = 'awaiting_exchange' RETURNING id",
+    [orderId]
+  );
+  if (manz.rowCount) {
+    await auditEvent('ZEROTOUCH_S3_GATEWAY_UNSUPPORTED', orderId, { gateway: pm || 'unknown' }, 'warning');
+    sendAdminAlert(`💰 S3 — Order #${orderId}: استرداد يدوي إلزامي (${pm || 'gateway?'})`,
+      `<p>انتهت 72 ساعة بلا اختيار. البوابة ${pm} بلا مسار استرداد آلي — dossier يدوي.</p>`);
+    sendCustomerExchangeEmail(
+      customerEmail,
+      `طلبك #${orderId} — استردادك قيد التنفيذ`,
+      `<div style="direction:rtl;text-align:right;font-family:Arial,sans-serif"><p>انتهت مهلة اختيار البديل. استردادك ($${totalAmount}) قيد المعالجة — سنتواصل معك لتأكيد تفاصيل التحويل.</p></div>`
+    ).catch(() => {});
+  }
+  return { recovered: false, strategy: 'S3_manual_gateway' };
+}
+
 // 🤖 zeroTouchRecovery — Mission #16 (S1→S2→S3) — محصّن ضد الحلقات
 // ═══════════════════════════════════════════════════════════════
 const zeroTouchGuard = new Set(); // 🆕 Mission #17 — loop guard
 
 async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customerEmail, customerPhone, customerName }) {
+  // 🆕 SWEEP GUARD — vids فارغة + 72h+ → S3 مباشرة (مسار L0 sweep)
+  // الطلبات الطازجة بلا vids تسلك المسار الأصلي — سلوك اليوم unchanged
+  if (!Array.isArray(vids) || vids.length === 0) {
+    try {
+      const { rows: ageChk } = await pool.query(
+        `SELECT EXTRACT(EPOCH FROM (NOW() - COALESCE(manual_since, created_at))) / 3600 AS hours FROM orders WHERE id = $1`,
+        [orderId]
+      );
+      if ((ageChk[0]?.hours || 0) >= 72) {
+        console.log(`🤖 [ZeroTouch] #${orderId} sweep path — no vids + 72h+ → direct S3`);
+        return await executeS3(orderId, { totalAmount, customerEmail, via: 'sweep' });
+      }
+    } catch (gErr) {
+      console.warn(`🤖 [ZeroTouch] #${orderId} sweep-guard failed: ${gErr.message}`);
+    }
+  }
+
   // 🛡️ حلقة استدعاء ذاتية: recovery → fulfillCJOrder → recovery = ∞ — ممنوعة
   if (zeroTouchGuard.has(orderId)) {
     console.warn(`🤖 [ZeroTouch] #${orderId} already in recovery cycle — skipped (loop guard)`);
@@ -873,26 +981,48 @@ async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customer
       `, [orderId]);
 
       if (subs.length > 0) {
-        await pool.query(
-          `UPDATE orders SET status = 'awaiting_exchange', exchange_options = $2, manual_since = NOW() WHERE id = $1 AND status IN ('manual', 'paid')`,
+        // 🛡️ rowCount guard — زيارة sweep على طلب معروض أصلًا: لا إعادة عرض، لا سبام
+        const upd = await pool.query(
+          `UPDATE orders SET status = 'awaiting_exchange', exchange_options = $2, manual_since = NOW()
+           WHERE id = $1 AND status IN ('manual', 'paid')
+           RETURNING exchange_token`,
           [orderId, JSON.stringify(subs)]
         );
-        await auditEvent('ZEROTOUCH_S2_OFFERED', orderId, { substitutes: subs.length, options: subs.map(s => s.id) }, 'warning');
-        console.log(`📧 [ZeroTouch] #${orderId} S2: ${subs.length} substitutes offered — awaiting customer choice`);
+        if (upd.rowCount > 0) {
+          await auditEvent('ZEROTOUCH_S2_OFFERED', orderId, { substitutes: subs.length, options: subs.map(s => s.id) }, 'warning');
 
-        const optsHtml = subs.map((s, i) => `
-          <div style="margin:10px 0;padding:12px;border:1px solid #ddd;border-radius:8px;">
-            <b>${i+1}. ${s.title}</b><br/>
-            Price: $${Number(s.price).toFixed(2)}<br/>
-            <a href="https://laclarc.com/exchange/${orderId}" 
-               style="color:#8B78C6;font-weight:bold;">Choose your replacement →</a>
-          </div>`).join('');
-        sendAdminAlert(
-          `🤖 ZeroTouch S2 — Order #${orderId} substitutes offered`,
-          `<p>الزبون: ${customerName} — $${totalAmount}</p>${optsHtml}`
-        );
+          // 🔑 capability token — بلا هذا الرابط مفتوح (IDOR write-capable)
+          const exchangeUrl = `https://laclarc.com/exchange/${orderId}?t=${upd.rows[0].exchange_token}`;
 
-        return { recovered: false, strategy: 'S2_customer_choice', substitutes: subs.length };
+          // 📧 الزبون — كان الرابط يذهب للأدمن فقط — fire-and-forget (Tenet #4)
+          sendCustomerExchangeEmail(
+            customerEmail,
+            `طلبك #${orderId} — اختر بديلك المجاني`,
+            `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;direction:rtl;text-align:right">
+              <h2 style="color:#1D1E3C">مرحباً ${customerName || ''} 👋</h2>
+              <p>نعتذر — المنتج في طلبك <b>#${orderId}</b> غير متوفر حالياً للشحن إلى بلدك.</p>
+              <p>اخترنا لك <b>${subs.length} بديلاً مجانياً</b> من نفس الفئة بنفس القيمة:</p>
+              ${subs.map(s => `<p style="margin:4px 0">• ${s.title} — $${Number(s.price).toFixed(2)}</p>`).join('')}
+              <p style="margin:24px 0;text-align:center">
+                <a href="${exchangeUrl}" style="background:#8B78C6;color:#fff;padding:14px 28px;border-radius:12px;text-decoration:none;font-weight:bold">اختر بديلك الآن →</a>
+              </p>
+              <p style="color:#666;font-size:13px">⏳ لديك 72 ساعة للاختيار — بعدها يُنفَّذ الاسترداد الكامل تلقائياً دون أي إجراء منك.</p>
+              <p style="color:#999;font-size:12px">إذا لم تكن أنت صاحب هذا الطلب، تجاهل هذه الرسالة.</p>
+            </div>`
+          ).catch(e => console.error(`📧 [ZeroTouch] customer email FAILED #${orderId}: ${e.message}`));
+
+          const optsHtml = subs.map((s, i) => `
+            <div style="margin:10px 0;padding:12px;border:1px solid #ddd;border-radius:8px;">
+              <b>${i + 1}. ${s.title}</b><br/>
+              Price: $${Number(s.price).toFixed(2)}<br/>
+              <a href="${exchangeUrl}" style="color:#8B78C6;font-weight:bold;">Choose your replacement →</a>
+            </div>`).join('');
+          sendAdminAlert(`🤖 ZeroTouch S2 — Order #${orderId} substitutes offered`,
+            `<p>الزبون: ${customerName} — $${totalAmount}</p>${optsHtml}`);
+          console.log(`📧 [ZeroTouch] #${orderId} S2: ${subs.length} substitutes offered + customer emailed`);
+          return { recovered: false, strategy: 'S2_customer_choice', substitutes: subs.length };
+        }
+        // rowCount = 0 → معروضة أصلًا (زيارة sweep) → يسقط لفحص S3 أدناه
       }
     } catch (e) {
       console.warn(`🤖 [ZeroTouch] #${orderId} S2 failed: ${e.message}`);
@@ -906,28 +1036,9 @@ async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customer
     const hoursStuck = ageRows[0]?.hours || 0;
 
     if (hoursStuck >= 72) {
-      console.log(`🤖 [ZeroTouch] #${orderId} S3: 72h+ no decision — auto-refund...`);
-      const ord2 = await pool.query('SELECT stripe_session_id, payment_method FROM orders WHERE id = $1', [orderId]);
-      if (ord2.rows[0]?.stripe_session_id && /stripe/i.test(ord2.rows[0].payment_method || '')) {
-        try {
-          const session = await stripe.checkout.sessions.retrieve(ord2.rows[0].stripe_session_id);
-          const pi = typeof session.payment_intent === 'string'
-            ? await stripe.paymentIntents.retrieve(session.payment_intent)
-            : session.payment_intent;
-          if (pi?.latest_charge) {
-            await stripe.refunds.create({ charge: pi.latest_charge });
-            await pool.query("UPDATE orders SET status = 'refunded' WHERE id = $1", [orderId]);
-            await auditEvent('ZEROTOUCH_S3_REFUNDED', orderId, { amount: totalAmount }, 'warning');
-            sendAdminAlert(`💰 ZeroTouch S3 — Order #${orderId} auto-refunded ($${totalAmount})`,
-              `<p>72 ساعة بلا قرار زبون. استرداد آلي نُفّذ.</p>`);
-            console.log(`💰 [ZeroTouch] #${orderId} refund done — Zero-Touch complete`);
-            return { recovered: true, strategy: 'S3_refund' };
-          }
-        } catch (refundErr) {
-          console.error(`🤖 [ZeroTouch] #${orderId} S3 refund failed: ${refundErr.message}`);
-        }
-      }
-    }
+  console.log(`🤖 [ZeroTouch] #${orderId} S3: 72h+ no decision — auto-refund path...`);
+  return await executeS3(orderId, { totalAmount, customerEmail, via: 'main' });
+}
 
     await auditEvent('ZEROTOUCH_PENDING', orderId, { strategy_tried: 'S1+S2', hours_stuck: hoursStuck }, 'info');
     return { recovered: false, strategy: 'pending' };
@@ -947,6 +1058,39 @@ async function selfHealStuckOrders() {
   let scanned = 0, healed1 = 0, healed2 = 0, manualized = 0, walletAlerted = false;
 
   try {
+    // ─── L0 🆕 — Exchange sweep: S3 كانت unreachable — لا شيء يعيد زيارة awaiting_exchange ───
+    // vids:[] مقصود — sweep-guard داخل zeroTouchRecovery يوجّه مباشرة إلى executeS3
+    try {
+      const { rows: expired } = await pool.query(`
+        SELECT id, total_amount, customer_email, customer_phone, customer_name, shipping_address
+        FROM orders
+        WHERE status = 'awaiting_exchange'
+          AND manual_since < NOW() - INTERVAL '72 hours'
+        ORDER BY manual_since ASC
+        LIMIT 20
+      `);
+      for (const o of expired) {
+        if (zeroTouchGuard.has(o.id)) continue;
+        try {
+          let country = 'DZ';
+          try { country = JSON.parse(o.shipping_address)?.country || 'DZ'; } catch { country = 'DZ'; }
+          await zeroTouchRecovery(o.id, {
+            country,
+            vids: [],
+            totalAmount: parseFloat(o.total_amount),
+            customerEmail: o.customer_email,
+            customerPhone: o.customer_phone,
+            customerName: o.customer_name,
+          });
+        } catch (e) {
+          console.error(`🩺 [SelfHeal] L0 sweep #${o.id} failed: ${e.message}`);
+        }
+      }
+      if (expired.length) console.log(`🩺 [SelfHeal] L0: ${expired.length} expired exchange(s) → recovery`);
+    } catch (e) {
+      console.error(`🩺 [SelfHeal] L0 error: ${e.message}`);
+    }
+
     const { rows: candidates } = await pool.query(`
       SELECT id, cj_order_number, total_amount, customer_name, customer_email, created_at
       FROM orders

@@ -54,4 +54,6 @@ desktop.ini
 
 # ─── Node internals ───
 .npm/
-.node_repl_history
+.node_repl_history*.bak-xchg
+*.bak-xchg
+*.bak-xchg
