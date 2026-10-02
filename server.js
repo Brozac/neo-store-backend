@@ -22,7 +22,7 @@ const { secondShotConversion } = require('./services/conversionService');
 const { fulfillCJOrder, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
-const { selfHealStuckOrders, disputeWatchdogCron } = require('./services/cjService');
+const { selfHealStuckOrders, disputeWatchdogCron, auditEvent } = require('./services/cjService');
 const logger = require('./logger');
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
 const multer = require('multer');
@@ -2089,10 +2089,31 @@ app.post('/api/exchange/:orderId', async (req, res) => {
       await auditEvent('EXCHANGE_SUCCESS', orderId, { newProduct: chosen.id, title: chosen.title }, 'info');
       return res.json({ success: true, message: 'تم استبدال المنتج وإعادة الإرسال — ستصلك رسالة شحن قريباً!' });
     }
+
     await auditEvent('EXCHANGE_FAIL', orderId, { chosen: chosen.id }, 'warning');
-    return res.json({ success: false, message: 'البديل غير متوفر للشحن حالياً — سنقترح بدائل جديدة تلقائياً، أو يُنفَّذ الاسترداد الكامل.' });
+
+    // 🆕 الفشل الصادق — الحالة تحكم الرسالة:
+    const st = await pool.query('SELECT status FROM orders WHERE id = $1', [orderId]);
+    if (st.rows[0]?.status === 'awaiting_exchange') {
+      // الـ cascade أعاد العرض فعلاً → بدائل جديدة + إيميل خرج من Render
+      return res.json({ success: false, message: 'البديل غير متوفر للشحن — أرسلنا لك بدائل جديدة على بريدك الإلكتروني.' });
+    }
+
+    // 🆕 الـ cascade مات → حالة صادقة + triage، لا 'paid' غامضة تفسرها الواجهة كنجاح
+    await pool.query(
+      "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'paid'",
+      [orderId]
+    );
+    sendAdminAlert(`🚨 Exchange cascade died — #${orderId} → manual`,
+      `<p>فشل البديل <b>${chosen.title}</b> ومات الـ cascade قبل إعادة العرض — triage يدوي أو انتظار L0 sweep.</p>`);
+    return res.json({ success: false, message: 'تعذر إتمام التبديل — فريقنا يتابع طلبك وستصلك رسالة قريباً.' });
   } catch (e) {
     logger.logError('Exchange fulfillment', e);
+    // 🆕 حتى الكراش هنا يستحق حالة صادقة لو ما زال 'paid'
+    await pool.query(
+      "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'paid'",
+      [orderId]
+    ).catch(() => {});
     return res.status(500).json({ success: false, message: 'خطأ في إعادة الإرسال — فريقنا سيتابع طلبك تلقائياً' });
   }
 });
@@ -2113,9 +2134,13 @@ app.get('/api/exchange/:orderId/options', async (req, res) => {
     if (status === 'awaiting_exchange') {
       return res.json({ status: 'awaiting_exchange', options: exchange_options || [] });
     }
-    if (status === 'refunded' || status === 'manual') {
-      // refunded = نُفّذ • manual = استرداد يدوي قيد التنفيذ — الصفحة تقول الحقيقة في الحالين
+    if (status === 'refunded') {
+      // S3 نُفّذ فعلاً — الصفحة تقول "تم الاسترداد"
       return res.json({ status: 'refunded' });
+    }
+    if (status === 'manual') {
+      // 🆕 manual = معالجة جارية (استرداد يدوي أو triage) — لا نؤكد استرداداً لم يحدث
+      return res.json({ status: 'processing' });
     }
     if (['paid', 'fulfilled', 'completed'].includes(status)) {
       return res.json({ status: 'exchanged' });

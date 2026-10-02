@@ -976,7 +976,7 @@ async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customer
             (SELECT price * 0.7 FROM order_items WHERE order_id = $1 LIMIT 1) AND
             (SELECT price * 1.3 FROM order_items WHERE order_id = $1 LIMIT 1)
           AND p.category = (SELECT category FROM products WHERE id = (SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1))
-        ORDER BY p.sales_count DESC NULLS LAST
+        ORDER BY p.created_at DESC
         LIMIT 3
       `, [orderId]);
 
@@ -1424,4 +1424,4 @@ async function payCJOrderBalance(...candidates) {
   return { ok: false, reason: lastReason };
 }
 
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent };
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery };
