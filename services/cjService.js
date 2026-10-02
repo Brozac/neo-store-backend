@@ -669,6 +669,19 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
         console.log(`🎉 All ${successfulSplits} split shipments succeeded for Order #${orderId}!`);
         orderSuccess = true;
         successfulCJOrderNumber = splitOrdersCreated.join(', ');
+                // 🔒 persist split order number IMMEDIATELY — the gap between
+        // "CJ accepted the split" and "number saved in DB" is where the
+        // Stripe Reconcile loop lived (2026-10-02): it saw "paid, no cj_order_number"
+        // and re-fired the full gauntlet every 15min (~40 attempts + email spam).
+        // A dropped connection right here previously widened that gap to forever.
+        // Same atomic guard as financialGate — never overwrite a live number.
+        await pool.query(
+          `UPDATE orders
+           SET cj_order_number = $2
+           WHERE id = $1 AND (cj_order_number IS NULL OR cj_order_number = '')`,
+          [orderId, successfulCJOrderNumber]
+        );
+        console.log(`💾 [CJ Split] #${orderId} order number persisted: ${successfulCJOrderNumber}`);
       } else if (successfulSplits > 0) {
         console.error(`🚨 Partial fulfillment on Order #${orderId}: ${successfulSplits}/${cjProducts.length} shipped.`);
         await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
