@@ -406,14 +406,21 @@ app.post('/api/admin/scrape-product', scraperLimiter, async (req, res) => {
 // ═══ 💱 Currency Detection — حسب بلد الزائر (Cloudflare header مجاني) ═══
 
 app.get('/api/currency/detect', async (req, res) => {
+  // 🆕 hoisted out of try — the old catch referenced `usd` out of scope
+  // (ReferenceError → unhandled rejection → process crash = public DoS vector)
+  const usd = parseFloat(req.query.usd) || 0;
   try {
-    const country = (req.headers['cf-ipcountry'] || req.query.country || 'US').toUpperCase();
-    const usd = parseFloat(req.query.usd) || 0;
+    // 🆕 String() neutralizes Express array-params (?country=a&country=b)
+    // + slice caps input length
+    const country = String(req.headers['cf-ipcountry'] || req.query.country || 'US')
+      .toUpperCase()
+      .slice(0, 2);
     const data = await detectAndConvert(usd, country);
     res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=1800');
     res.json({ ...data, supported: SUPPORTED.map(s => s.code) });
   } catch (e) {
-    res.json({ currency: 'USD', rate: 1, symbol: '$', localAmount: usd || 0 });
+    logger.logError('currency/detect', e); // 🆕 was a silent catch (Tenet #13)
+    res.json({ currency: 'USD', rate: 1, symbol: '$', localAmount: usd });
   }
 });
 // ==========================================
@@ -941,7 +948,7 @@ async function runCjVideoSync() {
             console.log(`🎥 [Video Sync] ✅ #${importedCount}: ${String(productRow.title).slice(0, 60)}`);
           }
         } catch (productErr) {
-          // خطأ منتج فردي — ما يوقفش الجولة
+          console.warn(`⚠️ [Video Sync] product failed: ${productErr.message}`); // Tenet #13
         }
       }
     }
@@ -1079,7 +1086,7 @@ async function runCjProductSync(keyword) {
         );
 
         importedCount++;
-      } catch (productErr) { console.error('🔴 [Import] product FAILED: ' + (details?.pid || productId) + ' — ' + productErr.message); }
+      } catch (productErr) { console.error('🔴 [Import] product FAILED: ' + productId + ' — ' + productErr.message); }
     }
   }
 
