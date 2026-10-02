@@ -750,11 +750,48 @@ app.get('/api/categories', async (req, res) => {
       return res.json(categoryTreeCache);
     }
     const tree = await getCategoryTree();
+
+    // 🆕 Temu-style: attach a representative product image per category
+    // one cheap query per cache-miss (every 10 min) — first in-stock product per category
+    // 🆕 Temu-style rail: representative product image per category
+    // ONE lateral query per cache-miss (every 10 min) — prefix-aware
+    // matching (same rules as the homepage filter: exact / -suffix / /-suffix)
+    try {
+      const { rows: imgs } = await pool.query(`
+        SELECT c.slug, img.image_url
+        FROM categories c
+        LEFT JOIN LATERAL (
+          SELECT p.image_url
+          FROM products p
+          WHERE p.stock_status = true
+            AND p.image_url IS NOT NULL AND p.image_url <> ''
+            AND (p.category = c.slug OR p.category LIKE c.slug || '-%' OR p.category LIKE c.slug || '/%')
+          ORDER BY p.sort_order DESC NULLS LAST, p.id DESC
+          LIMIT 1
+        ) img ON true
+      `);
+      const imgMap = new Map(imgs.map((r) => [r.slug, r.image_url]));
+      const attach = (nodes) => {
+        for (const n of nodes || []) {
+          if (!n?.slug) continue;
+          n.image_url = imgMap.get(n.slug) || null;
+          if (Array.isArray(n.children) && n.children.length) {
+            attach(n.children);
+            // parent inherits first child's image when it has none of its own
+            if (!n.image_url) n.image_url = n.children.find((c) => c.image_url)?.image_url || null;
+          }
+        }
+      };
+      attach(Array.isArray(tree) ? tree : tree?.children || []);
+    } catch (e) {
+      console.warn('categories image enrichment failed:', e.message); // no silent catch
+    }
+
     categoryTreeCache = tree;
     categoryTreeCacheTime = Date.now();
     res.json(tree);
   } catch (err) {
-      logger.logError('Route Handler', err);
+    logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
