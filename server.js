@@ -751,11 +751,14 @@ app.get('/api/categories', async (req, res) => {
     }
     const tree = await getCategoryTree();
 
-    // 🆕 Temu-style: attach a representative product image per category
-    // one cheap query per cache-miss (every 10 min) — first in-stock product per category
-    // 🆕 Temu-style rail: representative product image per category
-    // ONE lateral query per cache-miss (every 10 min) — prefix-aware
-    // matching (same rules as the homepage filter: exact / -suffix / /-suffix)
+        // 🆕 Temu-style rail: SMART representative image per category.
+    // One lateral query per cache-miss (every 10 min), prefix-aware matching
+    // (same rules as the homepage filter). Ranking hierarchy:
+    //   1. sort_order DESC      → explicit admin override always wins
+    //   2. is_sourced DESC      → admin-curated products (hand-picked deals)
+    //   3. has video DESC       → video-sync imports = marketing-grade assets
+    //   4. image count DESC     → multi-image listings = curated, not lazy
+    //   5. id DESC              → newest as final tiebreak
     try {
       const { rows: imgs } = await pool.query(`
         SELECT c.slug, img.image_url
@@ -766,7 +769,12 @@ app.get('/api/categories', async (req, res) => {
           WHERE p.stock_status = true
             AND p.image_url IS NOT NULL AND p.image_url <> ''
             AND (p.category = c.slug OR p.category LIKE c.slug || '-%' OR p.category LIKE c.slug || '/%')
-          ORDER BY p.sort_order DESC NULLS LAST, p.id DESC
+          ORDER BY
+            p.sort_order DESC NULLS LAST,
+            p.is_sourced DESC,
+            (p.video_url IS NOT NULL AND p.video_url <> '') DESC,
+            COALESCE(array_length(p.images, 1), 0) DESC,
+            p.id DESC
           LIMIT 1
         ) img ON true
       `);
@@ -783,7 +791,7 @@ app.get('/api/categories', async (req, res) => {
         }
       };
       attach(Array.isArray(tree) ? tree : tree?.children || []);
-    } catch (e) {
+     } catch (e) {
       console.warn('categories image enrichment failed:', e.message); // no silent catch
     }
 
