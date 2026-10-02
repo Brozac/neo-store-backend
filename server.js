@@ -2588,14 +2588,18 @@ cron.schedule('0 * * * *', async () => {
     isSweeping = false;
   }
 });
-// ✨ كرون يمنع Neon من النوم (Scale to Zero) كل 4 دقائق
-cron.schedule('*/4 * * * *', async () => {
-  try {
-    await pool.query('SELECT 1');
-  } catch (err) {
-    console.error('Neon keep-alive error:', err.message);
-  }
-});
+// 🛑 DISABLED (2026-10-02) — Neon free-plan compute killer:
+// this 4-min ping kept the DB compute awake 24/7 → burned the monthly
+// compute hours in ~4 days → project suspended by Neon.
+// On Launch (always-on compute) it's redundant anyway.
+// Re-enable ONLY if ever returning to Neon Free plan.
+// cron.schedule('*/4 * * * *', async () => {
+//   try {
+//     await pool.query('SELECT 1');
+//   } catch (err) {
+//     console.error('Neon keep-alive error:', err.message);
+//   }
+// });
 // ==========================================
 // 🛒 8. كرون استرجاع السلات المتروكة (Abandoned Cart Recovery)
 // يعمل كل ساعتين لإرسال إيميل تذكيري مع كوبون خصم للزبائن المترددين
