@@ -1251,12 +1251,35 @@ app.get('/api/admin/manual-orders', async (req, res) => {
   }
 });
 
+// ==========================================
+// مسارات BaridiMob والطلبات اليدوية (hardened)
+// 🩹 approve: + receipt_url guard + halted-check + email normalization
+// 🩹 reject: forward-only guard (موجود من قبل — أُبقي)
+// 🩹 retry: HALTED guard (يمنع حلقة #79) + halted-clear logic
+// 🩹 failed-orders: أعمدة محددة (كان SELECT * — يخرج stripe_session_id/exchange_token)
+// ==========================================
+
 app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid order id' });
 
-    // ✨ v2: قفل ذري — pending → paid فقط (ضغطة ثانية = 409، ما كيرجعش fulfilled لـ paid)
+    // 🩹 FIX-A1 — جلب الطلب أولاً للتحقق من receipt_url قبل القفل
+    const preRes = await pool.query(
+      'SELECT status, receipt_url, customer_email FROM orders WHERE id = $1',
+      [id]
+    );
+    if (preRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    const pre = preRes.rows[0];
+
+    // 🩹 FIX-A2 — الموافقة تتطلب وصل مرفوع (لا موافقة عمياء)
+    if (!pre.receipt_url) {
+      return res.status(400).json({
+        error: 'Cannot approve — no receipt uploaded. Reject this order or ask the customer to upload a receipt.'
+      });
+    }
+
+    // ✨ v2: قفل ذري — pending → paid فقط
     const updateRes = await pool.query(
       "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING *",
       [id]
@@ -1282,13 +1305,12 @@ app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
         const customerDetails = {
           address: parsedAddress,
           phone: order.customer_phone,
-          email: order.customer_email || '',   // ✨ V3 — fulfillCJOrder v2 عندو fallback آمن
+          email: normalizeEmail(order.customer_email) || '',   // 🩹 FIX-A3
           name: order.customer_name,
         };
 
         const cjResponse = await fulfillCJOrder(order.id, order.customer_name, customerDetails, items);
 
-        // ✅ v2 — بلا 'completed': الحالة تبقى paid، الويب هوك SHIPPED هو اللي كيرفع + يصيفط واتساب
         if (cjResponse && cjResponse.success) {
           console.log(`📤 [BaridiMob] #${id} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
         } else {
@@ -1316,7 +1338,6 @@ app.put('/api/admin/manual-orders/reject/:id', async (req, res) => {
   try {
     const { id } = req.params;
     // 🩹 FIX#14 — forward-only guard: ما كتكتبش cancelled فوق paid/fulfilled/refunded
-    //    (كان: رفض أدمن لطلب تحوّل meanwhile لـ paid = يختفي من كل شاشات المتابعة)
     const upd = await pool.query(
       "UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status IN ('pending','manual') RETURNING id",
       [id]
@@ -1343,8 +1364,37 @@ app.put('/api/admin/retry-fulfillment/:id', async (req, res) => {
     if (!['manual', 'paid'].includes(order.status)) {
       return res.status(409).json({ error: `Order is '${order.status}' — فقط manual أو paid يمكن إعادة إرسالهم` });
     }
+
+    // 🩹 FIX-B1 v2 — HALTED guard (NULL-safe + 7-day window متسق مع الحارس الداخلي):
+    //    1. NULL-safe: cj_order_number قد يكون NULL (halt من أول مرة بلا retry سابق) — كان يفلته
+    //    2. نافذة 7 أيام: مطابقة للـ inner-shield — بعدها يُفترض أن الأدمن حسم في CJ
+    //    3. أي halt خلال النافذة = retry مضمون الفشل (dedup على الزبون+المنتجات لا الرقم)
+    if (order.status === 'manual') {
+      const haltEv = await pool.query(`
+        SELECT details, created_at FROM system_events
+        WHERE order_id = $1 AND event_type = 'CJ_ORDER_HALTED'
+        ORDER BY created_at DESC LIMIT 1
+      `, [id]);
+      const halt = haltEv.rows[0];
+      if (halt) {
+        const haltAgeHours = (Date.now() - new Date(halt.created_at).getTime()) / (1000 * 60 * 60);
+        if (haltAgeHours < 168) {   // داخل نافذة الـ 7 أيام — مضمون الفشل
+          return res.status(409).json({
+            error: `⛔ Order #${id} is HALTED (CJ duplicate-blocked, ${Math.floor(haltAgeHours)}h ago) — retrying will fail identically.`,
+            resolution: [
+              '1. Manual order from CJ Dashboard (same customer details)',
+              '2. Try Auto-Split path (different payload structure)',
+              '3. Refund via Stripe Dashboard',
+            ],
+            detail: halt.details,
+          });
+        }
+        // halt أقدم من 7 أيام → نسمح (اتساق مع inner-shield) — لكن ننبه
+        console.warn(`ℹ️ [Retry] #${id} HALTED expired (${Math.floor(haltAgeHours)}h) — allowing fresh attempt`);
+      }
+    }
+
     // تمكين محاولة جديدة: نحيدو cj_order_number القديم (الـ COALESCE ما يسمحش بالكتابة فوق)
-    // ✨ burnedBump في cjService هو لي يخلي الـ retry ما يعاودش يمشي على الأرقام المحروقة
     await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1 AND status = 'manual'", [id]);
     const itemsRes = await pool.query('SELECT * FROM order_items WHERE order_id = $1', [id]);
 
@@ -1358,7 +1408,7 @@ app.put('/api/admin/retry-fulfillment/:id', async (req, res) => {
         const customerDetails = {
           address: parsedAddress,
           phone: order.customer_phone || '',
-          email: order.customer_email || '',
+          email: normalizeEmail(order.customer_email) || '',    // 🩹 FIX-B2
           name: order.customer_name,
         };
         const r = await fulfillCJOrder(order.id, order.customer_name, customerDetails, itemsRes.rows);
@@ -1373,7 +1423,25 @@ app.put('/api/admin/retry-fulfillment/:id', async (req, res) => {
 
 app.get('/api/admin/failed-orders', async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM orders WHERE status = 'manual' AND payment_method != 'BaridiMob' ORDER BY id DESC");
+    // 🩹 FIX-C1 — أعمدة محددة (كان SELECT * يخرج stripe_session_id + exchange_token)
+    //    + 🩹 FIX-C2 — يعرض HALTED flag حتى يفهم الأدمن لماذا الطلب مقفول
+    const result = await pool.query(`
+      SELECT
+        o.id,
+        o.customer_name,
+        o.customer_email,
+        o.total_amount,
+        o.status,
+        o.created_at,
+        o.cj_order_number,
+        o.manual_since,
+        (SELECT details FROM system_events se
+         WHERE se.order_id = o.id AND se.event_type = 'CJ_ORDER_HALTED'
+         ORDER BY created_at DESC LIMIT 1) AS halt_details
+      FROM orders o
+      WHERE o.status = 'manual' AND o.payment_method != 'BaridiMob'
+      ORDER BY o.id DESC
+    `);
     res.json(result.rows);
   } catch (err) {
       logger.logError('Route Handler', err);
