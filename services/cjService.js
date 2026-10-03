@@ -466,6 +466,38 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
     const isSandbox = (process.env.CJ_SANDBOX_MODE === 'true' && process.env.NODE_ENV !== 'production') ? 1 : 0;
     if (isSandbox) console.warn('🧪 [SANDBOX] طلب #' + orderId + ' كيتخلق sandbox — ما غاديش يشحن!');
 
+    // 🩹 FIX-B v2 (inner shield) — الطلب الموقوف سابقاً (HALTED) لا يُعاد إرساله تلقائياً
+    //    CJ dedup يرفض نفس الزبون+المنتجات بغض النظر عن الرقم — مثبت 13+ ترقية كلها TRASH
+    //    v2: صلاحية 7 أيام — بعد ذلك يُفترض أن الأدمن تدخل (CJ Dashboard / refund) ويُسمح بمحاولة جديدة
+    //    force_bypass_halt: خيار يدوي مستقبلي (admin override عبر flags)
+    try {
+      const haltCheck = await pool.query(
+        `SELECT details, created_at FROM system_events
+         WHERE order_id = $1 AND event_type = 'CJ_ORDER_HALTED'
+         ORDER BY created_at DESC LIMIT 1`,
+        [orderId]
+      );
+      const halt = haltCheck.rows[0];
+      const haltAgeHours = halt ? (Date.now() - new Date(halt.created_at).getTime()) / (1000 * 60 * 60) : 0;
+      const isFreshHalt = halt && haltAgeHours < 168; // 7 أيام
+
+      if (isFreshHalt && !flags._nested && !flags.force_bypass_halt) {
+        console.warn(`🛑 [CJ] #${orderId} HALTED ${Math.floor(haltAgeHours)}h ago — refusing re-fulfill (CJ dedup active)`);
+        return {
+          success: false,
+          halted: true,
+          reason: 'PREVIOUSLY_HALTED',
+          detail: halt.details,
+          haltAgeHours: Math.floor(haltAgeHours),
+        };
+      }
+      if (halt && !isFreshHalt) {
+        console.log(`ℹ️ [CJ] #${orderId} HALTED expired (${Math.floor(haltAgeHours)}h > 168h) — allowing fresh attempt (assume admin resolved in CJ)`);
+      }
+    } catch (e) {
+      console.warn(`🩹 [CJ] halt-check #${orderId} failed: ${e.message}`); // fail-open (لا نحجب الطلبات السليمة بسبب خطأ فحص)
+    }
+
     let safeCustomerName = (customerName || '').trim();
     if (!safeCustomerName || safeCustomerName.toLowerCase() === 'guest customer' || !safeCustomerName.includes(' ')) {
       safeCustomerName = safeCustomerName ? `${safeCustomerName} Customer` : 'Valued Customer';
