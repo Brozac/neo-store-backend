@@ -1,4 +1,9 @@
 // services/cjService.js - Laclarc Enterprise Dropshipping Engine (v3 FINAL)
+// 🩹 Hardened 2026-10-02 — full audit applied:
+//   • exports: + probeOrderStatus/classifyDuplicate (cjWebhookService P0-20 يعتمدهما)
+//   • attemptRefulfill: IN_FLIGHT لا يحرق محاولة SelfHeal (FIX#16)
+//   • fatal-path: zt.halted ينتشر (لا alert مكرر) (FIX#17)
+//   • resolveSplitDup: alive → يحفظ realCj الحقيقي (FIX#إ3)
 require('dotenv').config();
 const axios = require('axios');
 const pool = require('../db');
@@ -16,6 +21,8 @@ let tokenRefreshPromise = null; // ✨ Mutex — حماية ضد تسابق ال
 
 // ==========================================
 // 1. نظام إدارة وتجديد التوكن المحصن (Thread-Safe)
+// 🩹 v3 — الـ finally القديم كان يُنفّذ قبل تعيين الـ promise (throw متزامن =
+//    rejected promise مخزّن للأبد). الآن: التعيين خارج الـ IIFE + تنظيف شرطي.
 // ==========================================
 async function getCJToken(forceRefresh = false) {
   if (!forceRefresh && cachedCjToken && cachedCjTokenExpiry && Date.now() < cachedCjTokenExpiry) {
@@ -26,7 +33,7 @@ async function getCJToken(forceRefresh = false) {
     return await tokenRefreshPromise;
   }
 
-  tokenRefreshPromise = (async () => {
+  const refreshJob = (async () => {
     const apiKey = process.env.CJ_API_KEY;
     if (!apiKey) throw new Error("CJ_API_KEY is missing in environment variables");
 
@@ -63,11 +70,17 @@ async function getCJToken(forceRefresh = false) {
         throw new Error(`CJ Authentication failed: ${authRes.data.message || 'Unknown error'}`);
       }
     } finally {
-      tokenRefreshPromise = null;
+      // cleanup happens outside (below) — a synchronous throw would run this block BEFORE the promise is assigned,
+      // leaving a rejected promise cached forever
     }
   })();
 
-  return await tokenRefreshPromise;
+  tokenRefreshPromise = refreshJob;
+  refreshJob.then(() => {}, () => {}).finally(() => {
+    if (tokenRefreshPromise === refreshJob) tokenRefreshPromise = null;
+  });
+
+  return await refreshJob;
 }
 
 // ==========================================
@@ -131,6 +144,84 @@ const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
 
 const DEAD_CJ_STATUSES = ['TRASH', 'CANCELLED', 'CLOSED', 'INTERCEPTED'];
 
+// 🔢 CJ يحتجز رقم الطلب للأبد حتى بعد الحذف (TRASH) → 1603003 دائماً.
+// الترقيم حتمي (deterministic): STORE-77, STORE-77-R2, STORE-77-R3 ... ويستأنف من آخر رقم *مؤكد الموت*
+// (ذاكرة + system_events) بدل ما يعاود من الصفر كل استدعاء ويحرق الـ carriers على أرقام ميتة (سبب حلقة #77).
+// حتمي = idempotent: لو CJ قبل الطلب ولم يُحفظ رقمه عندنا، المحاولة التالية تلقاه (1603003 + probe حي) ولا تنشئ نسخة ثانية.
+const MAX_NUMBER_BUMPS = 12;   // سقف الأرقام المحروقة في استدعاء واحد (كل رقم ≈ 5 ثواني)
+const MAX_SPLIT_BUMPS = 6;
+const burnedBump = new Map();           // base -> أعلى bump مؤكد الموت
+const fulfillInFlight = new Set();      // orderId — fulfillment واحد فقط لكل طلب في نفس الوقت
+const capiSent = new Set();             // orderId — Purchase مرة واحدة لكل عملية
+
+const numberFor = (base, bump) => (bump <= 1 ? base : `${base}-R${bump}`);
+
+async function loadBurnedBump(base, orderId) {
+  let max = burnedBump.get(base) || 0;
+  try {
+    const { rows } = await pool.query(
+      `SELECT details FROM system_events WHERE order_id = $1 AND event_type = 'CJ_NUMBER_BURNED' ORDER BY created_at DESC LIMIT 200`,
+      [orderId]
+    );
+    for (const r of rows) {
+      let d = r.details;
+      if (typeof d === 'string') { try { d = JSON.parse(d); } catch { continue; } }
+      if (d && d.base === base && Number.isInteger(d.bump) && d.bump > max) max = d.bump;
+    }
+  } catch (e) {
+    console.warn(`⚠️ [CJ] loadBurnedBump #${orderId} failed (${e.message}) — using in-memory state`);
+  }
+  if (max > 0) burnedBump.set(base, max);
+  return max;
+}
+
+async function markBurned(base, bump, orderId, reason) {
+  if (bump > (burnedBump.get(base) || 0)) burnedBump.set(base, bump);
+  await auditEvent('CJ_NUMBER_BURNED', orderId, { base, bump, number: numberFor(base, bump), reason }, 'info');
+}
+
+// 1603003 = "الرقم موجود" — نجاح منطقي فقط إذا أثبت الـ probe أنه حي *ولنفس الرقم*
+//   alive → نجاح | dead → رقم محروق (نرقّي) | ambiguous → لا ننشئ نسخة ثانية ولا نعلن نجاحاً (halt)
+function classifyDuplicate(probe) {
+  if (!probe || !probe.status || probe.status === 'UNKNOWN') return 'ambiguous';
+  if (!probe.matched) return 'ambiguous';
+  if (DEAD_CJ_STATUSES.includes(probe.status)) return 'dead';
+  return 'alive';
+}
+
+async function getSavedCjNumber(orderId) {
+  try {
+    const r = await pool.query('SELECT cj_order_number FROM orders WHERE id = $1', [orderId]);
+    return r.rows[0]?.cj_order_number || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 🛑 توقف لا يحله إعادة المحاولة → manual + alert مفصّل (القرار البشري: refund/إصلاح) — لا S1/S2/refund آلي
+async function haltOrderManual(orderId, info, lastErr) {
+  try {
+    await pool.query(
+      "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status IN ('paid','pending','processing')",
+      [orderId]
+    );
+  } catch (e) {
+    console.warn(`⚠️ [CJ] haltOrderManual #${orderId} status update failed: ${e.message}`);
+  }
+  let errStr = '';
+  try { errStr = typeof lastErr === 'string' ? lastErr : JSON.stringify(lastErr || {}); } catch (e) { errStr = String(lastErr); }
+  await auditEvent('CJ_ORDER_HALTED', orderId, { ...info, lastError: errStr.slice(0, 500) }, 'critical');
+  console.error(`🛑 [CJ] #${orderId} HALTED (${info.reason}) → manual. ${JSON.stringify(info)}`);
+  sendAdminAlert(
+    `🛑 CJ order #${orderId} متوقف — ${info.reason}`,
+    `<p>الـ fulfillment توقف لأن إعادة المحاولة لن تحل المشكل (وS1/S2 كانا سيعيدان نفس الفشل + إيميل جديد للزبون).</p>
+     <p><b>السبب:</b> <code>${info.reason}</code></p>
+     <pre style="background:#f5f5f5;padding:10px;border-radius:6px">${JSON.stringify(info, null, 2)}</pre>
+     <p><b>آخر رد من CJ:</b> <code>${errStr.slice(0, 400).replace(/</g, '&lt;')}</code></p>
+     <p>الحالة → manual. افحص الطلب في CJ Dashboard (هل موجود فعلاً؟) ثم قرّر: إعادة إرسال يدوية أو refund.</p>`
+  ).catch(() => {});
+}
+
 function extractCjNumber(dataObj) {
   const d = dataObj || {};
   const isOurEcho = (v) => typeof v === 'string' && /^STORE-/i.test(v);
@@ -157,13 +248,27 @@ async function probeOrderStatus(targetOrderNumber, tag) {
         headers: { 'CJ-Access-Token': token },
       })
     );
-    const dd = detail.data?.data || {};
+    // ⚠️ code != 200 (طلب غير موجود/خطأ) = غير معروف — ماشي "حي" (كان يمر كنجاح منطقي كاذب)
+    const body = detail.data || {};
+    const okBody = body.code === 200 || (body.code === undefined && body.data);
+    if (!okBody) {
+      console.warn(`⚠️ [CJ] probe (${tag}) ${targetOrderNumber}: code=${body.code} message=${body.message}`);
+      return { status: 'UNKNOWN', realCj: null, orderNum: '', matched: false };
+    }
+    const dd = body.data || {};
     sampleOnce(tag, dd);
     const realCj = extractCjNumber(dd) || extractCjNumber(dd.orderInfo);
-    return { status: String(dd.orderStatus || '').toUpperCase(), realCj };
+    const status = String(dd.orderStatus || '').toUpperCase() || 'UNKNOWN';
+    // 🔍 هل الطلب المرجّع هو *نفس* الرقم المسؤول عنه؟ (CJ قد يرجّع طلباً آخر)
+    const orderNum = String(dd.orderNum || '').trim();
+    const t = String(targetOrderNumber || '').trim().toLowerCase();
+    const same = (v) => String(v || '').trim().toLowerCase() === t;
+    // ⓘ متساهل عمداً: رد بلا orderNum يُعتبر مطابقاً (يفادي halts كاذبة) — العينات تثبت orderNum دائماً حاضر
+    const matched = !orderNum || same(orderNum) || same(dd.cjOrderCode) || same(dd.orderId);
+    return { status, realCj, orderNum, matched };
   } catch (e) {
     console.warn(`⚠️ [CJ] probe (${tag}) فشل لـ ${targetOrderNumber}:`, e.response?.data?.message || e.message);
-    return { status: 'UNKNOWN', realCj: null };
+    return { status: 'UNKNOWN', realCj: null, orderNum: '', matched: false };
   }
 }
 
@@ -187,7 +292,7 @@ async function auditEvent(eventType, orderId, details = {}, severity = 'info') {
 async function financialGate(orderId) {
   try {
     const r = await pool.query(
-      'SELECT payment_method, payment_ref, total_amount, stripe_session_id, payment_status FROM orders WHERE id = $1',
+      'SELECT status, payment_method, payment_ref, total_amount, stripe_session_id, payment_status FROM orders WHERE id = $1',
       [orderId]
     );
     const o = r.rows[0];
@@ -330,7 +435,25 @@ async function getOrderTotalAmount(orderId) {
   }
 }
 
+// 🔒 fulfillment واحد لكل طلب في نفس الوقت (Reconcile / JIT / webhook / retry / exchange / SelfHeal كلهم يصلون هنا)
+// استدعاءات ZeroTouch S1 الداخلية (_nested) تمر لأنها تحت قفل المستدعي الأب
 async function fulfillCJOrder(orderId, customerName, customerDetails, items, orderNumberOverride = null, forcedLogisticName = null, flags = {}) {
+  const nested = !!(flags && flags._nested === true);
+  const lockKey = String(orderId);
+  if (!nested) {
+    if (fulfillInFlight.has(lockKey)) {
+      console.warn(`⏭️ [CJ] #${orderId} fulfillment already in flight — skipped (no side effects)`);
+      return { success: false, reason: 'IN_FLIGHT' };
+    }
+    fulfillInFlight.add(lockKey);
+  }
+  try {
+    return await fulfillCJOrderImpl(orderId, customerName, customerDetails, items, orderNumberOverride, forcedLogisticName, flags || {});
+  } finally {
+    if (!nested) fulfillInFlight.delete(lockKey);
+  }
+}
+async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items, orderNumberOverride = null, forcedLogisticName = null, flags = {}) {
   let cjCreated = false;
   // 🏦 financialGate — Tenet #15
   const _gate = await financialGate(orderId);
@@ -351,7 +474,11 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
     const safeEmail = (customerDetails?.email || '').trim() || 'orders@laclarc.com';
 
     // ═══ CAPI Purchase — Fire-and-Forget (Tenet #3) ═══
+    // 🛡️ مرة واحدة لكل طلب لكل عملية — S1/retries كانت تبعث Purchase جديد في كل محاولة (20+ لـ #77)
     (async () => {
+      if (capiSent.has(orderId)) return;
+      capiSent.add(orderId);
+      if (capiSent.size > 5000) capiSent.delete(capiSent.values().next().value);
       try {
         const { rows } = await pool.query(
           'SELECT total_amount, customer_email, customer_phone, customer_name, customer_city, utm_source, utm_campaign, click_id FROM orders WHERE id = $1',
@@ -381,8 +508,9 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
           clickId:      order.click_id,
         })
           .then((s) => console.log(`[CAPI] purch_${orderId} dispatched ✓`, JSON.stringify(s)))
-          .catch((e) => console.warn(`[CAPI] purch_${orderId} non-fatal: ${e.message}`));
+          .catch((e) => { capiSent.delete(orderId); console.warn(`[CAPI] purch_${orderId} non-fatal: ${e.message}`); });
       } catch (e) {
+        capiSent.delete(orderId); // فشل قبل الإرسال — نسمح بمحاولة لاحقة
         console.warn(`[CAPI] purch_${orderId} context-guard: ${e.message}`);
       }
     })();
@@ -436,8 +564,11 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
     let needsSplitting = false;
     let successfulCJOrderNumber = null;
 
-    let orderNumberSeed = orderNumberOverride || `STORE-${orderId}`;
-    let numberBump = 1;
+    const baseNumber = orderNumberOverride || `STORE-${orderId}`;
+    let numberBump = orderNumberOverride ? 1 : (await loadBurnedBump(baseNumber, orderId)) + 1;
+    let orderNumberSeed = numberFor(baseNumber, numberBump);
+    let bumpsThisCall = 0;
+    let halted = null; // { reason, ... } — توقف لا تحله إعادة المحاولة → manual + alert (ماشي S1/S2/refund)
 
     let safeLine1 = (addr.line1 || 'Main Street 1').trim();
     if (!/\d/.test(safeLine1)) safeLine1 += ' 1';
@@ -469,8 +600,57 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
       ).catch((e) => console.warn('⚠️ [CJ] saveCjNumber failed for #' + orderId + ' (' + num + '): ' + e.message));
     }
 
+    // يحرق الرقم الحالي (يسجله) ثم ينتقل للتالي — false إذا تجاوزنا السقف
+    const advanceNumber = async (reason) => {
+      if (!orderNumberOverride) await markBurned(baseNumber, numberBump, orderId, reason);
+      if (++bumpsThisCall > MAX_NUMBER_BUMPS) return false;
+      numberBump += 1;
+      orderNumberSeed = numberFor(baseNumber, numberBump);
+      return true;
+    };
+
+    // 'success' (حي ونفس الرقم) | 'retry' (محروق → رقم جديد + نفس الـ carrier) | 'halt' (غير مؤكد/سقف)
+    const handleDuplicate = async (targetOrderNumber) => {
+      const probe = await probeOrderStatus(targetOrderNumber, 'OrderDetail');
+      const kind = classifyDuplicate(probe);
+
+      if (kind === 'alive') {
+        console.log(`ℹ️ [CJ] Order #${orderId} already exists (${probe.status}) — logical success.`);
+        orderSuccess = true;
+        cjCreated = true;
+        successfulCJOrderNumber = probe.realCj || targetOrderNumber;
+        if (probe.realCj && probe.realCj !== targetOrderNumber) {
+          console.log(`🔗 [CJ] #${orderId} → رقم CJ الحقيقي: ${probe.realCj}`);
+        }
+        await saveCjNumber(successfulCJOrderNumber);
+        return 'success';
+      }
+
+      if (kind === 'dead') {
+        console.warn(`🧟 [CJ] #${orderId} 1603003 لكن ${targetOrderNumber} DEAD (${probe.status}) — رقم محتجز. ترقية → ${numberFor(baseNumber, numberBump + 1)}`);
+        orderSuccess = false;
+        if (!(await advanceNumber(`probe_dead_${probe.status}`))) {
+          halted = { reason: 'number_walk_cap', number: targetOrderNumber, probeStatus: probe.status, bumps: bumpsThisCall };
+          return 'halt';
+        }
+        return 'retry';
+      }
+
+      // ambiguous — لا نعلن نجاحاً ولا نرقّي: الرقم قد يكون حياً فعلاً (إنشاء نسخة ثانية = شحنة مزدوجة)
+      // أو CJ يرفض بسبب المحتوى (نفس الزبون/العنوان) لا بسبب الرقم
+      halted = {
+        reason: 'duplicate_unverifiable',
+        number: targetOrderNumber,
+        probeStatus: probe.status,
+        probeOrderNum: probe.orderNum || null,
+        probeMatched: probe.matched,
+      };
+      return 'halt';
+    };
+
     // 1. محاولة الإرسال المجمّع
-    for (const logisticName of logisticsToTry) {
+    for (let li = 0; li < logisticsToTry.length; li++) {
+      const logisticName = logisticsToTry[li];
       const targetOrderNumber = orderNumberSeed;
       const cjOrderPayload = {
         ...basePayload,
@@ -514,7 +694,10 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
               cjCreated = false;
               orderSuccess = false;
               successfulCJOrderNumber = null;
-              orderNumberSeed = `STORE-${orderId}-R${++numberBump}`;
+              if (!(await advanceNumber('zombie_deleted'))) {
+                halted = { reason: 'number_walk_cap', number: targetOrderNumber, bumps: bumpsThisCall };
+                break;
+              }
               continue;
             }
 
@@ -539,26 +722,11 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
           break;
         }
 
-        // ✨ 1603003 — Fix#4: نجاح منطقي فقط إلا كان حياً
+        // ✨ 1603003 — نجاح منطقي فقط إذا أثبت الـ probe أنه حي ولنفس الرقم (انظر handleDuplicate)
         if (lastError.code === 1603003) {
-          const probe = await probeOrderStatus(targetOrderNumber, 'OrderDetail');
-
-          if (DEAD_CJ_STATUSES.includes(probe.status)) {
-            console.warn(`🧟 [CJ] #${orderId} 1603003 لكن الموجود DEAD (${probe.status}) — رقم محتجز. ترقية → STORE-${orderId}-R${numberBump + 1}`);
-            orderNumberSeed = `STORE-${orderId}-R${++numberBump}`;
-            orderSuccess = false;
-            continue;
-          }
-
-          console.log(`ℹ️ [CJ] Order #${orderId} already exists (${probe.status}) — logical success.`);
-          orderSuccess = true;
-          cjCreated = true;
-          successfulCJOrderNumber = probe.realCj || targetOrderNumber;
-          if (probe.realCj && probe.realCj !== targetOrderNumber) {
-            console.log(`🔗 [CJ] #${orderId} → رقم CJ الحقيقي: ${probe.realCj}`);
-          }
-          await saveCjNumber(successfulCJOrderNumber);
-          break;
+          const act = await handleDuplicate(targetOrderNumber);
+          if (act === 'retry') { li--; continue; } // نفس الـ carrier برقم جديد — لا نحرق carrier على رقم ميت
+          break; // success | halt
         }
 
         // 💰 1605001 — محفظة فارغة → orderFlow:0
@@ -586,21 +754,10 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
         if (lastError.code === 1600200) break;
       } catch (err) {
         if (err.response?.data?.code === 1603003) {
-          const probe = await probeOrderStatus(targetOrderNumber, 'OrderDetail');
-
-          if (DEAD_CJ_STATUSES.includes(probe.status)) {
-            console.warn(`🧟 [CJ] #${orderId} 1603003(exception) الموجود DEAD (${probe.status}) — ترقية الرقم + carrier موالي`);
-            orderNumberSeed = `STORE-${orderId}-R${++numberBump}`;
-            orderSuccess = false;
-            continue;
-          }
-
-          console.log(`ℹ️ [CJ] Order #${orderId} already exists (exception, ${probe.status}) — success.`);
-          orderSuccess = true;
-          cjCreated = true;
-          successfulCJOrderNumber = probe.realCj || targetOrderNumber;
-          await saveCjNumber(successfulCJOrderNumber);
-          break;
+          lastError = err.response.data;
+          const act = await handleDuplicate(targetOrderNumber);
+          if (act === 'retry') { li--; continue; }
+          break; // success | halt
         }
         lastError = err.response?.data || err.message;
       }
@@ -614,10 +771,34 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
 
       for (let i = 0; i < cjProducts.length; i++) {
         const product = cjProducts[i];
-        let itemSuccess = false;
+        const splitBase = `STORE-${orderId}-S${i + 1}`;
+        let splitBump = (await loadBurnedBump(splitBase, orderId)) + 1;
+        let splitWalks = 0;
+        let itemDone = false;
 
-        for (const logisticName of logisticsToTry) {
-          const splitOrderNum = `STORE-${orderId}-S${i + 1}`;
+        // 'success' | 'retry' | 'halt' — نفس منطق الطلب الكامل (كان يعتبر أي 1603003 نجاحاً حتى لو TRASH)
+        // 🩹 FIX#إ3 — يرجع أيضاً realCj الحقيقي (كان يُخسى: نجاح منطقي كان يدفع رقمنا الوهمي للـ DB
+        //    بينما CJ يعرف الطلب برقم SD مختلف — tracking batch كان يلتقطه بالـ dual-key صدفةً)
+        const resolveSplitDup = async (num) => {
+          const probe = await probeOrderStatus(num, 'SplitDetail');
+          const kind = classifyDuplicate(probe);
+          if (kind === 'alive') return { act: 'success', realCj: probe.realCj || num };
+          if (kind === 'dead') {
+            await markBurned(splitBase, splitBump, orderId, `probe_dead_${probe.status}`);
+            if (++splitWalks > MAX_SPLIT_BUMPS) {
+              halted = halted || { reason: 'split_number_walk_cap', number: num };
+              return { act: 'halt' };
+            }
+            splitBump += 1;
+            return { act: 'retry' };
+          }
+          halted = halted || { reason: 'split_duplicate_unverifiable', number: num, probeStatus: probe.status };
+          return { act: 'halt' };
+        };
+
+        for (let li = 0; li < logisticsToTry.length && !itemDone; li++) {
+          const logisticName = logisticsToTry[li];
+          const splitOrderNum = numberFor(splitBase, splitBump);
           const splitPayload = {
             ...basePayload,
             orderNumber: splitOrderNum,
@@ -625,6 +806,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
             products: [product]
           };
 
+          let dup = false;
           try {
             await new Promise(r => setTimeout(r, 1200));
             const splitRes = await cjRequest((token) =>
@@ -636,7 +818,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
 
             if (splitRes.data.code === 200) {
               console.log(`✅ Split [${i + 1}/${cjProducts.length}] sent via ${logisticName}!`);
-              itemSuccess = true;
+              itemDone = true;
               successfulSplits++;
               splitOrdersCreated.push(splitOrderNum);
               cjCreated = true;
@@ -644,23 +826,23 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
               if (splitCj && splitCj !== splitOrderNum) await saveCjNumber(splitCj);
               break;
             }
-            if (splitRes.data.code === 1603003) {
-              console.log(`ℹ️ [CJ Split] ${splitOrderNum} already exists (body).`);
-              itemSuccess = true;
-              successfulSplits++;
-              splitOrdersCreated.push(splitOrderNum);
-              cjCreated = true;
-              break;
-            }
+            if (splitRes.data.code === 1603003) dup = true;
           } catch (err) {
-            if (err.response?.data?.code === 1603003) {
-              console.log(`ℹ️ [CJ Split] ${splitOrderNum} already exists (exception).`);
-              itemSuccess = true;
+            if (err.response?.data?.code === 1603003) dup = true;
+          }
+
+          if (dup) {
+            const res = await resolveSplitDup(splitOrderNum);
+            if (res.act === 'success') {
+              console.log(`ℹ️ [CJ Split] ${res.realCj} already exists (alive) — logical success.`);
+              itemDone = true;
               successfulSplits++;
-              splitOrdersCreated.push(splitOrderNum);
+              splitOrdersCreated.push(res.realCj);   // 🩹 FIX#إ3 — الرقم الحقيقي لا الوهمي
               cjCreated = true;
               break;
             }
+            if (res.act === 'retry') { li--; continue; }
+            break; // halt — هذا العنصر لا يُحل بإعادة المحاولة
           }
         }
       }
@@ -706,12 +888,19 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
 
     console.error(`❌ CJ Order Fulfillment Failed for #${orderId}. Reason:`, lastError);
 
+    // 🛑 توقف لا تحله إعادة المحاولة (1603003 غير مؤكد / سقف الترقيم) — S1/S2 ينشئان طلبات عند CJ
+    // فيعيدان نفس الفشل + إيميل جديد للزبون (الحلقة الأصلية). المسار الصادق: manual + alert بالتفاصيل.
+    if (halted) {
+      if (!flags._nested) await haltOrderManual(orderId, halted, lastError); // الاستدعاءات الداخلية لا تنبّه — الأب يفعل مرة واحدة
+      return { success: false, halted: true, reason: 'CJ_DUPLICATE_BLOCKED', detail: halted, error: lastError };
+    }
+
     // 🤖 Mission #16 — Zero-Touch recovery بدل manual
     // 🆕 Mission #17 — skipZeroTouch: من الحلقات الذاتية (inner S1 attempts)
     if (!flags.skipZeroTouch) {
       try {
         const vids = cjProducts.map(p => ({ vid: p.vid, quantity: p.quantity }));
-        await zeroTouchRecovery(orderId, {
+        const zt = await zeroTouchRecovery(orderId, {
           country: addr.country || 'US',
           vids,
           totalAmount: parseFloat(await getOrderTotalAmount(orderId)),
@@ -719,6 +908,13 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
           customerPhone: basePayload.shippingPhone,
           customerName: safeCustomerName,
         });
+        // ✅ S1 نجح فعلاً → الطلب عند CJ: لا نرجّع فشلاً كاذباً (كان يُفعّل manual/alerts خاطئة عند المستدعين)
+        if (zt && zt.recovered) {
+          return { success: true, orderNumber: await getSavedCjNumber(orderId), via: `zerotouch_${zt.strategy}` };
+        }
+        if (zt && zt.halted) {
+          return { success: false, halted: true, reason: 'CJ_DUPLICATE_BLOCKED', detail: zt.detail, error: lastError };
+        }
       } catch (ztErr) {
         console.warn(`🤖 [ZeroTouch] #${orderId} recovery exception: ${ztErr.message}`);
         await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
@@ -735,7 +931,7 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
       if (!flags.skipZeroTouch) {
         try {
           const vids = (items || []).map(it => ({ vid: it.vid || '', quantity: it.quantity || 1 })).filter(v => v.vid);
-          await zeroTouchRecovery(orderId, {
+          const zt = await zeroTouchRecovery(orderId, {
             country: 'US',
             vids,
             totalAmount: parseFloat(await getOrderTotalAmount(orderId)),
@@ -743,6 +939,13 @@ async function fulfillCJOrder(orderId, customerName, customerDetails, items, ord
             customerPhone: customerDetails?.phone || '',
             customerName: customerName || '',
           });
+          if (zt && zt.recovered) {
+            return { success: true, orderNumber: await getSavedCjNumber(orderId), via: `zerotouch_${zt.strategy}` };
+          }
+          // 🩹 FIX#17 — halted في الفادح ينتشر (كان يسقط لرد عام → alert مكرر عند المستدعي)
+          if (zt && zt.halted) {
+            return { success: false, halted: true, reason: 'CJ_DUPLICATE_BLOCKED', detail: zt.detail, error: err.message };
+          }
         } catch (ztErr) {
           console.warn(`🤖 [ZeroTouch] fatal-path failed: ${ztErr.message}`);
           await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]).catch(() => {});
@@ -854,7 +1057,8 @@ async function executeS3(orderId, { totalAmount, customerEmail }) {
         ? await stripe.paymentIntents.retrieve(session.payment_intent)
         : session.payment_intent;
       if (!pi?.latest_charge) throw new Error('no latest_charge — لا شهادة دفع قابلة للاسترداد');
-      await stripe.refunds.create({ charge: pi.latest_charge });
+      // 🛡️ idempotencyKey — حتى لو نفّذ الجسم مرتين (سباق نظري)، Stripe يدمجهما
+      await stripe.refunds.create({ charge: pi.latest_charge }, { idempotencyKey: `refund-order-${orderId}` });
       await pool.query("UPDATE orders SET status = 'refunded' WHERE id = $1", [orderId]);
       await auditEvent('ZEROTOUCH_S3_REFUNDED', orderId, { amount: totalAmount }, 'warning');
       sendAdminAlert(`💰 ZeroTouch S3 — Order #${orderId} auto-refunded ($${totalAmount})`,
@@ -890,7 +1094,6 @@ async function executeS3(orderId, { totalAmount, customerEmail }) {
   }
   return { recovered: false, strategy: 'S3_manual_gateway' };
 }
-
 // 🤖 zeroTouchRecovery — Mission #16 (S1→S2→S3) — محصّن ضد الحلقات
 // ═══════════════════════════════════════════════════════════════
 const zeroTouchGuard = new Set(); // 🆕 Mission #17 — loop guard
@@ -936,6 +1139,7 @@ async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customer
       if (fr.data?.code === 200) s1Options = fr.data.data || [];
     } catch (e) { console.warn(`🤖 [ZeroTouch] S1 freight failed: ${e.message}`); }
 
+    let haltedInner = null;
     if (s1Options.length > 0) {
       console.log(`🤖 [ZeroTouch] #${orderId} S1: ${s1Options.length} freight options — retrying with each...`);
       for (const opt of s1Options) {
@@ -964,17 +1168,25 @@ async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customer
             itemsRes.rows,
             null,
             opt.logisticName,
-            { skipZeroTouch: true }   // 🆕 #17 — لا استدعاء ذاتي
+            { skipZeroTouch: true, _nested: true }   // 🆕 #17 — لا استدعاء ذاتي | _nested = تحت قفل الأب
           );
           if (res.success) {
             await auditEvent('ZEROTOUCH_S1_SUCCESS', orderId, { carrier: opt.logisticName, cost: opt.logisticPrice }, 'info');
             console.log(`✅ [ZeroTouch] #${orderId} S1 SUCCESS via ${opt.logisticName} ($${opt.logisticPrice})`);
             return { recovered: true, strategy: 'S1_force_carrier' };
           }
+          // 🩹 halt داخلي → كسر الحلقة — الـ halt اليدوي الوحيد يقع هنا (لا مكرر)
+          if (res.halted) { haltedInner = res.detail || { reason: 'duplicate_unverifiable' }; break; }
         } catch (e) {
           console.warn(`🤖 [ZeroTouch] #${orderId} S1 attempt (${opt.logisticName}) failed: ${e.message}`);
         }
       }
+    }
+
+    // 🛑 S1 اصطدم بـ 1603003 غير قابل للحل → S2 سيعيد نفس الفشل + إيميل للزبون: manual + alert بدلاً منه
+    if (haltedInner) {
+      await haltOrderManual(orderId, haltedInner, null);
+      return { recovered: false, strategy: 'halted', halted: true, detail: haltedInner };
     }
 
     // ─── S2: بديل آلي — نفس الفئة، سعر ±30% ───
@@ -985,7 +1197,7 @@ async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customer
         FROM products p
         WHERE p.stock_status = true
           AND p.id != (SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1)
-          AND p.price BETWEEN 
+          AND p.price BETWEEN
             (SELECT price * 0.7 FROM order_items WHERE order_id = $1 LIMIT 1) AND
             (SELECT price * 1.3 FROM order_items WHERE order_id = $1 LIMIT 1)
           AND p.category = (SELECT category FROM products WHERE id = (SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1))
@@ -1049,9 +1261,9 @@ async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customer
     const hoursStuck = ageRows[0]?.hours || 0;
 
     if (hoursStuck >= 72) {
-  console.log(`🤖 [ZeroTouch] #${orderId} S3: 72h+ no decision — auto-refund path...`);
-  return await executeS3(orderId, { totalAmount, customerEmail, via: 'main' });
-}
+      console.log(`🤖 [ZeroTouch] #${orderId} S3: 72h+ no decision — auto-refund path...`);
+      return await executeS3(orderId, { totalAmount, customerEmail, via: 'main' });
+    }
 
     await auditEvent('ZEROTOUCH_PENDING', orderId, { strategy_tried: 'S1+S2', hours_stuck: hoursStuck }, 'info');
     return { recovered: false, strategy: 'pending' };
@@ -1181,8 +1393,8 @@ async function selfHealStuckOrders() {
       if (DEAD_CJ_STATUSES.includes(cjStatus)) {
         console.warn(`🩺 [SelfHeal] #${oid} DEAD at CJ (${cjStatus}) — clearing code, re-fulfilling fresh...`);
         await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
-        await attemptRefulfill(oid, cand, 'dead-order');
-        att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att);
+        const r1 = await attemptRefulfill(oid, cand, 'dead-order');
+        if (r1 !== false) { att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att); } // 🩹 FIX#16
         continue;
       }
 
@@ -1193,8 +1405,9 @@ async function selfHealStuckOrders() {
         console.log(`🧹 [SelfHeal] #${oid} zombie deleted — re-fulfilling...`);
         await auditEvent('SELFHEAL_DELETE', oid, { code }, 'info');
         await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
-        const ok = await attemptRefulfill(oid, cand, 'zombie-recreate');
-        if (ok) { healed1++; att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att); continue; }
+        const r = await attemptRefulfill(oid, cand, 'zombie-recreate');
+        if (r === true) { healed1++; att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att); continue; }
+        // 🩹 FIX#16 — r === null يعني IN_FLIGHT (webhook/JIT ماسك الطلب) — لا يُحرق كمحاولة
       }
 
       // L2 — payBalance
@@ -1210,8 +1423,8 @@ async function selfHealStuckOrders() {
         if (DEAD_CJ_STATUSES.includes(detailStatus)) {
           console.warn(`🩺 [SelfHeal] #${oid} is ${detailStatus} at detail-level — clearing + re-fulfill`);
           await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
-          await attemptRefulfill(oid, cand, 'dead-detail-recreate');
-          att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att);
+          const r2 = await attemptRefulfill(oid, cand, 'dead-detail-recreate');
+          if (r2 === true) { att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att); }
           continue;
         }
       } catch (e) { console.warn(`🩺 [SelfHeal] #${oid} detail-probe failed: ${e.message}`); }
@@ -1235,11 +1448,11 @@ async function selfHealStuckOrders() {
         sendAdminAlert(
           '💳 CJ Wallet — Top-up required (SelfHeal)',
           `<p>النظام يحاول إنقاذ طلبات عالقة بالدفع الذاتي لكن المحفظة لا تكفي.</p>
-           <p>الطلبات المنتظرة: ${candidates.filter(c => c.status === 'paid').length}</p>
+           <p>الطلبات المنتظرة: ${candidates.length}</p>
            <p>الإجراء البشري الوحيد: عمّر المحفظة — النظام يكمل الباقي أوتوماتيكياً.</p>`
         );
         walletAlerted = true;
-        await auditEvent('WALLET_EMPTY', null, { pending: candidates.filter(c => c.status === 'paid').length }, 'warning');
+        await auditEvent('WALLET_EMPTY', null, { pending: candidates.length }, 'warning');
       }
       console.warn(`🩺 [SelfHeal] #${oid} payBalance failed: ${pay.reason} — retried next cycle`);
       att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att);
@@ -1252,6 +1465,7 @@ async function selfHealStuckOrders() {
 }
 
 // 🔄 إعادة fulfillment — عبر financialGate (belt-and-suspenders)
+// 🩹 FIX#16 — return ثلاثي: true نجح · false فشل حقيقي (يحرق محاولة) · null IN_FLIGHT (لا يحرق)
 async function attemptRefulfill(oid, cand, tag) {
   try {
     const itemsRes = await pool.query(`
@@ -1283,6 +1497,10 @@ async function attemptRefulfill(oid, cand, tag) {
       { skipZeroTouch: true }  // 🆕 #17 — recovery داخلي بالفعل، لا استدعاء ذاتي
     );
     console.log(`🩺 [SelfHeal] #${oid} re-fulfill (${tag}) => ${resp.success ? '✅ ' + (resp.orderNumber || '') : '❌ ' + (resp.reason || resp.error || 'unknown')}`);
+
+    // 🩹 FIX#16 — fulfillment آخر (webhook/JIT/exchange) ماسك الطلب = هو المسؤول — لا تحرق محاولة SelfHeal عليه
+    if (!resp.success && resp.reason === 'IN_FLIGHT') return null;
+
     return !!resp.success;
   } catch (e) {
     console.warn(`🩺 [SelfHeal] #${oid} re-fulfill exception: ${e.message}`);
@@ -1307,7 +1525,7 @@ async function disputeWatchdogCron() {
 
   try {
     const { rows } = await pool.query(`
-      SELECT id, stripe_session_id, total_amount, customer_name, customer_email, cj_order_number
+      SELECT id, status, stripe_session_id, total_amount, customer_name, customer_email, cj_order_number
       FROM orders
       WHERE status IN ('paid', 'pending', 'manual')
         AND payment_method = 'Stripe'
@@ -1331,7 +1549,9 @@ async function disputeWatchdogCron() {
         await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'paid'", [o.id]);
 
         if (o.cj_order_number) {
-          const icpt = await deleteCJOrder(o.cj_order_number);
+          // 🩹 hygiene — split-numbers ("SD1, SD2") لا يفهمها delete — نأخذ الأول (تحسين Backlog#15 الكامل)
+          const firstCode = String(o.cj_order_number).split(',')[0].trim();
+          const icpt = await deleteCJOrder(firstCode, `STORE-${o.id}`);
           console.log(`⚖️ [DisputeWatch] #${o.id} CJ intercept => ${icpt.ok ? '✅ deleted' : 'ℹ️ not deletable — Dashboard manual'}`);
           await auditEvent('DISPUTE_INTERCEPT', o.id, { code: o.cj_order_number, deleted: icpt.ok }, 'warning');
         }
@@ -1437,4 +1657,8 @@ async function payCJOrderBalance(...candidates) {
   return { ok: false, reason: lastReason };
 }
 
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery };
+// ==========================================
+// 📤 التصديرات — 🩹 إجباري: probeOrderStatus + classifyDuplicate + auditEvent
+//    cjWebhookService v2.1 (P0-20 anti-spoof) يعتمدهما — بلاهما أول webhook يرمي undefined
+// ==========================================
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate };

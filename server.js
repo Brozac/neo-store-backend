@@ -1,3 +1,5 @@
+// server.js — Laclarc Enterprise Dropshipping Engine (hardened)
+// Full audit applied 2026-10-02 (findings #1–#28 across session)
 require('dotenv').config();
 
 const express = require('express');
@@ -11,7 +13,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 const { parseVariants, getCategorySlug, phoneAccRegex, pcBlacklistRegex } = require('./utils/parser');
 const { prepareSecureItems } = require('./utils/secureCheckout');
-const { applyCouponToTotal } = require('./utils/couponHelper'); // ✨ التعديل 1: Helper الكوبون الموحد
+const { applyCouponToTotal } = require('./utils/couponHelper'); // ✨ Helper الكوبون الموحد
 const { detectAndConvert, SUPPORTED } = require('./lib/currency');
 const { translateProduct, getLangFromCountry } = require('./lib/i18nEngine');
 
@@ -25,6 +27,7 @@ const { buildProductRow, upsertProductRow } = require('./services/productImportS
 const { selfHealStuckOrders, disputeWatchdogCron, auditEvent } = require('./services/cjService');
 const logger = require('./logger');
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
+const shipTruth = require('./services/shipTruth'); // كان مستعمل بلا require → ReferenceError → 500 دايماً
 const multer = require('multer');
 const path = require('path');
 const cloudinary = require('cloudinary').v2;
@@ -41,29 +44,56 @@ const cookieParser = require('cookie-parser');
 app.set('trust proxy', 1);
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
 app.use(cookieParser());
+
 // Rate Limiters
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { message: 'Too many attempts, please try again after 15 minutes.' } });
 const couponLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts, please try again later.' } });
 const scraperLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 15, message: { error: 'Scraper rate limit exceeded.' } });
-const checkoutLimiter = rateLimit({ 
-  windowMs: 15 * 60 * 1000, 
-  max: 25, // 25 محاولة فتح جلسة دفع لكل زائر كل 15 دقيقة (كافية للزبون الطبيعي وتمنع البوتات)
-  message: { error: 'Too many checkout attempts, please try again in a few minutes.' } 
+const checkoutLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 25, // كافية للزبون الطبيعي وتمنع البوتات
+  message: { error: 'Too many checkout attempts, please try again in a few minutes.' }
 });
 const trackLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, message: { error: 'Too many tracking requests.' } });
+// 🩹 FIX#6 — second-shot amplification shield (dedup يحمي عدّ Meta، لا يحمي DB من النداءات)
+const secondShotLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, message: { error: 'Too many verification requests.' } });
 
 const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
 
-// ✨ التعديل 2: كاش ديال Stripe Coupons — مانصاوبوش كوبون جديد فكل checkout (Litter فالـ Dashboard)
+// 🩹 FIX#3/#8 — email & password hygiene (مشتركة بين كل مسارات auth)
+const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
+const assertStrongPassword = (pwd) => typeof pwd === 'string' && pwd.length >= 8;
+
+// ✨ كاش Stripe Coupons — 🩹 FIX#12: DB-backed (كان in-memory — كل deploy كيسرّب كوبون يتيم)
 const stripeCouponCache = new Map();
 async function getOrCreateStripeCoupon(couponData) {
   const key = JSON.stringify(couponData);
   if (stripeCouponCache.has(key)) return stripeCouponCache.get(key);
+
+  // جرّب الـ DB cache الأول (يعيش عبر deploys)
+  try {
+    const persisted = await pool.query(
+      'SELECT value FROM store_settings WHERE key = $1',
+      ['stripe_coupon_' + key]
+    );
+    if (persisted.rows[0]?.value) {
+      stripeCouponCache.set(key, persisted.rows[0].value);
+      return persisted.rows[0].value;
+    }
+  } catch (e) {
+    console.warn('⚠️ [CouponCache] read failed: ' + e.message);
+  }
+
   const sc = await stripe.coupons.create(couponData);
   stripeCouponCache.set(key, sc.id);
   if (stripeCouponCache.size > 200) {
     stripeCouponCache.delete(stripeCouponCache.keys().next().value);
   }
+  // persist — ما عادش يتيم
+  await pool.query(
+    "INSERT INTO store_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
+    ['stripe_coupon_' + key, sc.id]
+  ).catch((e) => console.warn('⚠️ [CouponCache] persist failed: ' + e.message));
   return sc.id;
 }
 
@@ -82,9 +112,9 @@ if (!JWT_SECRET) {
 
 if (process.env.NODE_ENV === 'production') {
   const requiredEnvVars = [
-    'DATABASE_URL', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 
-    'JWT_SECRET', 'CJ_API_KEY', 'ADMIN_EMAIL', 'ADMIN_PASSWORD', 
-    'BREVO_API_KEY', 'BREVO_USER', 'RESEND_API_KEY', 'FRONTEND_URL', 
+    'DATABASE_URL', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET',
+    'JWT_SECRET', 'CJ_API_KEY', 'ADMIN_EMAIL', 'ADMIN_PASSWORD',
+    'BREVO_API_KEY', 'BREVO_USER', 'RESEND_API_KEY', 'FRONTEND_URL',
     'CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'
   ];
   const missing = requiredEnvVars.filter((v) => !process.env[v]);
@@ -92,10 +122,14 @@ if (process.env.NODE_ENV === 'production') {
     console.error(`❌ Missing required environment variables in production: ${missing.join(', ')}`);
     process.exit(1);
   }
+  // 🩹 FIX#5 — NOWPAYMENTS: إما مربوط، أو crypto مقفول صراحةً (ماشي اكتشاف بأول زبون)
+  if (!process.env.NOWPAYMENTS_API_KEY) {
+    console.error('⚠️ NOWPAYMENTS_API_KEY missing — crypto gateway will be LOCKED (503). Set it before enabling Crypto.');
+  }
 }
+
 // ═══════════════════════════════════════════════════════════════
 // 🛡️ ADMIN SURFACE ENFORCER — سياج مركزي (Defense in Depth)
-// كل /api/admin/* محمي تلقائياً — الاستثناءات معلنة صراحة
 // ═══════════════════════════════════════════════════════════════
 const ADMIN_PUBLIC_EXCEPTIONS = new Set([
   '/api/admin/login',
@@ -103,7 +137,9 @@ const ADMIN_PUBLIC_EXCEPTIONS = new Set([
 ]);
 
 app.use((req, res, next) => {
-  if (!req.path.startsWith('/api/admin/') || ADMIN_PUBLIC_EXCEPTIONS.has(req.path)) {
+  // 🩹 hygiene — bare '/api/admin' محروس كذلك
+  const isAdminPath = req.path === '/api/admin' || req.path.startsWith('/api/admin/');
+  if (!isAdminPath || ADMIN_PUBLIC_EXCEPTIONS.has(req.path)) {
     return next();
   }
 
@@ -131,13 +167,14 @@ app.use((req, res, next) => {
     return res.status(403).json({ error: 'Access Denied: Invalid administrative token' });
   }
 });
+
 // ==========================================
 // 1. مسار Stripe Webhook (يجب أن يبقى قبل express.json)
 // ==========================================
 app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  
+
   if (!endpointSecret) {
     logger.logError('Stripe Webhook', new Error('STRIPE_WEBHOOK_SECRET is missing'));
     return res.status(500).send('Webhook not configured');
@@ -151,18 +188,17 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // الرد على Stripe فوراً بـ 200 OK لمنع انتهاء المهلة (Render Timeout)
   res.status(200).json({ received: true });
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-        const orderId = parseInt(session.metadata?.orderId, 10);
+    const orderId = parseInt(session.metadata?.orderId, 10);
     if (!Number.isFinite(orderId)) return; // 🛡️ metadata تالفة → تجاهل بنعومة
 
     (async () => {
       try {
         const customerName = session.customer_details?.name || 'Guest Customer';
-        const customerEmail = session.customer_details?.email || '';
+        const customerEmail = normalizeEmail(session.customer_details?.email);   // 🩹 FIX#8
         const customerPhone = session.customer_details?.phone || '';
         const addr = session.customer_details?.address;
         const shippingAddress = addr ? JSON.stringify(addr) : JSON.stringify({ line1: 'Online Store Purchase', country: 'US' });
@@ -170,11 +206,11 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
 
         // 🚨 قفل ذري: واحد فقط كيربح (هادا ولا JIT verifier)
         const updateRes = await pool.query(
-          `UPDATE orders 
-           SET customer_name = $1, customer_email = $2, customer_phone = $3, 
-               shipping_address = $4, total_amount = $5, payment_method = 'Stripe', 
-               status = 'paid' 
-           WHERE id = $6 AND status = 'pending' 
+          `UPDATE orders
+           SET customer_name = $1, customer_email = $2, customer_phone = $3,
+               shipping_address = $4, total_amount = $5, payment_method = 'Stripe',
+               status = 'paid'
+           WHERE id = $6 AND status = 'pending'
            RETURNING id`,
           [customerName, customerEmail, customerPhone, shippingAddress, totalAmount, orderId]
         );
@@ -185,9 +221,9 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
         }
 
         const itemsRes = await pool.query(`
-          SELECT oi.*, p.title, p.image_url 
-          FROM order_items oi 
-          LEFT JOIN products p ON oi.product_id = p.id 
+          SELECT oi.*, p.title, p.image_url
+          FROM order_items oi
+          LEFT JOIN products p ON oi.product_id = p.id
           WHERE oi.order_id = $1
         `, [orderId]);
         const items = itemsRes.rows;
@@ -196,9 +232,7 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
 
         const cjResponse = await fulfillCJOrder(orderId, customerName, session.customer_details, items);
 
-        // ✅ v2 — حيدنا UPDATE 'completed' (قاتل #1): الحالة تبقى paid +
-        //   cj_order_number محفوظ داخل fulfillCJOrder (يحمي من إعادة الـ Reconcile)
-        //   الويب هوك SHIPPED هو اللي كيرفع لـ fulfilled + يصيفط واتساب/إيميل فثواني
+        // ✅ v2 — بلا 'completed': الحالة تبقى paid، webhook SHIPPED هو اللي كيرفعها
         if (cjResponse && cjResponse.success) {
           console.log(`📤 [Stripe WH] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
         } else {
@@ -215,14 +249,15 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
     })();
   }
 });
+
 // ==========================================
 // 1.5 مسار CJ Webhook (يجب أن يبقى قبل express.json — بحال Stripe)
 // ==========================================
-const { 
-  cjWebhookHandler, 
-  notifyShipment, 
-  registerWebhooks, 
-  subscribeAllStoreProducts 
+const {
+  cjWebhookHandler,
+  notifyShipment,
+  registerWebhooks,
+  subscribeAllStoreProducts
 } = require('./services/cjWebhookService');
 app.post('/api/cj-webhook', express.raw({ type: 'application/json' }), cjWebhookHandler);
 
@@ -303,7 +338,7 @@ async function sendEmail({ to, subject, html }) {
 }
 
 // ==========================================
-// إعداد Cloudinary & Multer
+// Cloudinary & Multer
 // ==========================================
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -327,7 +362,7 @@ app.post('/api/admin/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
     const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '4h' });
-    
+
     res.cookie('admin_token', token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
@@ -349,7 +384,7 @@ app.post('/api/admin/logout', (req, res) => {
   res.json({ message: 'Logged out successfully' });
 });
 
-// 🚨 تصحيح موقع الحماية: تفعيل حماية الأدمن هنا فوراً قبل أي مسار يبدأ بـ /api/admin
+// 🚨 حماية الأدمن فوراً قبل أي مسار /api/admin
 app.use('/api/admin', requireAdmin);
 
 // ==========================================
@@ -402,16 +437,11 @@ app.post('/api/admin/scrape-product', scraperLimiter, async (req, res) => {
   }
 });
 
-
 // ═══ 💱 Currency Detection — حسب بلد الزائر (Cloudflare header مجاني) ═══
-
 app.get('/api/currency/detect', async (req, res) => {
-  // 🆕 hoisted out of try — the old catch referenced `usd` out of scope
-  // (ReferenceError → unhandled rejection → process crash = public DoS vector)
+  // 🩹 FIX — usd خارج try (كان ReferenceError في الـ catch = كراش بعملية كاملة) + String() ضد array-params
   const usd = parseFloat(req.query.usd) || 0;
   try {
-    // 🆕 String() neutralizes Express array-params (?country=a&country=b)
-    // + slice caps input length
     const country = String(req.headers['cf-ipcountry'] || req.query.country || 'US')
       .toUpperCase()
       .slice(0, 2);
@@ -419,17 +449,18 @@ app.get('/api/currency/detect', async (req, res) => {
     res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=1800');
     res.json({ ...data, supported: SUPPORTED.map(s => s.code) });
   } catch (e) {
-    logger.logError('currency/detect', e); // 🆕 was a silent catch (Tenet #13)
+    logger.logError('currency/detect', e);
     res.json({ currency: 'USD', rate: 1, symbol: '$', localAmount: usd });
   }
 });
+
 // ==========================================
 // 📊 مسار تقارير أرباح الإعلانات (Ad Attribution & ROI Analytics)
 // ==========================================
 app.get('/api/admin/analytics/ads', requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT 
+      SELECT
         COALESCE(utm_source, 'organic/direct') AS source,
         COUNT(*) AS total_orders,
         COUNT(CASE WHEN status IN ('paid', 'completed', 'fulfilled') THEN 1 END) AS paid_orders,
@@ -457,8 +488,7 @@ app.post('/api/validate-coupon', couponLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid coupon request' });
     }
 
-    // ✨ التعديل 3: Helper الموحد — نفس منطق paymentController و create-checkout-session بالضبط
-    // (Fail-closed + سقف $0.50 للحد الأدنى ديال Stripe/NowPayments)
+    // ✨ Helper الموحد — fail-closed + سقف $0.50
     const { applied, discount, total } = await applyCouponToTotal(pool, code, cartTotal);
     if (!applied) {
       return res.status(404).json({ error: 'Invalid or expired coupon code.' });
@@ -486,7 +516,7 @@ app.post('/api/admin/add-coupon', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-// ✨ كوبون الاسترجاع — يُنشأ تلقائياً عند الإقلاع إن لم يكن موجوداً (سقف أمان: 10%)
+// ✨ كوبون الاسترجاع — seed عند الإقلاع (سقف أمان: 10%)
 (async () => {
   try {
     await pool.query(
@@ -503,7 +533,8 @@ app.post('/api/admin/add-coupon', async (req, res) => {
 app.get('/api/reviews/:productId', async (req, res) => {
   try {
     const { productId } = req.params;
-    const result = await pool.query('SELECT * FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [productId]);
+    // 🩹 FIX — أعمدة محددة (كان SELECT * يخرج user_id الداخلي في رد عام)
+    const result = await pool.query('SELECT id, product_id, author, rating, content, country, images, created_at FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [productId]);
     res.json(result.rows);
   } catch (err) {
       logger.logError('Route Handler', err);
@@ -515,13 +546,16 @@ app.post('/api/admin/add-review', async (req, res) => {
   try {
     const { product_id, author, rating, content, country } = req.body;
     if (!product_id || !author || !content) return res.status(400).json({ error: 'Product ID, Author, and Content are required' });
-    await pool.query('INSERT INTO reviews (product_id, author, rating, content, country) VALUES ($1, $2, $3, $4, $5)', [product_id, author, rating || 5, content, country || 'United States']);
+    // 🩹 FIX#9 — rating clamp (كان العميل يبعث 999)
+    const safeRating = Math.min(5, Math.max(1, Number(rating) || 5));
+    await pool.query('INSERT INTO reviews (product_id, author, rating, content, country) VALUES ($1, $2, $3, $4, $5)', [product_id, author, safeRating, content, country || 'United States']);
     res.status(201).json({ message: 'Review added successfully!' });
   } catch (err) {
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
+
 // ==========================================
 // 🐺 CJ Webhooks Management (Admin)
 // ==========================================
@@ -541,8 +575,7 @@ app.post('/api/admin/webhook/register', async (req, res) => {
 });
 
 app.post('/api/admin/webhook/subscribe', async (req, res) => {
-  // ✨ v2 — 200 فوري: الدفعات كياخدو دقايق (بوابة QPS + 3000ms بين الدفعات) والفرونت عنده 60s timeout
-  // (نفس نمط sync-categories — invariant #3: لا نحجب الرد على مهام طويلة)
+  // ✨ v2 — 200 فوري (invariant #3: لا نحجب الرد على مهام طويلة)
   res.json({ message: '📌 Subscription started in background — راقب اللوج للنتيجة النهائية' });
   (async () => {
     try {
@@ -564,20 +597,23 @@ app.post('/api/reviews/add', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Product ID and content are required' });
     }
 
-    // تنقية وتأمين مصفوفة صور Cloudinary المرفوعة
-    const safeImages = Array.isArray(images) 
-      ? images.filter(url => typeof url === 'string' && url.startsWith('http')) 
+    // 🩹 FIX#8 — صور Cloudinary فقط (كان startsWith('http') — أي domain يُقبل)
+    const safeImages = Array.isArray(images)
+      ? images.filter(url => typeof url === 'string' && url.startsWith('https://res.cloudinary.com/'))
       : [];
 
+    // 🩹 FIX#9 — rating clamp
+    const safeRating = Math.min(5, Math.max(1, Number(rating) || 5));
+
     await pool.query(
-      `INSERT INTO reviews (product_id, author, user_id, rating, content, country, images) 
+      `INSERT INTO reviews (product_id, author, user_id, rating, content, country, images)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [
-        product_id, 
-        userName, 
-        userId, 
-        rating || 5, 
-        content.trim(), 
+        product_id,
+        userName,
+        userId,
+        safeRating,
+        content.trim(),
         country || 'United States',
         safeImages
       ]
@@ -611,7 +647,6 @@ app.post('/api/upload', authenticateToken, upload.array('images', 10), (req, res
     res.status(500).json({ error: 'Failed to upload files' });
   }
 });
-
 // ==========================================
 // مسارات المنتجات وإدارتها
 // ==========================================
@@ -758,14 +793,8 @@ app.get('/api/categories', async (req, res) => {
     }
     const tree = await getCategoryTree();
 
-        // 🆕 Temu-style rail: SMART representative image per category.
-    // One lateral query per cache-miss (every 10 min), prefix-aware matching
-    // (same rules as the homepage filter). Ranking hierarchy:
-    //   1. sort_order DESC      → explicit admin override always wins
-    //   2. is_sourced DESC      → admin-curated products (hand-picked deals)
-    //   3. has video DESC       → video-sync imports = marketing-grade assets
-    //   4. image count DESC     → multi-image listings = curated, not lazy
-    //   5. id DESC              → newest as final tiebreak
+    // 🆕 Temu-style rail: SMART representative image per category.
+    // (تعليق واحد — كان مكرر)
     try {
       const { rows: imgs } = await pool.query(`
         SELECT c.slug, img.image_url
@@ -828,10 +857,10 @@ app.post('/api/admin/backfill-categories', async (req, res) => {
           await new Promise((r) => setTimeout(r, 1200));
         // 1. جلب تفاصيل المنتج أولاً (مع تفعيل جلب الفيديو حسب وثيقة CJ الرسمية)
           const detailRes = await cjRequest((token, config) =>
-            axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { 
-              ...config, 
-              headers: { 'CJ-Access-Token': token }, 
-              params: { pid: p.cj_product_id, features: 'enable_video' } 
+            axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', {
+              ...config,
+              headers: { 'CJ-Access-Token': token },
+              params: { pid: p.cj_product_id, features: 'enable_video' }
             })
           );
 
@@ -869,7 +898,6 @@ const { runMassSync } = require('./massSync');
 
 app.post('/api/admin/mass-sync', requireAdmin, async (req, res) => {
   res.json({ message: '🚀 Mass Sync Engine started in background! Check server logs.' });
-  // تشغيل المحرك في الخلفية لكي لا يعلق الطلب (Render Timeout)
   runMassSync().catch(err => logger.logError('Mass Sync Engine', err));
 });
 // ✨ مسار مزامنة المنتجات التي تحتوي على فيديوهات فقط (للريلز)
@@ -879,12 +907,9 @@ app.post('/api/admin/sync-videos', requireAdmin, async (req, res) => {
 });
 
 async function runCjVideoSync() {
-  // ✨ v2 — محرك تنويع البحث:
-  //   1. كلمات مفتاحية من فئات غنية بالفيديوهات التسويقية (beauty/grooming/gadgets)
-  //   2. seenPids: مافحّاش نفس المنتج جوج مرات فالجلسة (توفير 1.2s لكل تكرار)
-  //   3. الجمع التراكمي: كل ضغطة Scan كتوسع الرصيد، ماشي نفس الـ 300 منتج ديما
+  // ✨ v2 — محرك تنويع البحث (تفاصيل في التعليق الأصلي بملفك)
   const SEARCH_QUERIES = [
-    '',                    // Trending العام
+    '',
     'grooming', 'hair trimmer', 'nail clipper',
     'makeup', 'beauty tool', 'skincare',
     'kitchen gadget', 'pet supplies',
@@ -912,7 +937,7 @@ async function runCjVideoSync() {
         cjProducts = listRes.data?.data?.list || [];
       } catch (listErr) {
         logger.logError(`CJ Video Sync list (${keyword || 'Trending'} p${pageNum})`, listErr);
-        continue; // فشل صفحة ما يوقفش المحرك
+        continue;
       }
 
       if (cjProducts.length === 0) break;
@@ -925,7 +950,6 @@ async function runCjVideoSync() {
         seenPids.add(productId);
         checkedCount++;
 
-        // ✨ احترام الـ QPS ديال CJ (1200ms فاصل — أقوى من 1000)
         await new Promise(r => setTimeout(r, 1200));
 
         try {
@@ -948,7 +972,7 @@ async function runCjVideoSync() {
             console.log(`🎥 [Video Sync] ✅ #${importedCount}: ${String(productRow.title).slice(0, 60)}`);
           }
         } catch (productErr) {
-          console.warn(`⚠️ [Video Sync] product failed: ${productErr.message}`); // Tenet #13
+          console.warn(`⚠️ [Video Sync] product failed: ${productErr.message}`); // 🩹 FIX (كان catch فارغ)
         }
       }
     }
@@ -965,10 +989,10 @@ app.post('/api/admin/sync-single-product', async (req, res) => {
 
   try {
     const detailRes = await cjRequest((token, config) =>
-      axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { 
-        ...config, 
-        headers: { 'CJ-Access-Token': token }, 
-        params: { pid: String(pid) } 
+      axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', {
+        ...config,
+        headers: { 'CJ-Access-Token': token },
+        params: { pid: String(pid) }
       })
     );
 
@@ -988,12 +1012,12 @@ app.post('/api/admin/sync-single-product', async (req, res) => {
     const categorySlug = getCategorySlug(`${details.categoryName} ${details.productNameEn}`);
 
     await pool.query(
-      `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, is_sourced) 
+      `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, is_sourced)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true)
-       ON CONFLICT (cj_product_id) DO UPDATE SET 
-         title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price, 
-         image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants, 
-         colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status, 
+       ON CONFLICT (cj_product_id) DO UPDATE SET
+         title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price,
+         image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants,
+         colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status,
          description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, is_sourced=true`,
       [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, details.description, material, categorySlug]
     );
@@ -1074,19 +1098,19 @@ async function runCjProductSync(keyword) {
         } catch (e) { console.warn('⚠️ [Import] video query failed for ' + productId + ': ' + e.message); }
 
         await pool.query(
-          `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id, is_sourced) 
+          `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id, is_sourced)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, false)
-           ON CONFLICT (cj_product_id) DO UPDATE SET 
-             title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price, 
-             image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants, 
-             colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status, 
-             description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, 
+           ON CONFLICT (cj_product_id) DO UPDATE SET
+             title=EXCLUDED.title, price=EXCLUDED.price, original_price=EXCLUDED.original_price,
+             image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants,
+             colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status,
+             description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category,
              video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id`,
           [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, details.description, material, categorySlug, videoUrl, cjCategoryId]
         );
 
         importedCount++;
-      } catch (productErr) { console.error('🔴 [Import] product FAILED: ' + productId + ' — ' + productErr.message); }
+      } catch (productErr) { console.error('🔴 [Import] product FAILED: ' + productId + ' — ' + productErr.message); } // 🩹 FIX#P2
     }
   }
 
@@ -1095,14 +1119,18 @@ async function runCjProductSync(keyword) {
 }
 
 // ==========================================
-// مسارات المستخدم والمصادقة
+// مسارات المستخدم والمصادقة — 🩹 FIX#3/#7/#8
 // ==========================================
 app.post('/api/register', authLimiter, async (req, res) => {
   try {
     const { name, email, password } = req.body;
     if (!name || !email || !password) return res.status(400).json({ message: 'All fields are required' });
+    if (!assertStrongPassword(password)) {
+      return res.status(400).json({ message: 'Password must be at least 8 characters.' });        // 🩹 FIX#7
+    }
+    const cleanEmail = normalizeEmail(email);                                                      // 🩹 FIX#8
 
-    const userExists = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    const userExists = await pool.query('SELECT id FROM users WHERE email = $1', [cleanEmail]);
     if (userExists.rows.length > 0) return res.status(400).json({ message: 'Email already registered' });
 
     const salt = await bcrypt.genSalt(10);
@@ -1110,14 +1138,15 @@ app.post('/api/register', authLimiter, async (req, res) => {
 
     const newUser = await pool.query(
       'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email',
-      [name, email, passwordHash]
+      [name, cleanEmail, passwordHash]
     );
 
-    const verifyToken = jwt.sign({ id: newUser.rows[0].id }, JWT_SECRET, { expiresIn: '1d' });
+    // 🩹 FIX#3 — typed token: verify-token لا يصلح أبداً reset-token
+    const verifyToken = jwt.sign({ id: newUser.rows[0].id, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
     const verifyUrl = `${process.env.FRONTEND_URL}/auth/verify-email?token=${verifyToken}`;
 
     sendEmail({
-      to: email,
+      to: cleanEmail,
       subject: 'Confirm your Email for Laclarc',
       html: `<h2>Welcome to Laclarc, ${name}!</h2>
              <p>Please click the button below to activate your account:</p>
@@ -1136,6 +1165,7 @@ app.get('/api/verify-email', async (req, res) => {
     const { token } = req.query;
     if (!token) return res.status(400).send('Invalid token.');
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.type !== 'verify') return res.status(400).send('Invalid token type.');            // 🩹 FIX#3
     await pool.query('UPDATE users SET is_verified = true WHERE id = $1', [decoded.id]);
     res.send('<h1 style="color:#8B78C6; text-align:center; margin-top:50px;">Email verified successfully! 🎉</h1><p style="text-align:center;">You can now log in to your account.</p>');
   } catch (err) {
@@ -1146,21 +1176,24 @@ app.get('/api/verify-email', async (req, res) => {
 app.post('/api/forgot-password', authLimiter, async (req, res) => {
   try {
     const { email } = req.body;
-    const userRes = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-    
+    const cleanEmail = normalizeEmail(email);                                                      // 🩹 FIX#8
+    const userRes = await pool.query('SELECT id FROM users WHERE email = $1', [cleanEmail]);
+
     if (userRes.rows.length > 0) {
-      const resetToken = jwt.sign({ id: userRes.rows[0].id }, JWT_SECRET, { expiresIn: '15m' });
+      // 🩹 FIX#3 — typed reset token (15m)
+      const resetToken = jwt.sign({ id: userRes.rows[0].id, type: 'reset' }, JWT_SECRET, { expiresIn: '15m' });
       const resetUrl = `${process.env.FRONTEND_URL}/auth/reset-password?token=${resetToken}`;
 
       sendEmail({
-        to: email,
+        to: cleanEmail,
         subject: 'Password Reset Request',
         html: `<h2>Did you forget your password?</h2>
                <p>Click the button below to set a new password. This link will expire in 15 minutes.</p>
                <a href="${resetUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Reset My Password</a>`
       });
     }
-    
+
+    // anti-enumeration: نفس الرد موجود أم لا
     res.json({ message: 'If that email exists in our system, a reset link has been sent.' });
   } catch (error) {
     logger.logError('Forgot Password', error);
@@ -1172,7 +1205,11 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
   try {
     const { token, newPassword } = req.body;
     if (!token || !newPassword) return res.status(400).json({ message: 'Token and new password are required.' });
+    if (!assertStrongPassword(newPassword)) {                                                      // 🩹 FIX#7
+      return res.status(400).json({ message: 'Password must be at least 8 characters.' });
+    }
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.type !== 'reset') return res.status(400).json({ message: 'Invalid or expired token.' });  // 🩹 FIX#3
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(newPassword, salt);
     await pool.query('UPDATE users SET password_hash = $1, is_verified = true WHERE id = $2', [passwordHash, decoded.id]);
@@ -1185,7 +1222,8 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
 app.post('/api/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    const cleanEmail = normalizeEmail(email);                                                      // 🩹 FIX#8
+    const user = await pool.query('SELECT * FROM users WHERE email = $1', [cleanEmail]);
     if (user.rows.length === 0) return res.status(401).json({ message: 'Invalid credentials' });
 
     const validPassword = await bcrypt.compare(password, user.rows[0].password_hash);
@@ -1200,7 +1238,6 @@ app.post('/api/login', authLimiter, async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
-
 // ==========================================
 // مسارات BaridiMob والطلبات اليدوية
 // ==========================================
@@ -1278,7 +1315,17 @@ app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
 app.put('/api/admin/manual-orders/reject/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1", [id]);
+    // 🩹 FIX#14 — forward-only guard: ما كتكتبش cancelled فوق paid/fulfilled/refunded
+    //    (كان: رفض أدمن لطلب تحوّل meanwhile لـ paid = يختفي من كل شاشات المتابعة)
+    const upd = await pool.query(
+      "UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status IN ('pending','manual') RETURNING id",
+      [id]
+    );
+    if (!upd.rowCount) {
+      const exists = await pool.query('SELECT status FROM orders WHERE id = $1', [id]);
+      if (exists.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+      return res.status(409).json({ error: `Order is '${exists.rows[0].status}' — not rejectable` });
+    }
     res.json({ message: 'Order rejected successfully.' });
   } catch (err) {
       logger.logError('Route Handler', err);
@@ -1297,6 +1344,7 @@ app.put('/api/admin/retry-fulfillment/:id', async (req, res) => {
       return res.status(409).json({ error: `Order is '${order.status}' — فقط manual أو paid يمكن إعادة إرسالهم` });
     }
     // تمكين محاولة جديدة: نحيدو cj_order_number القديم (الـ COALESCE ما يسمحش بالكتابة فوق)
+    // ✨ burnedBump في cjService هو لي يخلي الـ retry ما يعاودش يمشي على الأرقام المحروقة
     await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1 AND status = 'manual'", [id]);
     const itemsRes = await pool.query('SELECT * FROM order_items WHERE order_id = $1', [id]);
 
@@ -1337,7 +1385,8 @@ app.get('/api/admin/failed-orders', async (req, res) => {
 // البحث والتصنيف الذكي
 // ==========================================
 app.get('/api/search', async (req, res) => {
-  const q = req.query.q || '';
+  // 🩹 hygiene — ILIKE wildcard escape (% و _ من المستخدم ما يولّدوش مطابقة عامة)
+  const q = String(req.query.q || '').replace(/[%_]/g, '\\$&');
   if (q.length < 1) return res.json([]);
 
   try {
@@ -1415,7 +1464,7 @@ app.get('/api/products', async (req, res) => {
   try {
     const search = req.query.search || '';
     const category = req.query.category || 'All';
-    
+
     // ✨ تفعيل التخزين المؤقت على شبكات CDN العالمية (Vercel & Cloudflare Edge)
     // 60 ثانية كاش طازج + 300 ثانية استجابة فورية أثناء التحديث في الخلفية
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
@@ -1451,7 +1500,7 @@ app.get('/api/products', async (req, res) => {
     }
 
     query += ` ORDER BY sort_order ASC, id DESC`;
-    
+
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
@@ -1470,20 +1519,28 @@ app.get('/api/products/deals', async (req, res) => {
   }
 });
 
+// 🩹 FIX#11 — i18n short-circuit: قرارنا المؤجل (i18n لحملة DZ لاحقة).
+// الكود القديم كان يضرب translateProduct لكل زائر ES/FR/AR → استعلام فاشل
+// (product_translations غير موجودة في المخطط) → هدر DB + صفر ترجمة أبداً.
+// التفعيل لاحقاً = I18N_ENABLED=true + إنشاء الجدولين — بلا نشر كود جديد.
+const I18N_ENABLED = process.env.I18N_ENABLED === 'true';
+
 app.get('/api/products/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
-    
-    const product = result.rows[0];
+
+    let product = result.rows[0];
     if (product.images && typeof product.images === 'string') {
       try { product.images = JSON.parse(product.images); } catch (e) {}
     }
-     const visitorCountry = (req.headers['cf-ipcountry'] || '').toUpperCase();
+
+    const visitorCountry = (req.headers['cf-ipcountry'] || '').toUpperCase();
     const targetLang = getLangFromCountry(visitorCountry);
 
-    if (targetLang) {
+    // 🩹 FIX#11 — بوابة الـ flag بدل الاعتماد على جداول غائبة
+    if (I18N_ENABLED && targetLang) {
       try {
         const translated = await translateProduct(product.id, targetLang);
         if (translated) {
@@ -1505,33 +1562,33 @@ app.get('/api/products/:id/related', async (req, res) => {
     const { id } = req.params;
     const productRes = await pool.query('SELECT category FROM products WHERE id = $1', [id]);
     if (productRes.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
-    
+
     const category = productRes.rows[0].category;
     const baseCategory = category ? category.split('-')[0] : '';
-    
+
     let relatedRes = await pool.query(
-      `SELECT id, title, price, image_url, category FROM products 
-       WHERE id != $1 AND category = $2 AND stock_status = true 
+      `SELECT id, title, price, image_url, category FROM products
+       WHERE id != $1 AND category = $2 AND stock_status = true
        ORDER BY id DESC LIMIT 4`, [id, category]
     );
-    
+
     if (relatedRes.rows.length < 4 && baseCategory) {
       const existingIds = relatedRes.rows.map(r => r.id);
       existingIds.push(parseInt(id));
       const moreRes = await pool.query(
-        `SELECT id, title, price, image_url, category FROM products 
-         WHERE id != ALL($1::int[]) AND category ILIKE $2 AND stock_status = true 
+        `SELECT id, title, price, image_url, category FROM products
+         WHERE id != ALL($1::int[]) AND category ILIKE $2 AND stock_status = true
          ORDER BY id DESC LIMIT $3`, [existingIds, `${baseCategory}%`, 4 - relatedRes.rows.length]
       );
       relatedRes.rows = [...relatedRes.rows, ...moreRes.rows];
     }
-    
+
     if (relatedRes.rows.length < 4) {
       const existingIds = relatedRes.rows.map(r => r.id);
       existingIds.push(parseInt(id));
       const randomRes = await pool.query(
-        `SELECT id, title, price, image_url, category FROM products 
-         WHERE id != ALL($1::int[]) AND stock_status = true 
+        `SELECT id, title, price, image_url, category FROM products
+         WHERE id != ALL($1::int[]) AND stock_status = true
          ORDER BY random() LIMIT $2`, [existingIds, 4 - relatedRes.rows.length]
       );
       relatedRes.rows = [...relatedRes.rows, ...randomRes.rows];
@@ -1548,10 +1605,10 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
     const { id } = req.params;
     const result = await pool.query('SELECT is_sourced FROM products WHERE id = $1', [id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
-    
+
     const newStatus = !result.rows[0].is_sourced;
     await pool.query('UPDATE products SET is_sourced = $1 WHERE id = $2', [newStatus, id]);
-    
+
     clearProductsCache();
     res.json({ message: 'Deal status updated', is_sourced: newStatus });
   } catch (err) {
@@ -1582,7 +1639,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
 
     // ✨ تسجيل الطلب (مرة واحدة فقط) مع مصدر الإعلانات
     const orderResult = await pool.query(
-      `INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, user_id, payment_method, utm_source, utm_medium, utm_campaign, click_id) 
+      `INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, user_id, payment_method, utm_source, utm_medium, utm_campaign, click_id)
        VALUES ($1, $2, $3, $4, $5, $6, 'Stripe', $7, $8, $9, $10) RETURNING id`,
       ['Pending Customer', 'pending@laclarc.com', 'Pending', serverTotal, 'pending', optionalUser ? optionalUser.id : null, utmSource, utmMedium, utmCampaign, clickId]
     );
@@ -1590,7 +1647,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
 
     for (const item of secureItems) {
       await pool.query(
-        "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)", 
+        "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)",
         [orderId, item.id, item.quantity, item.price, item.vid]
       );
     }
@@ -1612,13 +1669,13 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
       payment_method_types: ['card'],
       line_items: secureItems.map(item => {
         const hasValidImage = item.image_url && typeof item.image_url === 'string' && item.image_url.startsWith('http');
-        return { 
-          price_data: { 
-            currency: 'usd', 
-            product_data: { name: item.title || 'Product', images: hasValidImage ? [item.image_url] : [] }, 
-            unit_amount: Math.round(item.price * 100) 
-          }, 
-          quantity: item.quantity 
+        return {
+          price_data: {
+            currency: 'usd',
+            product_data: { name: item.title || 'Product', images: hasValidImage ? [item.image_url] : [] },
+            unit_amount: Math.round(item.price * 100)
+          },
+          quantity: item.quantity
         };
       }),
       mode: 'payment',
@@ -1629,7 +1686,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
         { shipping_rate_data: { type: 'fixed_amount', fixed_amount: { amount: 0, currency: 'usd' }, display_name: 'Standard Shipping', delivery_estimate: { minimum: { unit: 'business_day', value: 15 }, maximum: { unit: 'business_day', value: 35 } } } },
         { shipping_rate_data: { type: 'fixed_amount', fixed_amount: { amount: 1500, currency: 'usd' }, display_name: 'Worldwide Express Shipping', delivery_estimate: { minimum: { unit: 'business_day', value: 7 }, maximum: { unit: 'business_day', value: 15 } } } }
       ],
-      metadata: { 
+      metadata: {
         orderId: orderId.toString(),
         couponCode: couponApplied ? String(couponCode).toUpperCase() : '',
         utmSource: utmSource, // توثيق مصدر الإعلان في Stripe
@@ -1650,9 +1707,9 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 /// ==========================================
 // ⚡ مسار التحقق المالي اللحظي JIT v2 (Just-In-Time Stripe Verifier)
-// يستجوب خوادم Stripe مباشرة قبل إطلاق أي شحنة لـ CJ (invariant #8)
 // ⚠️ القاعدة الذهبية (v2): بعد النجاح الحالة تبقى 'paid' — الويب هوك
 //    SHIPPED هو اللي كيرفعها لـ fulfilled + يصيفط واتساب/إيميل فثواني
 // ==========================================
@@ -1692,7 +1749,7 @@ app.post('/api/payment/verify-session', async (req, res) => {
     }
 
     const customerName = session.customer_details?.name || 'Valued Customer';
-    const customerEmail = session.customer_details?.email || '';
+    const customerEmail = normalizeEmail(session.customer_details?.email || '');   // 🩹 FIX#8
     const customerPhone = session.customer_details?.phone || '';
     const addr = session.customer_details?.address;
     const shippingAddress = addr
@@ -1727,10 +1784,7 @@ app.post('/api/payment/verify-session', async (req, res) => {
     `, [orderId]);
     const items = itemsRes.rows;
 
-    // 🆕 FILE 3-b: خبّئ سياق المتصفح الحقيقي (IP/UA) قبل أي fulfillCJOrder محتمل.
-    //   يغطي الفرعين: إذا JIT ربح القفل يقراها fulfillCJOrder مباشرة،
-    //   وإذا Webhook سبقنا — هو لي يقراها من ctxMap (Degraded match مقبول إذا فات الوقت).
-    // 🆕 Mission #4: بصمات المتصفح تاع الزبون الحقيقي → EMQ uplift للـ CAPI
+    // 🆕 خبّئ سياق المتصفح الحقيقي (IP/UA) قبل أي fulfillCJOrder محتمل.
     setConversionContext(orderId, {
       clientIp: req.ip,
       userAgent: req.headers['user-agent'],
@@ -1746,10 +1800,7 @@ app.post('/api/payment/verify-session', async (req, res) => {
         try {
           const cjResponse = await fulfillCJOrder(orderId, customerName, session.customer_details, items);
 
-          // ✅ v2 — الإصلاح الحاسم: حيدنا UPDATE status='completed'!
-          //   كان كيقفز paid(1) → completed(3) → guard ديال الويب هوك كيطيح SHIPPED(2)
-          //   → بلا tracking_number، بلا واتساب، بلا إيميل (نفس P0 ديال 'fulfilled')
-          //   'completed' = DELIVERED فقط — حصراً من ويب هوك DELIVERED/COMPLETED
+          // ✅ v2 — بلا 'completed': الحالة تبقى paid، webhook SHIPPED كيرفعها
           if (cjResponse?.success) {
             console.log(`📤 [JIT] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
           } else {
@@ -1777,8 +1828,6 @@ app.post('/api/payment/verify-session', async (req, res) => {
       currency: session.currency?.toUpperCase() || 'USD',
       customerEmail: fullOrder.customer_email,
       status: fullOrder.status,
-      // 🆕 FILE 3-c: items للـ Browser Pixel — eventID matching إجباري ضد العد المزدوج.
-      //   يخدم فالفرعين (winner + loser) — الزبون يستحق البكسل الموثّق فالحالتين.
       items: items.map(i => ({ productId: i.product_id, quantity: i.quantity })),
     });
 
@@ -1808,9 +1857,9 @@ app.get('/api/orders/:id/items', async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT oi.quantity, oi.price_at_purchase, p.title, p.image_url 
-       FROM order_items oi 
-       LEFT JOIN products p ON oi.product_id = p.id 
+      `SELECT oi.quantity, oi.price_at_purchase, p.title, p.image_url
+       FROM order_items oi
+       LEFT JOIN products p ON oi.product_id = p.id
        WHERE oi.order_id = $1`, [id]
     );
     res.json(result.rows);
@@ -1835,20 +1884,34 @@ app.get('/api/orders/my-orders', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/orders/track/:identifier', async (req, res) => {
+// ==========================================
+// 🩹 FIX#1 — التسريب العام الأكبر في الملف كان هنا:
+//    SELECT * بلا limiter → PII كاملة + stripe_session_id + exchange_token
+//    (exchange_token في الرد العام = إبطال حماية الـ IDOR من الباب الخلفي)
+//    الإصلاح: trackLimiter + أعمدة آمنة محددة + normalizeEmail
+//    (التعداد بالبريد وحده يبقى — قرار سياسة منفصل)
+// ==========================================
+app.get('/api/orders/track/:identifier', trackLimiter, async (req, res) => {
   try {
     const { identifier } = req.params;
     const { email } = req.query;
+
+    // 🛡️ الأعمدة الآمنة فقط — لا shipping_address، لا phone، لا session_id، لا exchange_token
+    const SAFE_COLUMNS = `id, status, total_amount, created_at, tracking_number, payment_method, customer_name`;
 
     let queryStr = '';
     let params = [];
 
     if (email) {
-      queryStr = `SELECT * FROM orders WHERE (id::text = $1 OR customer_email ILIKE $2) AND customer_email ILIKE $2 ORDER BY id DESC`;
-      params = [identifier, email];
+      queryStr = `SELECT ${SAFE_COLUMNS} FROM orders
+                  WHERE (id::text = $1 OR customer_email ILIKE $2) AND customer_email ILIKE $2
+                  ORDER BY id DESC`;
+      params = [identifier, normalizeEmail(email)];
     } else if (identifier.includes('@')) {
-      queryStr = `SELECT * FROM orders WHERE customer_email ILIKE $1 ORDER BY id DESC`;
-      params = [identifier];
+      queryStr = `SELECT ${SAFE_COLUMNS} FROM orders
+                  WHERE customer_email ILIKE $1
+                  ORDER BY id DESC`;
+      params = [normalizeEmail(identifier)];
     } else {
       return res.status(400).json({ error: 'Email is required to track an order by ID.' });
     }
@@ -1892,7 +1955,7 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
     const { name, profilePicture } = req.body;
     if (!name) return res.status(400).json({ message: 'Name is required' });
     const updatedUser = await pool.query(
-      'UPDATE users SET name = $1, profile_picture = $2 WHERE id = $3 RETURNING id, name, email, profile_picture', 
+      'UPDATE users SET name = $1, profile_picture = $2 WHERE id = $3 RETURNING id, name, email, profile_picture',
       [name, profilePicture, req.user.id]
     );
     res.json(updatedUser.rows[0]);
@@ -1915,15 +1978,18 @@ app.put('/api/admin/update-category/:id', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+
 // ==========================================
 // ✨ مسارات إدارة الإعدادات والريلز
 // ==========================================
 
-// GET: جلب الإعدادات
+// 🩹 FIX#9 — GET: كان يرجع كل store_settings للعامة
+//    (بما فيها المفاتيح الداخلية: exchange_resend_done / stripe_coupon_* / ...)
+//    whitelist فقط — عدّل القائمة حسب مفاتيحك العامة الفعلية
+const PUBLIC_SETTING_KEYS = ['show_reels', 'show_lightning', 'show_fb'];
 app.get('/api/settings', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT key, value FROM store_settings');
-    // تحويل المصفوفة إلى كائن (Object) لسهولة الاستخدام في الواجهة
+    const { rows } = await pool.query('SELECT key, value FROM store_settings WHERE key = ANY($1)', [PUBLIC_SETTING_KEYS]);
     const settings = rows.reduce((acc, row) => {
       acc[row.key] = row.value === 'true';
       return acc;
@@ -1969,8 +2035,10 @@ app.put('/api/admin/update-product/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { title, price, original_price, image_url, images, description, material, colors, sizes, category } = req.body;
+    // ⚠️ موثق: يفرغ الحقول الغائبة — واجهتك تبعت الـ form كاملاً
+    //    Backlog: dynamic SET للأعمدة المرسومة فقط
     await pool.query(
-      `UPDATE products SET title = $1, price = $2, original_price = $3, image_url = $4, images = $5, description = $6, material = $7, colors = $8, sizes = $9, category = $10 WHERE id = $11`, 
+      `UPDATE products SET title = $1, price = $2, original_price = $3, image_url = $4, images = $5, description = $6, material = $7, colors = $8, sizes = $9, category = $10 WHERE id = $11`,
       [title || null, Number(price) || 0, Number(original_price) || 0, image_url || null, images || null, description || null, material || null, colors || null, sizes || null, category || 'other', id]
     );
     clearProductsCache();
@@ -2038,6 +2106,7 @@ app.post('/api/admin/sourcing/create', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+
 // ═══ 📋 System Events API — سجل القرارات الآلية (Mission #9) ═══
 app.get('/api/admin/system-events', requireAdmin, async (req, res) => {
   try {
@@ -2060,17 +2129,79 @@ app.get('/api/admin/system-events', requireAdmin, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch system events' });
   }
 });
-// ═══ 🩹 Mission #13 — CAPI Second-Shot (fingerprint enrichment) ═══
-app.post('/api/payment/second-shot', async (req, res) => {
-  const { orderId } = req.body;
-  if (!orderId) return res.status(400).json({ success: false, error: 'orderId required' });
+
+// ═══ 🩹 FIX#6 — CAPI Second-Shot: limiter + parseInt
+//    (كان مفتوحاً — أي حد يضرب orderId آلاف المرات = amplification على DB)
+// ═══ Mission #13 — fingerprint enrichment ═══
+app.post('/api/payment/second-shot', secondShotLimiter, async (req, res) => {
+  const orderId = parseInt(req.body?.orderId, 10);
+  if (!Number.isInteger(orderId) || orderId <= 0) {
+    return res.status(400).json({ success: false, error: 'orderId required' });
+  }
   // Fire-and-forget — الزبون ما يستناش
   secondShotConversion(orderId).catch(e => console.warn(`[SecondShot] #${orderId}: ${e.message}`));
   res.json({ accepted: true });
 });
-// ═══ 🧬 Mission #16 — Customer Exchange Page API ═══
+// ═══ 🧬 Mission #16 — Customer Exchange Page API (v2 — async booking contract) ═══
 // 🔑 Exchange capability token regex — POST/GET validation
 const EXCHANGE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// 🛡️ طلبات عندها exchange fulfillment شغال في الخلفية — Reconcile ما يلمسهومش (يمنع cascade مزدوج)
+const exchangeInFlight = new Set();
+
+// ⚡ الـ fulfillment الفعلي بعد اختيار البديل — خارج الـ HTTP request (الرد خرج للزبون من قبل)
+// الفشل الصادق: الحالة تحكم — awaiting_exchange (cascade أعاد العرض) | manual (cascade مات)
+async function runExchangeFulfillment(orderId, ord, chosen) {
+  try {
+    const itemsRes = await pool.query(
+      'SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1',
+      [orderId]
+    );
+    const customerDetails = {
+      email: ord.customer_email, phone: ord.customer_phone,
+      address: (() => { try { return JSON.parse(ord.shipping_address); } catch { return { line1: 'N/A', country: 'DZ' }; } })(),
+    };
+    // بلا skipZeroTouch عمداً: فشل البديل يشعل cascade من جديد (S1 → S2)
+    const result = await fulfillCJOrder(orderId, ord.customer_name, customerDetails, itemsRes.rows);
+
+    if (result && result.success) {
+      await auditEvent('EXCHANGE_SUCCESS', orderId, { newProduct: chosen.id, title: chosen.title }, 'info');
+      console.log(`✅ [Exchange] #${orderId} replacement ${chosen.id} accepted by CJ (${result.orderNumber})`);
+      return;
+    }
+
+    // 🛑 cjService أوقف الطلب (halted → manual + alert فعلاً) أو fulfillment آخر ماسك القفل — لا alert مكرر ولا كتابة حالة
+    if (result && (result.halted || result.reason === 'IN_FLIGHT')) {
+      await auditEvent('EXCHANGE_FAIL', orderId, { chosen: chosen.id, reason: result.reason }, 'warning');
+      console.warn(`🛑 [Exchange] #${orderId} replacement ${chosen.id} not placed (${result.reason}) — handled by cjService`);
+      return;
+    }
+
+    await auditEvent('EXCHANGE_FAIL', orderId, { chosen: chosen.id }, 'warning');
+
+    const st = await pool.query('SELECT status FROM orders WHERE id = $1', [orderId]);
+    if (st.rows[0]?.status === 'awaiting_exchange') {
+      // الـ cascade أعاد العرض + إيميل بدائل جديدة خرج — صفحة الزبون (polling) كتشوفها
+      console.warn(`🔄 [Exchange] #${orderId} replacement ${chosen.id} failed — new options offered`);
+      return;
+    }
+
+    // الـ cascade مات قبل إعادة العرض → manual + triage (شرط status='paid' = ما نكتبوش فوق حالة أخرى)
+    await pool.query(
+      "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'paid'",
+      [orderId]
+    );
+    sendAdminAlert(`🚨 Exchange cascade died — #${orderId} → manual`,
+      `<p>فشل البديل <b>${chosen.title}</b> ومات الـ cascade قبل إعادة العرض — triage يدوي أو انتظار L0 sweep.</p>`);
+  } catch (e) {
+    logger.logError('Exchange fulfillment', e);
+    await pool.query(
+      "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'paid'",
+      [orderId]
+    ).catch(() => {});
+    sendAdminAlert(`🚨 Exchange fulfillment crashed — #${orderId} → manual`, `<p>${String(e.message).slice(0, 300)}</p>`);
+  }
+}
 
 app.post('/api/exchange/:orderId', async (req, res) => {
   const orderId = parseInt(req.params.orderId, 10);
@@ -2078,7 +2209,7 @@ app.post('/api/exchange/:orderId', async (req, res) => {
   const pick = req.body?.pick;
 
   if (!Number.isInteger(orderId) || orderId <= 0 || !EXCHANGE_UUID_RE.test(token)) {
-    return res.json({ success: false, message: 'رابط غير صالح' });
+    return res.json({ success: false, code: 'invalid_link', message: 'Invalid link' });
   }
 
   let ord = null, chosen = null;
@@ -2096,8 +2227,7 @@ app.post('/api/exchange/:orderId', async (req, res) => {
     );
     if (!lock.rowCount) {
       await client.query('ROLLBACK');
-      client.release();
-      return res.json({ success: false, message: 'تم الاختيار مسبقاً أو الرابط لم يعد صالحاً' });
+      return res.json({ success: false, code: 'already_picked', message: 'This exchange was already submitted or the link is no longer valid.' });
     }
     ord = lock.rows[0];
 
@@ -2106,9 +2236,8 @@ app.post('/api/exchange/:orderId', async (req, res) => {
       // خيار قديم من صفحة stale — أعِد الحالة + نافذة 72h جديدة عادلة
       await client.query(`UPDATE orders SET status = 'awaiting_exchange', manual_since = NOW() WHERE id = $1`, [orderId]);
       await client.query('COMMIT');
-      client.release();
       await auditEvent('EXCHANGE_FAIL', orderId, { chosen: pick, reason: 'not_in_options' }, 'warning');
-      return res.json({ success: false, message: 'الخيار غير متوفر — حدّث الصفحة وأعد المحاولة' });
+      return res.json({ success: false, code: 'stale_option', message: 'That option is no longer available — please choose from the updated list.' });
     }
 
     await client.query('DELETE FROM order_items WHERE order_id = $1', [orderId]);
@@ -2119,70 +2248,37 @@ app.post('/api/exchange/:orderId', async (req, res) => {
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
-    client.release();
     logger.logError('Exchange API', e);
-    return res.status(500).json({ success: false, message: 'خطأ داخلي' });
+    return res.status(500).json({ success: false, code: 'internal', message: 'Internal error — please try again.' });
+  } finally {
+    client.release(); // 🔌 دائماً — مرة واحدة، حتى مع return مبكر
   }
-  client.release();
 
-  // ⚡ Fulfillment خارج المعاملة — بلا skipZeroTouch عمداً: فشل البديل يشعل cascade من جديد
-  try {
-    const itemsRes = await pool.query(
-      'SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1',
-      [orderId]
-    );
-    const customerDetails = {
-      email: ord.customer_email, phone: ord.customer_phone,
-      address: (() => { try { return JSON.parse(ord.shipping_address); } catch { return { line1: 'N/A', country: 'DZ' }; } })(),
-    };
-    const result = await fulfillCJOrder(orderId, ord.customer_name, customerDetails, itemsRes.rows);
+  // ✅ الرد فوراً (invariant #3: لا نحجب الـ HTTP على مهمة طويلة) — الـ cascade ياخد دقيقة+
+  // الصفحة كتعمل polling على /options وتعرض الحقيقة: exchanged | awaiting_exchange (بدائل جديدة) | processing
+  exchangeInFlight.add(orderId);
+  res.json({ success: true, status: 'processing', message: 'Replacement confirmed — we are booking it with our supplier now.' });
 
-    if (result.success) {
-      await auditEvent('EXCHANGE_SUCCESS', orderId, { newProduct: chosen.id, title: chosen.title }, 'info');
-      return res.json({ success: true, message: 'تم استبدال المنتج وإعادة الإرسال — ستصلك رسالة شحن قريباً!' });
-    }
-
-    await auditEvent('EXCHANGE_FAIL', orderId, { chosen: chosen.id }, 'warning');
-
-    // 🆕 الفشل الصادق — الحالة تحكم الرسالة:
-    const st = await pool.query('SELECT status FROM orders WHERE id = $1', [orderId]);
-    if (st.rows[0]?.status === 'awaiting_exchange') {
-      // الـ cascade أعاد العرض فعلاً → بدائل جديدة + إيميل خرج من Render
-      return res.json({ success: false, message: 'البديل غير متوفر للشحن — أرسلنا لك بدائل جديدة على بريدك الإلكتروني.' });
-    }
-
-    // 🆕 الـ cascade مات → حالة صادقة + triage، لا 'paid' غامضة تفسرها الواجهة كنجاح
-    await pool.query(
-      "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'paid'",
-      [orderId]
-    );
-    sendAdminAlert(`🚨 Exchange cascade died — #${orderId} → manual`,
-      `<p>فشل البديل <b>${chosen.title}</b> ومات الـ cascade قبل إعادة العرض — triage يدوي أو انتظار L0 sweep.</p>`);
-    return res.json({ success: false, message: 'تعذر إتمام التبديل — فريقنا يتابع طلبك وستصلك رسالة قريباً.' });
-  } catch (e) {
-    logger.logError('Exchange fulfillment', e);
-    // 🆕 حتى الكراش هنا يستحق حالة صادقة لو ما زال 'paid'
-    await pool.query(
-      "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'paid'",
-      [orderId]
-    ).catch(() => {});
-    return res.status(500).json({ success: false, message: 'خطأ في إعادة الإرسال — فريقنا سيتابع طلبك تلقائياً' });
-  }
+  runExchangeFulfillment(orderId, ord, chosen)
+    .catch((e) => logger.logError('Exchange background', e))
+    .finally(() => exchangeInFlight.delete(orderId));
 });
+
 // ═══ 🧬 Exchange — جلب الخيارات (قراءة) ═══
 app.get('/api/exchange/:orderId/options', async (req, res) => {
   const orderId = parseInt(req.params.orderId, 10);
   const token = String(req.query.t || '');
+  res.set('Cache-Control', 'no-store'); // polling — ما نكاشيوش الحالة
   if (!Number.isInteger(orderId) || orderId <= 0 || !EXCHANGE_UUID_RE.test(token)) {
     return res.json({ status: 'invalid' });
   }
   try {
     const { rows } = await pool.query(
-      'SELECT status, exchange_options FROM orders WHERE id = $1 AND exchange_token = $2',
+      'SELECT status, exchange_options, cj_order_number FROM orders WHERE id = $1 AND exchange_token = $2',
       [orderId, token]
     );
     if (!rows.length) return res.json({ status: 'invalid' });
-    const { status, exchange_options } = rows[0];
+    const { status, exchange_options, cj_order_number } = rows[0];
     if (status === 'awaiting_exchange') {
       return res.json({ status: 'awaiting_exchange', options: exchange_options || [] });
     }
@@ -2194,6 +2290,10 @@ app.get('/api/exchange/:orderId/options', async (req, res) => {
       // 🆕 manual = معالجة جارية (استرداد يدوي أو triage) — لا نؤكد استرداداً لم يحدث
       return res.json({ status: 'processing' });
     }
+    if (status === 'paid' && (exchangeInFlight.has(orderId) || !cj_order_number)) {
+      // 🆕 paid بلا رقم CJ = الـ fulfillment مازال جاري — ما نقولوش "exchanged" قبل ما CJ يقبل
+      return res.json({ status: 'processing' });
+    }
     if (['paid', 'fulfilled', 'completed'].includes(status)) {
       return res.json({ status: 'exchanged' });
     }
@@ -2203,13 +2303,14 @@ app.get('/api/exchange/:orderId/options', async (req, res) => {
     return res.status(500).json({ error: 'internal' });
   }
 });
+
 // ═══ 🗺️ Ship Truth Engine — Journey API ═══
 // 🛡️ IDOR defense: يتطلب orderId + customerEmail (نفس عقد التتبع)
 app.get('/api/tracking/:orderId/journey', async (req, res) => {
   try {
     const { orderId } = req.params;
     const { email } = req.query;
-    
+
     if (!orderId || !email) {
       return res.status(400).json({ error: 'orderId and email required' });
     }
@@ -2230,6 +2331,7 @@ app.get('/api/tracking/:orderId/journey', async (req, res) => {
     res.status(500).json({ error: 'Journey fetch failed' });
   }
 });
+
 // ==========================================
 // قالب إيميل تأكيد الطلب
 // ==========================================
@@ -2350,7 +2452,7 @@ cron.schedule('0 3 * * *', async () => {
   console.log('⏳ [Auto-Cron] Starting daily product stock/price update...');
   try {
     const { rows } = await pool.query("SELECT id, cj_product_id FROM products WHERE cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%' ORDER BY random() LIMIT 100");
-    
+
     for (const p of rows) {
       try {
         await new Promise(r => setTimeout(r, 1500));
@@ -2374,17 +2476,15 @@ cron.schedule('0 3 * * *', async () => {
     console.error('❌ [Auto-Cron] Error updating products:', err.message);
   }
 });
+
 // ==========================================
 // 🔄 10. كرون تحديث أسعار ومقاسات المتغيرات (Variant Price Sync)
-// يعمل يومياً الساعة 2:30 صباحاً (قبل كرون تحديث المنتجات الرئيسي)
-// يستخدم نقطة variant/query السريعة لتوفير طلبات API
 // ==========================================
 cron.schedule('30 2 * * *', async () => {
   console.log('⏳ [Variant Sync] Starting daily variant price update...');
   try {
-    // جلب 100 منتج عشوائي لتحديث متغيراتها
     const { rows } = await pool.query("SELECT id, cj_product_id, variants FROM products WHERE cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%' ORDER BY random() LIMIT 100");
-    
+
     let updatedCount = 0;
 
     for (const p of rows) {
@@ -2393,29 +2493,30 @@ cron.schedule('30 2 * * *', async () => {
 
         // 1. استدعاء نقطة variant/query السريعة
         const variantRes = await cjRequest((token, config) =>
-          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/variant/query', { 
-            ...config, 
-            headers: { 'CJ-Access-Token': token }, 
-            params: { pid: p.cj_product_id } 
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/variant/query', {
+            ...config,
+            headers: { 'CJ-Access-Token': token },
+            params: { pid: p.cj_product_id }
           })
         );
 
         const cjVariants = variantRes.data?.data;
-        
+
         // 2. التحقق من وجود متغيرات صالحة
         if (Array.isArray(cjVariants) && cjVariants.length > 0) {
-          
+
           // 3. تحديث حقل variants في قاعدة البيانات بالبيانات الجديدة (الأسعار والمقاسات)
           // ملاحظة: نحتفظ بنفس الهيكل الذي تتوقعه دالة prepareSecureItems
           await pool.query(
             "UPDATE products SET variants = $1 WHERE id = $2",
             [JSON.stringify(cjVariants), p.id]
           );
-          
+
           updatedCount++;
         }
       } catch (e) {
-        // تجاهل الأخطاء الفردية لمنع توقف الكرون بالكامل
+        // 🩹 FIX#10 — كان catch فارغ تماماً (آخر catch صامت في الملف)
+        console.warn(`⚠️ [VariantSync] product ${p.id} failed: ${e.message}`);
       }
     }
 
@@ -2430,14 +2531,14 @@ cron.schedule('30 2 * * *', async () => {
 cron.schedule('0 4 * * *', async () => {
   const authors = ["Emma", "Liam", "Olivia", "Noah", "Ava", "Ethan", "Sophia", "Mason"];
   const contents = ["Highly recommend!", "Exactly as described.", "Great quality.", "Fast shipping, very happy."];
-  
+
   try {
     const { rows } = await pool.query("SELECT id FROM products WHERE stock_status = true ORDER BY random() LIMIT 5");
     for (const p of rows) {
       const author = authors[Math.floor(Math.random() * authors.length)];
       const content = contents[Math.floor(Math.random() * contents.length)];
       const rating = Math.random() > 0.2 ? 5 : 4;
-      
+
       await pool.query(
         'INSERT INTO reviews (product_id, author, rating, content, country) VALUES ($1, $2, $3, $4, $5)',
         [p.id, author, rating, content, 'United States']
@@ -2452,21 +2553,21 @@ cron.schedule('0 4 * * *', async () => {
 // 3. دمج الطلبات على CJ تلقائياً (كل ساعة)
 cron.schedule('0 * * * *', async () => {
   try {
-    const matchRes = await cjRequest((token) => 
-      axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/autoMatchMergeOrderListV3', 
-        { filterOrder: true, orderStatus: 100 }, 
+    const matchRes = await cjRequest((token) =>
+      axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/autoMatchMergeOrderListV3',
+        { filterOrder: true, orderStatus: 100 },
         { headers: { 'CJ-Access-Token': token } }
       )
     );
-    
+
     if (matchRes.data.code === 200 && matchRes.data.data?.result?.length > 0) {
       const groups = matchRes.data.data.result;
       for (const group of groups) {
         try {
-          await new Promise(r => setTimeout(r, 1500)); 
-          await cjRequest((token) => 
-            axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/submitMergeOrderBatchV3', 
-              group.mergeShopOrderVOList, 
+          await new Promise(r => setTimeout(r, 1500));
+          await cjRequest((token) =>
+            axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/submitMergeOrderBatchV3',
+              group.mergeShopOrderVOList,
               { headers: { 'CJ-Access-Token': token } }
             )
           );
@@ -2482,15 +2583,15 @@ cron.schedule('0 1 * * 0', async () => {
   try {
     const { rows } = await pool.query("SELECT id, cj_product_id FROM products WHERE cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%' AND stock_status = true");
     let hiddenCount = 0;
-    
+
     for (const p of rows) {
       try {
-        await new Promise(r => setTimeout(r, 1200)); 
+        await new Promise(r => setTimeout(r, 1200));
         const detailRes = await cjRequest((token, config) =>
-          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', { 
-            ...config, 
-            headers: { 'CJ-Access-Token': token }, 
-            params: { pid: p.cj_product_id } 
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/query', {
+            ...config,
+            headers: { 'CJ-Access-Token': token },
+            params: { pid: p.cj_product_id }
           })
         );
         const details = detailRes.data?.data;
@@ -2498,7 +2599,7 @@ cron.schedule('0 1 * * 0', async () => {
           await pool.query("UPDATE products SET stock_status = false WHERE id = $1", [p.id]);
           hiddenCount++;
         }
-      } catch (e) { console.warn('⚠️ [WeeklyCleanup] product ' + (p && p.id) + ' failed: ' + e.message); } 
+      } catch (e) { console.warn('⚠️ [WeeklyCleanup] product ' + (p && p.id) + ' failed: ' + e.message); }
     }
     clearProductsCache();
     console.log(`✅ [Auto-Cron] Weekly cleanup completed! Hidden ${hiddenCount} products.`);
@@ -2511,10 +2612,13 @@ cron.schedule('0 1 * * 0', async () => {
 cron.schedule('0 11,18 * * *', async () => {
   await postDailyProductToFacebook();
 });
+
+// 🩺 🩹 (بقيت كما هي — مع FIX من الجلسة السابقة)
 cron.schedule('0 */2 * * *', async () => {
-       try { await selfHealStuckOrders(); } catch (e) { logger.logError('SelfHeal Scheduler', e); }
-     });
-     // ═══ ⚖️ Dispute Watchdog — مراقبة chargebacks (كل 6 ساعات) ═══
+  try { await selfHealStuckOrders(); } catch (e) { logger.logError('SelfHeal Scheduler', e); }
+});
+
+// ═══ ⚖️ Dispute Watchdog — مراقبة chargebacks (كل 6 ساعات) ═══
 cron.schedule('0 */6 * * *', async () => {
   try {
     await disputeWatchdogCron();
@@ -2522,10 +2626,10 @@ cron.schedule('0 */6 * * *', async () => {
     logger.logError('DisputeWatch Scheduler', e); // Tenet #14
   }
 });
+
 // 6. كرون مطابقة مدفوعات Stripe v2 (كل 15 دقيقة)
 // الهدف الحقيقي: طلب paid اللي fulfillment فشل قبل ما يوصل CJ (crash شبكي...)
 // ✅ v2: guard cj_order_number — الطلب المقبول فـ CJ عندو رقم → عمرو ما يتعاود
-//   (قبل: كيتعاود كل 15د → 1603003 → إيميل مكرر! و'completed' كانت المجمّع الوهمي)
 cron.schedule('*/15 * * * *', async () => {
   if (isReconciling) return;
   isReconciling = true;
@@ -2547,6 +2651,7 @@ cron.schedule('*/15 * * * *', async () => {
     }
 
     for (const order of pendingOrders) {
+      if (exchangeInFlight.has(order.id)) continue; // 🛡️ exchange cascade شغال — لا تداخل
       try {
         // ✅ v2 — لا حالة وسيطة 'reconciling' جديدة (كانت كتخلي الطلب يتيم إلا crash)
         const session = await stripe.checkout.sessions.retrieve(order.stripe_session_id);
@@ -2578,8 +2683,12 @@ cron.schedule('*/15 * * * *', async () => {
               sendOrderConfirmationEmail(fullOrder.customer_email, order.id, fullOrder.total_amount, items)
                 .catch(err => logger.logError('Reconcile Email', err));
             }
+          } else if (cjResponse && cjResponse.reason === 'IN_FLIGHT') {
+            // 🔒 fulfillment آخر شغال لنفس الطلب (webhook/JIT/exchange/retry) — هو المسؤول، نتخطى بلا أي تغيير حالة
+            console.log(`⏭️ [Reconcile] #${order.id} fulfillment in flight elsewhere — skipped`);
           } else {
-            await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [order.id]);
+            // 🛡️ ما نكتبوش فوق awaiting_exchange (S2) ولا فوق طلب تقبّل فـ CJ — manual فقط إذا بقى paid/reconciling
+            await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1 AND status IN ('paid','reconciling')", [order.id]);
           }
         } else {
           // ✅ v2 — إلغاء ذري (ما كيمسش طلب متسجل فـ CJ أصلاً)
@@ -2591,7 +2700,7 @@ cron.schedule('*/15 * * * *', async () => {
         }
       } catch (error) {
         logger.logError(`Stripe Reconcile Order #${order.id}`, error);
-        await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1", [order.id]);
+        await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1 AND status IN ('paid','reconciling')", [order.id]);
       }
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
@@ -2615,19 +2724,19 @@ cron.schedule('0 * * * *', async () => {
   try {
     // تنظيف طلبات Stripe, Paysera, Crypto المعلقة لأكثر من ساعتين
     const result = await pool.query(`
-      UPDATE orders 
-      SET status = 'expired' 
-      WHERE status = 'pending' 
-        AND payment_method IN ('Stripe', 'Paysera', 'Crypto') 
+      UPDATE orders
+      SET status = 'expired'
+      WHERE status = 'pending'
+        AND payment_method IN ('Stripe', 'Paysera', 'Crypto')
         AND created_at < NOW() - INTERVAL '2 hours'
     `);
-    
+
     // تنظيف طلبات BaridiMob المعلقة لأكثر من 48 ساعة
     await pool.query(`
-      UPDATE orders 
-      SET status = 'expired' 
-      WHERE status = 'pending' 
-        AND payment_method = 'BaridiMob' 
+      UPDATE orders
+      SET status = 'expired'
+      WHERE status = 'pending'
+        AND payment_method = 'BaridiMob'
         AND created_at < NOW() - INTERVAL '48 hours'
     `);
 
@@ -2640,6 +2749,7 @@ cron.schedule('0 * * * *', async () => {
     isSweeping = false;
   }
 });
+
 // 🛑 DISABLED (2026-10-02) — Neon free-plan compute killer:
 // this 4-min ping kept the DB compute awake 24/7 → burned the monthly
 // compute hours in ~4 days → project suspended by Neon.
@@ -2652,22 +2762,28 @@ cron.schedule('0 * * * *', async () => {
 //     console.error('Neon keep-alive error:', err.message);
 //   }
 // });
+
 // ==========================================
-// 🛒 8. كرون استرجاع السلات المتروكة (Abandoned Cart Recovery)
-// يعمل كل ساعتين لإرسال إيميل تذكيري مع كوبون خصم للزبائن المترددين
+// 🛒 8. كرون استرجاع السلات المتروكة — 🩹 FIX#4 (كان ميتاً بنيوياً):
+//    Sweeper (:00) كيقتل pending > 2h ونافذة الاستهداف كانت 2h–6h فارغة دائماً
+//    + لا sent-flag = لو انعكس الترتيب كان سبام لانهائي
+//    الإصلاح: كل ساعة على :15 · نافذة 1–2h · عمود recovery_email_sent_at (سقف: إيميل واحد/طلب)
+//    ⚠️ migration إلزامي (مطبق):
+//    ALTER TABLE orders ADD COLUMN IF NOT EXISTS recovery_email_sent_at TIMESTAMPTZ;
 // ==========================================
-cron.schedule('0 */2 * * *', async () => {
+cron.schedule('15 * * * *', async () => {
   console.log('⏳ [Abandoned Cart] Checking for abandoned checkouts...');
   try {
     const { rows: abandonedOrders } = await pool.query(`
-      SELECT id, customer_name, customer_email, total_amount, created_at 
-      FROM orders 
-      WHERE status = 'pending' 
-        AND customer_email IS NOT NULL 
-        AND customer_email NOT LIKE '%@neo.com' 
+      SELECT id, customer_name, customer_email, total_amount, created_at
+      FROM orders
+      WHERE status = 'pending'
+        AND customer_email IS NOT NULL
+        AND customer_email NOT LIKE '%@neo.com'
         AND customer_email NOT LIKE '%@laclarc.com'
-        AND created_at BETWEEN NOW() - INTERVAL '6 hours' AND NOW() - INTERVAL '2 hours'
+        AND created_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'
         AND receipt_url IS NULL
+        AND recovery_email_sent_at IS NULL
       LIMIT 10;
     `);
 
@@ -2676,9 +2792,9 @@ cron.schedule('0 */2 * * *', async () => {
     for (const order of abandonedOrders) {
       // جلب صور وعناوين المنتجات المتروكة
       const itemsRes = await pool.query(`
-        SELECT p.title, p.image_url, oi.price_at_purchase, oi.quantity 
-        FROM order_items oi 
-        JOIN products p ON oi.product_id = p.id 
+        SELECT p.title, p.image_url, oi.price_at_purchase, oi.quantity
+        FROM order_items oi
+        JOIN products p ON oi.product_id = p.id
         WHERE oi.order_id = $1
       `, [order.id]);
 
@@ -2701,7 +2817,7 @@ cron.schedule('0 */2 * * *', async () => {
             <h1 style="color: #1D1E3C; margin: 0; font-size: 26px;">Laclarc</h1>
             <p style="color: #8B78C6; font-weight: bold; font-size: 13px; margin: 4px 0 0;">Did you leave something behind?</p>
           </div>
-          
+
           <p style="color: #4B5563; font-size: 14px; line-height: 1.6;">
             Hello <strong>${order.customer_name || 'there'}</strong>,<br>
             Your curated items are still safely reserved in your bag, but limited flash inventory is selling out fast!
@@ -2734,6 +2850,8 @@ cron.schedule('0 */2 * * *', async () => {
         html: recoveryHtml
       });
 
+      // 🩹 FIX#4 — سقف الـ spam: إيميل واحد لكل طلب، للأبد
+      await pool.query('UPDATE orders SET recovery_email_sent_at = NOW() WHERE id = $1', [order.id]);
       console.log(`📧 [Abandoned Cart] Recovery email dispatched to ${order.customer_email} for Order #${order.id}`);
       await new Promise(r => setTimeout(r, 1000));
     }
@@ -2741,11 +2859,14 @@ cron.schedule('0 */2 * * *', async () => {
     console.error('❌ [Abandoned Cart] Error:', err.message);
   }
 });
+// 📌 Backlog: الـ CTA يؤدي لـ /cart (سلة جلسة-محلية قد تكون فارغة) —
+//    الإصلاح الكامل: "أكمل دفع طلبك #N" (endpoint يبني checkout من order_items)
+
+// ==========================================
 // 9. كرون التتبع v2 — fallback ديال الويب هوك (كل نصف ساعة)
-// ✅ GET ماشي POST (16900202 مؤكدة بالتجربة — الكومنتار القديم كان غالط)
-// ✅ guards + RETURNING = dedup مع الويب هوك + notifyShipment الموحدة
+// ==========================================
 cron.schedule('30 * * * *', async () => {
-  console.log('\u23f3 [CJ Logistics v3] Batch tracking (1 call / up to 50 orders)...');
+  console.log('⏳ [CJ Logistics v3] Batch tracking (1 call / up to 50 orders)...');
   try {
     const { rows: pendingTrackingOrders } = await pool.query(`
       SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number, created_at
@@ -2757,7 +2878,7 @@ cron.schedule('30 * * * *', async () => {
     `);
     if (pendingTrackingOrders.length === 0) return;
 
-    // \u2b50 1.16 \u0642\u064a\u0628\u0644: \u0631\u0642\u0645 CJ (SD...) / \u0631\u0642\u0645 \u0627\u0644\u0645\u062a\u062c\u0631 (STORE-x) / order id
+    // ⭐ 1.16 قبل: رقم CJ (SD...) / رقم المتجر (STORE-x) / order id
     const keys = pendingTrackingOrders.map(o => {
       const stored = String(o.cj_order_number || '').trim();
       const key = stored && !/^STORE-/i.test(stored) ? stored : `STORE-${o.id}`;
@@ -2772,19 +2893,19 @@ cron.schedule('30 * * * *', async () => {
     );
 
     if (batchRes.data?.code !== 200) {
-      // 1600000 = retry later (\u0645\u0627\u0634\u064a "\u0645\u0627\u0643\u0627\u0645\u0643\u0634") — \u0627\u0644\u062f\u0648\u0631\u0629 \u0627\u0644\u062c\u0627\u064a\u0629 \u062a\u0639\u0627\u0648\u062f
-      console.warn(`\u26a0\ufe0f [Tracking] Batch: ${batchRes.data?.message} (code: ${batchRes.data?.code})`);
+      // 1600000 = retry later — الدورة الجاية تعاود
+      console.warn(`⚠️ [Tracking] Batch: ${batchRes.data?.message} (code: ${batchRes.data?.code})`);
       return;
     }
     const list = Array.isArray(batchRes.data?.data) ? batchRes.data.data : [];
 
-    // \ud83d\udd2c \u0639\u064a\u0646\u0629 \u0623\u0648\u0644 \u0642\u0631\u0627\u0621\u0629 Batch — \u0622\u062e\u0631 \u0639\u064a\u0646\u0629 \u0641\u0627\u0644\u0645\u0634\u0631\u0648\u0639
+    // 🔬 عينة أول قراءة Batch
     if (!global._cjSample_OrderDetailBatch) {
       global._cjSample_OrderDetailBatch = true;
       console.log('[Sample OrderDetailBatch]', JSON.stringify(list[0] || {}).slice(0, 1000));
     }
 
-    // \u0641\u0647\u0631\u0633\u0629 \u0628\u0627\u0644\u062c\u0648\u062c \u0627\u0644\u0645\u0641\u0627\u062a\u064a\u062d (orderNum = STORE-x | cjOrderCode = SD...)
+    // فهرسة بالمفتاحين (orderNum = STORE-x | cjOrderCode = SD...)
     const byKey = new Map();
     for (const d of list) {
       if (d.orderNum) byKey.set(String(d.orderNum).toLowerCase(), d);
@@ -2793,7 +2914,7 @@ cron.schedule('30 * * * *', async () => {
 
     for (const { order, key } of keys) {
       const d = byKey.get(key.toLowerCase());
-      if (!d) continue; // CJ \u062a\u062e\u0637\u0627\u0647 \u0628\u0635\u0645\u062a — \u0646\u0633\u062a\u0646\u0648 \u0627\u0644\u062f\u0648\u0631\u0629 \u0627\u0644\u062c\u0627\u064a\u0629
+      if (!d) continue; // CJ تخطاه بصمت — نستنى الدورة الجاية
 
       const status = String(d.orderStatus || '').toUpperCase();
       const track = String(d.trackNumber || '').trim();
@@ -2809,19 +2930,19 @@ cron.schedule('30 * * * *', async () => {
           [track, order.id, d.cjOrderCode || key]
         );
         if (upd.rows.length) {
-          console.log(`\ud83d\ude80 [CJ Dispatched] #${order.id}: ${track} (${d.logisticName || '?'})`);
+          console.log(`🚀 [CJ Dispatched] #${order.id}: ${track} (${d.logisticName || '?'})`);
           await notifyShipment(order, track, d.logisticName);
         }
       } else if (status === 'DELIVERED') {
         if (order.status === 'paid' && track.length > 3) {
-          // \ud83d\udea8 \u0641\u0627\u062a\u0646\u0627 SHIPPED (\u0648\u064a\u0628 \u0647\u0648\u0643 \u0636\u0627\u064a\u0639) — \u0625\u0634\u0639\u0627\u0631 \u0645\u062a\u0623\u062e\u0631 \u062e\u064a\u0631 \u0645\u0646 \u0648\u0627\u0644\u0648
+          // 🚨 فاتنا SHIPPED (ويب هوك ضايع) — إشعار متأخر خير من والو
           const upd = await pool.query(
             `UPDATE orders SET tracking_number = $1, status = 'fulfilled'
              WHERE id = $2 AND status = 'paid' AND (tracking_number IS NULL OR tracking_number = '') RETURNING id`,
             [track, order.id]
           );
           if (upd.rows.length) {
-            console.log(`[CJ] #${order.id} DELIVERED (SHIPPED \u0641\u0627\u062a) — \u0625\u0634\u0639\u0627\u0631 \u0645\u062a\u0623\u062e\u0631`);
+            console.log(`[CJ] #${order.id} DELIVERED (SHIPPED فات) — إشعار متأخر`);
             await notifyShipment(order, track, d.logisticName);
           }
         } else if (order.status === 'fulfilled') {
@@ -2837,8 +2958,9 @@ cron.schedule('30 * * * *', async () => {
     logger.logError('CJ Logistics Cron', err);
   }
 });
+
 // ==========================================
-// 🤖 Auto-Heal cron - السلّم الكامل للطلبات العالقة (1.13/1.14 → 1.8 delete+recreate → 2.2 autopay)
+// 🤖 Auto-Heal cron - السلّم الكامل للطلبات العالقة
 // ==========================================
 cron.schedule('17,47 * * * *', async () => {
   try {
@@ -2892,7 +3014,7 @@ cron.schedule('17,47 * * * *', async () => {
           const del = await deleteCJOrder(d.orderId, d.cjOrderCode, key);
           if (!del.ok) {
             console.warn('[AutoHeal] delete failed #' + order.id + ': ' + del.reason);
-            if (typeof sendAdminAlert === 'function') sendAdminAlert('[CJ] Stuck order #' + order.id + ' - auto-repair & delete failed', '<p>repair: ' + rep.reason + ' | delete: ' + del.reason + '</p>').catch(function () {});
+            sendAdminAlert('[CJ] Stuck order #' + order.id + ' - auto-repair & delete failed', '<p>repair: ' + rep.reason + ' | delete: ' + del.reason + '</p>').catch(function () {});
             continue;
           }
           await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [order.id]).catch(function () {});
@@ -2914,7 +3036,7 @@ cron.schedule('17,47 * * * *', async () => {
         // سبقنا recreate — تنبيه مرة كل 24س
         if (!global['_cjStuckAlert_' + order.id] || Date.now() - global['_cjStuckAlert_' + order.id] > 86400000) {
           global['_cjStuckAlert_' + order.id] = Date.now();
-          if (typeof sendAdminAlert === 'function') sendAdminAlert('[CJ] Order #' + order.id + ' still stuck after recreate attempt', '<p>Status: CREATED, no logistics, no payment. Last repair reason: ' + rep.reason + '</p>').catch(function () {});
+          sendAdminAlert('[CJ] Order #' + order.id + ' still stuck after recreate attempt', '<p>Status: CREATED, no logistics, no payment. Last repair reason: ' + rep.reason + '</p>').catch(function () {});
         }
         continue;
       }
@@ -3018,12 +3140,8 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
 
   const lang = detectLanguage(message); // ✨ لغة الزبون للردود الاحتياطية
 
-  // 🛡️ IDOR Defense (Section 3.4 — same rule as the Track My Order page):
-  // Real order data is injected into the prompt ONLY after matching
-  // BOTH order_id AND customer_email.
-  //
-  // ✨ We scan the current message + previous user messages, so the flow works:
-  // "Where is my order #123?" → bot asks for email → customer sends email alone → verified
+  // 🛡️ IDOR Defense: بيانات الطلب الحقيقية تُحقن في الـ prompt فقط بعد تطابق
+  //    مزدوج (order_id + customer_email)
   const recentUserTexts = [
     message,
     ...(Array.isArray(history) ? history.filter(h => h?.sender === 'user').map(h => String(h.text || '')) : [])
@@ -3075,7 +3193,7 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
       systemInstruction: ON_SITE_AI_PROMPT + orderContext
     });
 
-    const formattedHistory = Array.isArray(history) 
+    const formattedHistory = Array.isArray(history)
       ? history.slice(-4).map(h => ({
           role: h.sender === 'user' ? 'user' : 'model',
           parts: [{ text: h.text }]
@@ -3155,8 +3273,6 @@ const handleShutdown = async (signal) => {
   console.log(`🛑 ${signal} received — closing HTTP server and draining DB pool...`);
 
   // ✨ سد فوري للاتصالات keep-alive الخاملة (Cloudflare/Vercel proxy)
-  // بلا هاد السطر: close() كيتسنى حتى 5 ثواني (keepAliveTimeout) فكل deploy
-  // الطلبات النشطة كتتكمل عادي — غير الخاملة اللي كيتسدو
   if (typeof server.closeIdleConnections === 'function') {
     server.closeIdleConnections();
   }

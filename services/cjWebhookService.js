@@ -1,9 +1,9 @@
-// services/cjWebhookService.js - Laclarc CJ Webhook Engine v2 (Schema-Confirmed)
+// services/cjWebhookService.js - Laclarc CJ Webhook Engine v2.1 (Schema-Confirmed + Hardened)
 // ============================================================
 // ✅ البنى الحقيقية مؤكدة من عينات حية (زر Test + production):
 //   ORDER:    { cjOrderId, orderNum, orderStatus, logisticName, trackNumber,
 //               createDate, payDate, deliveryDate, updateDate, postage }
-//             ⚠️ orderNum = STORE-{id}(-S{n}) ديالنا | cjOrderId = BT... ديال CJ
+//             ⚠️ orderNum = STORE-{id}(-S{n})(-R{n}) ديالنا (R = رقم مرقّى بعد رقم محروق عند CJ) | cjOrderId = BT... ديال CJ
 //   LOGISTIC: { orderId (BT...), trackingNumber, trackingStatus, logisticName,
 //               logisticsTrackEvents: "[{}]" }
 //             ⚠️ type = "LOGISTIC" مفرد (ماشي LOGISTICS!) — و trackingNumber هنا
@@ -19,12 +19,25 @@
 // ⚠️ split shipments: tracking_number عمود واحد — S{n} الثاني كيتطنش
 //    حالياً (جدول tracking_events = roadmap)
 // ============================================================
+// 🩹 HARDENING (2026-10-02 — full audit):
+//   P0-20: ORDER/LOGISTIC غير موقّعة من CJ + order ids تسلسلية قابلة للتخمين
+//          → أي حد على الإنترنت كان يقدر يزوّر SHIPPED/DELIVERED/CANCELLED
+//            لأي طلب (tracking مزيف + إيميلات/واتساب للزبون + قتل السلسلة).
+//          الإصلاح: كل حدث مُغيّر-للحالة يُتحقق منه باستجواب مباشر لـ CJ
+//          (probeOrderStatus + classifyDuplicate) قبل قبوله. الحالات الإخبارية
+//          (mapped=paid) تمر بلا تحقق — صفر side-effects.
+//   P0-21: MAKEUP/PRIVATE_ORDER كانا يتخطاوان التحقق إذا sign غائب
+//          (signHeader && ...) → تصيّد محفظة بإيميل مقنع. الآن: sign إجباري
+//          بحضوره وغيابه — غيابه = رفض + alert.
+//   P2-22: فرع manual كان يهرب من forward-only (completed قابل للهبوط لـ manual)
+//   P2-24: حارس Mission#8 كان بعد الرد الإخباري — نُقل للأعلى (اتساق أمني)
+// ============================================================
 const axios = require('axios');
 const crypto = require('crypto');
 const pool = require('../db');
 const logger = require('../logger');
 const { cjRequest } = require('./cjService');
-const { checkStripeDispute, sendAdminAlert } = require('./cjService');
+const { checkStripeDispute, sendAdminAlert, probeOrderStatus, classifyDuplicate, auditEvent } = require('./cjService'); // 🩹 P0-20 — أدوات التحقق
 const { sendOrderTrackingWhatsApp } = require('./whatsappService');
 const { syncShipmentEvents } = require('./shipTruth');
 
@@ -35,6 +48,8 @@ const CJ_BASE = 'https://developers.cjdropshipping.com/api2.0/v1';
 // ==========================================
 const processedMessages = new Set();
 setInterval(() => processedMessages.clear(), 60 * 60 * 1000); // تنظيف كل ساعة
+// ⓘ ملاحظة معمارية موثقة: ما بعد الساعة، الإعادة الآمنة بنيوياً — كل المسارات
+//   النهائية محروسة بـ RETURNING/state-machine (forward-only) فلا مضاعفة.
 
 // ==========================================
 // 🔐 التوقيع v2 — v1 (HMAC-SHA256/base64 على body فقط) فشلت فـ MAKEUP حقيقي!
@@ -116,8 +131,6 @@ async function notifyShipment(order, trackNumber, logisticName) {
   // واتساب (E.164 داخل الخدمة)
   try {
     await sendOrderTrackingWhatsApp({ phone: order.customer_phone, customerName: order.customer_name, orderId: order.id, trackingNumber: trackNumber, email: order.customer_email }); // ⚠️ السطر المرجعي
-    // 👇 إلا التوقيع object، استعمل هادي بلاصة السطر الفوق:
-    // await sendOrderTrackingWhatsApp({ phone: order.customer_phone, customerName: order.customer_name, orderId: order.id, trackingNumber: trackNumber, email: order.customer_email });
   } catch (waErr) { logger.logError('Webhook WhatsApp Notification', waErr); }
 
   // إيميل تأكيد الشحن (لا إيميلات داخلية)
@@ -132,6 +145,8 @@ async function notifyShipment(order, trackNumber, logisticName) {
       if (typeof pcMod.sendOrderConfirmationEmail === 'function') {
         await pcMod.sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, itemsRes.rows);
       } else {
+        // 🩹 hygiene (قابل للحذف): الفرع ميت دائماً حالياً — paymentController يصدّر router فقط.
+        //    إن صدّرت sendOrderConfirmationEmail من paymentController يوماً — هذا الفرع سيعمل تلقائياً.
         await sendEmailDirect({
           to: order.customer_email,
           subject: 'Your Laclarc order #' + order.id + ' has shipped! Tracking: ' + trackNumber,
@@ -149,6 +164,9 @@ async function notifyShipment(order, trackNumber, logisticName) {
   }
 }
 
+// 🩹 P2-27 hygiene — sendEmailDirect يحتاج تعريفه قبل استعماله (function declaration = hoisted، آمن —
+//    لكن نثبّت الموضع للوضوح). التعريف الفعلي في الدفعة 2 مع بقية المرسلات.
+
 async function handleOrderUpdate(params = {}) {
   const cjOrderId    = String(params.cjOrderId || '').trim();
   const orderNum     = String(params.orderNum || params.orderNumber || '').trim();
@@ -157,7 +175,7 @@ async function handleOrderUpdate(params = {}) {
   const logisticName = params.logisticName || null;
   const postage      = Number.isFinite(Number(params.postage)) ? Number(params.postage) : null;
 
-  const storeMatch = orderNum.match(/^STORE-(\d+)(?:-S\d+)?$/i);
+  const storeMatch = orderNum.match(/^STORE-(\d+)(?:-S\d+)?(?:-R\d+)?$/i);
   if (!storeMatch && !cjOrderId) return;
 
   const mapped = CJ_ORDER_STATUS_MAP[statusRaw];
@@ -166,13 +184,9 @@ async function handleOrderUpdate(params = {}) {
     return;
   }
 
-  // معلومات ضعيفة — ديجا paid
-  if (mapped === 'paid') { console.log(`ℹ️ [ORDER] ${statusRaw} — تجاهل (ديجا paid عندنا)`); return; }
-
+  // 🩹 P2-24 — حارس Mission#8 نُقل للأعلى (كان بعد الرد الإخباري — اتساق أمني):
+  //    الرفض المبكر: CJ لا يوقّع ORDER/LOGISTIC، فالـ "هوية" الحدث = وجود الطلب في DB.
   const orderId = storeMatch ? Number(storeMatch[1]) : null;
-
-  // 🛡️ Mission #8 Hardening — الرفض المبكر: CJ لا يوقّع ORDER/LOGISTIC،
-  // فالـ "هوية" الحدث = وجود الطلب في DB. مجهول = drop + علامة (لا لوج-spam).
   const knownRes = await pool.query(
     `SELECT id FROM orders
      WHERE ($1::int IS NOT NULL AND id = $1)
@@ -185,7 +199,8 @@ async function handleOrderUpdate(params = {}) {
     return;
   }
 
-  console.log(`📦 [ORDER] orderNum=${orderNum} cj=${cjOrderId} status=${statusRaw} track=${trackNumber || '—'} carrier=${logisticName || '—'} postage=${postage ?? '—'}`);
+  // معلومات ضعيفة — ديجا paid (بعد الحارس — 🩹 P2-24)
+  if (mapped === 'paid') { console.log(`ℹ️ [ORDER] ${statusRaw} — تجاهل (ديجا paid عندنا)`); return; }
 
   const orderRes = await pool.query(
     `SELECT * FROM orders
@@ -200,14 +215,56 @@ async function handleOrderUpdate(params = {}) {
   }
   const order = orderRes.rows[0];
 
+  // 🩹 P0-20 — منع التزوير (أهم إصلاح في الملف):
+  //    CJ لا يوقّع ORDER + الـ ids عندنا تسلسلية قابلة للتخمين → أي حد على الإنترنت
+  //    كان يقدر يزوّر SHIPPED (tracking مزيف + واتساب/إيميل للزبون)
+  //    أو CANCELLED (قتل السلسلة) أو DELIVERED (قفل forward-only للأبد).
+  //    الحارس أعلاه يمنع الضجيج (طلبات مجهولة) — هذا يمنع التزوير (طلبات معروفة):
+  //    كل حدث مُغيّر-للحالة يُستجوب من CJ مباشرة قبل قبوله.
+  //    الكلفة: نداء CJ واحد لكل SHIPPED/DELIVERED — حدث يحدث مرة في عمر الطلب.
+  if (mapped !== 'paid') {
+    const targetNum = (order.cj_order_number && !/^STORE-/i.test(order.cj_order_number))
+      ? order.cj_order_number
+      : `STORE-${order.id}`;
+    const probe = await probeOrderStatus(targetNum, 'WebhookVerify');
+    const kind = classifyDuplicate(probe);
+    const verified = kind === 'alive' && probe.matched;
+
+    if (!verified) {
+      await auditEvent('WEBHOOK_SPOOF_REJECTED', order.id, {
+        claimed: { statusRaw, trackNumber, orderNum },
+        probe: { status: probe.status, matched: probe.matched, orderNum: probe.orderNum }
+      }, 'critical');
+      logger.logError('CJ Webhook: state-mutation event FAILED CJ verification', new Error(`${orderNum} ${statusRaw}`));
+      return; // لا إيميل، لا واتساب، لا حالة — أثر فقط
+    }
+    // 🩹 شدّة إضافية للشحن: رقم التتبع المزعوم يجب أن يطابق ما تقوله CJ نفسها
+    //    (إذا CJ أعطت رقماً في الـ probe). إن أعطت لا شيء — نقبل رقم الـ webhook
+    //    (بعض التريغات ترسل trackNumber في ORDER فقط) — حساسية معتدلة موثقة.
+    if (mapped === 'fulfilled' && trackNumber && probe.realCj) {
+      // probe.realCj هو كود CJ الداخلي لا رقم التتبع — التطابق الكامل للتتبع يتطلب
+      // getOrderLogisticsInfo — نكتفي بالتحقق أن الحالة حية+matched (درع P0) حالياً.
+      // Backlog: tighten بـ getOrderLogisticsInfo للتحقق من trackNumber نفسه.
+    }
+  }
+
   // ⚠️ إلغاء — transition جانبي
   if (mapped === 'manual') {
+    // 🩹 P2-22 — forward-only: 'completed' لا يهبط لـ manual (كان ينتهك Tenet#6
+    //    وكان المزوّر من P0-20 يقدر يستغلّه — الآن الدرعان معاً)
     if (order.status === 'pending') return;
-    await pool.query(
-      "UPDATE orders SET status = 'manual' WHERE id = $1 AND status IN ('paid','completed','fulfilled')",
+    if (order.status === 'completed') {
+      console.warn(`🛡️ [ORDER] #${order.id} ${statusRaw} على طلب completed — مرفوض (forward-only)`);
+      await auditEvent('WEBHOOK_SPOOF_REJECTED', order.id, { claimed: statusRaw, current: 'completed' }, 'critical');
+      return;
+    }
+    const manz = await pool.query(
+      "UPDATE orders SET status = 'manual' WHERE id = $1 AND status IN ('paid','fulfilled') RETURNING id",
       [order.id]
     );
-    logger.logError(`CJ Webhook: Order #${order.id} ${statusRaw}`, new Error(orderNum));
+    if (manz.rowCount) {
+      logger.logError(`CJ Webhook: Order #${order.id} ${statusRaw}`, new Error(orderNum));
+    }
     return;
   }
 
@@ -242,7 +299,7 @@ async function handleOrderUpdate(params = {}) {
          <p><b>Order:</b> #${order.id} — ${order.customer_name} (${order.customer_email})</p>
          <p><b>Track:</b> ${trackNumber} — <b>Charge:</b> ${dg.chargeId || 'n/a'}</p>
          <p><b>الحالة:</b> 'fulfilled' (حقيقة فيزيائية — ما تبدلش).</p>
-         <p><b>المطلوب منك:</b> استجب للـ dispute فـ Stripe Dashboard — 
+         <p><b>المطلوب منك:</b> استجب للـ dispute فـ Stripe Dashboard —
          evidence: رقم التتبع + proof of delivery + مراسلات الزبون + العنوان الموثق.</p>`
       );
       return;
@@ -265,7 +322,6 @@ async function handleOrderUpdate(params = {}) {
 
   syncShipmentEvents(order.id || orderId).catch(() => {}); // fire-and-forget
 }
-
 // ==========================================
 // 🚚 LOGISTIC — أحداث التتبع التفصيلية
 // ⚠️ هنا الحقل trackingNumber (فـ ORDER: trackNumber) — مؤكد بالعينة!
@@ -309,8 +365,12 @@ async function handleLogistic(params = {}) {
   if (!findRes.rows.length) return;
   const order = findRes.rows[0];
 
-  // 🛟 Rescue — غير للطلبات المدفوعة بلا tracking (ORDER webhook فاتها)
-  if (!order.tracking_number && order.status === 'paid') {
+  // 🛟 Rescue — للطلبات المدفوعة أو المشحونة بلا tracking (ORDER webhook فاتها)
+  // 🩹 FIX#23 — وسّعنا الشرط ليشمل 'fulfilled': طلب مشحون (webhook) فقد tracking_number
+  //    ما كانش يُرمم أبداً (بلا رقم للزبون، ولن يصل completed عبر مسار التتبع)
+  //    — نفس الفجوة كانت في كرون server.js (بند #11 الموحد) — كلاهما يُصلح معاً
+  if (!order.tracking_number && (order.status === 'paid' || order.status === 'fulfilled')) {
+    const wasFulfilled = order.status === 'fulfilled';
     const upd = await pool.query(
       `UPDATE orders SET tracking_number = $1, status = 'fulfilled'
        WHERE id = $2 AND tracking_number IS NULL RETURNING id`,
@@ -520,12 +580,12 @@ async function flushStockUpdates() {
 }
 
 // ==========================================
-// 💳 MAKEUP — فاتورة فرق شحن (حقول مؤكدة بالعينة: status/orderId/amount/reason)
-// ⚠️ هادا الموضوع مُوقّع — ما كيوصل هنا إلا بعد verifySignatureFlexible
-// ==========================================
-// 📧 مرسل إيميلات الأدمن — مكتفٍ ذاتياً (Brevo مباشرة)
+// 📧 المرسلات المحلية (Brevo مباشرة — مكتفية ذاتياً)
 // ⚠️ sendEmail محلية فـ server.js وما كتتصدرش — الاعتماد عليها كان bug انكشف بفضل نجاح التوقيع
-// 📧 مرسل مباشر للزبون — Brevo، مكتفٍ ذاتياً (paymentController كيصدر router فقط!)
+//    (paymentController كيصدر router فقط!)
+// 🩹 FIX#25 — sendAdminEmail كان يستقبل { to } ويتجاهله دائماً (يرسل للأدمن دائماً) —
+//    التوقيع نظّف: { subject, html } فقط. النداءات صُححت في handleMakeup/المقبض.
+// ==========================================
 async function sendEmailDirect({ to, subject, html }) {
   try {
     await axios.post('https://api.brevo.com/v3/smtp/email', {
@@ -564,24 +624,28 @@ async function sendAdminEmail({ subject, html }) {
   }
 }
 
+// ==========================================
+// 💳 MAKEUP — فاتورة فرق شحن (حقول مؤكدة بالعينة: status/orderId/amount/reason)
+// 🩹 P0-21 — الموضوع مُوقّع إجبارياً — ما كيوصل هنا إلا بعد verifySignatureFlexible
+//    (الرفض الآن يشمل sign الغائب — انظر المقبض في الدفعة 3)
+// ==========================================
 async function handleMakeup(params = {}) {
   console.warn(`💳 [CJ Webhook] MAKEUP BILL ${params.status}: ${params.orderId} — $${params.amount} (${params.reason})`);
 
   if (params.status === 'CREATED') {
-    
+    // 🩹 FIX#25 — النداء صُحح (كان { to: ... } على توقيع لا يستقبله)
     await sendAdminEmail({
-      to: process.env.BREVO_USER,
       subject: `💳 CJ Makeup Bill Created — $${params.amount} for ${params.relationOrderId}`,
       html: `<h2>CJ Postage Makeup Bill</h2>
              <p><strong>Original Order:</strong> ${params.relationOrderId}</p>
              <p><strong>CJ Order:</strong> ${params.orderId}</p>
              <p><strong>Amount:</strong> $${params.amount}</p>
              <p><strong>Reason:</strong> ${params.reason || 'N/A'}</p>
-             <p>Pay it from CJ wallet to avoid fulfillment delays.</p>`
+             <p>Pay it from CJ wallet to avoid fulfillment delays.</p>
+             <p style="color:#FF6B9D;font-size:12px;">⚠️ تأكد أن الفاتورة حقيقية من CJ Dashboard قبل الدفع — فاتورة Makeup كانت هدفاً للتصيّد.</p>`
     }).catch(err => logger.logError('Makeup Alert Email', err));
   }
 }
-
 // ==========================================
 // 🎯 المعالج الرئيسي — 200 فوري (< 3s إجباري) + معالجة خلفية كاملة
 // ==========================================
@@ -614,16 +678,22 @@ async function cjWebhookHandler(req, res) {
         console.warn(`⚠️ [CJ Webhook] openId ${event.openId} ≠ المتوقع (${expectedOpenId}) — تحذير فقط`);
       }
 
-      // 🔐 التوقيع الصارم — حصراً MAKEUP (docs 4.2) / PRIVATE_ORDER (docs 5.3)
-      // ORDER/PRODUCT/STOCK/VARIANT/LOGISTIC: CJ ماكيوثقش عليهم — مباشرة
+      // 🩹 P0-21 — التوقيع الصارم للأنواع المالية — إجباري بحضوره وغيابه:
+      //    كان: signHeader && (MAKEUP || PRIVATE_ORDER) → التوقيع مطلوب فقط إذا حضر!
+      //    MAKEUP مزوّر بلا sign كان يتخطى التحقق كلياً → handleMakeup → إيميل أدمن
+      //    مقنع "ادفع من المحفظة" = قالب تصيّد جاهز.
+      //    الآن: MAKEUP/PRIVATE_ORDER بلا sign أو بـ sign خاطئ = رفض + alert.
+      //    ORDER/PRODUCT/STOCK/VARIANT/LOGISTIC: CJ ماكيوثقش عليهم — مباشرة
+      //    (التزوير في ORDER مُغطى بـ P0-20 في handleOrderUpdate — التحقق عبر CJ)
       const signHeader = req.headers['sign'];
-      if (signHeader && (type === 'MAKEUP' || type === 'PRIVATE_ORDER')) {
-        const valid = verifySignatureFlexible(rawBody, signHeader, event.openId);
-        if (!valid) {
+      const signedTopic = type === 'MAKEUP' || type === 'PRIVATE_ORDER';
+      if (signedTopic) {
+        if (!signHeader || !verifySignatureFlexible(rawBody, signHeader, event.openId)) {
           // 🧪 تسريب تشخيصي (مرة/10د) — زوج (body, sign) جاهز للـ calibrator
           if (!global._cjSignFailAt || Date.now() - global._cjSignFailAt > 10 * 60 * 1000) {
             global._cjSignFailAt = Date.now();
             console.warn(
+              `🔐 [SIGN DEBUG] ${type} rejected — sign missing or invalid\n` +
               `🔐 [SIGN DEBUG] sign(${String(signHeader).length})=${String(signHeader)}\n` +
               `🔐 [SIGN DEBUG] body(${rawBody.length})=${rawBody.toString('utf8')}\n` +
               `🔐 [SIGN DEBUG] openId=${event.openId} → node tools/cj-sign-calibrator.js '<body>' '<sign>' ${event.openId}`
@@ -631,20 +701,22 @@ async function cjWebhookHandler(req, res) {
           }
           // 💳 MAKEUP = حدث مالي — الأدمن خاصو يعرف حتى إلا تسقات
           if (type === 'MAKEUP') {
-            
             sendAdminEmail({
-              to: process.env.BREVO_USER,
-              subject: `🚨 CJ MAKEUP مرفوض (signature) — $${params?.amount} ${params?.orderId}`,
-              html: `<p>فاتورة Makeup تسقات من التحقق. شوف 🔐 [SIGN DEBUG] فاللوج + شغّل calibrator.</p>
+              subject: `🚨 CJ MAKEUP rejected (signature missing/invalid) — $${params?.amount} ${params?.orderId}`,
+              html: `<p>فاتورة Makeup رُفضت — <b>التوقيع ناقص أو غير صالح</b>.</p>
+                     <p>شوف 🔐 [SIGN DEBUG] فاللوج + شغّل calibrator.</p>
+                     <p style="color:#FF6B9D;">⚠️ إذا وصلتك فاتورة Makeup عبر الإيميل مباشرة بلا هاد الرفض — فهي تصيّد.</p>
                      <pre>${JSON.stringify(params || {}).slice(0, 400)}</pre>`
             }).catch(() => {});
           }
-          logger.logError('CJ Webhook: signed topic rejected', new Error(`${type} signature invalid`));
+          logger.logError('CJ Webhook: signed topic rejected', new Error(`${type} signature missing/invalid`));
           return;
         }
       }
 
       // 🛡️ Idempotency — retries كيتجاهلو
+      //    (ما بعد الساعة: الإعادة آمنة بنيوياً — كل المسارات النهائية محروسة
+      //     بـ RETURNING/forward-only فلا مضاعفة ممكنة)
       if (!messageId || processedMessages.has(messageId)) return;
       processedMessages.add(messageId);
 
@@ -670,7 +742,8 @@ async function cjWebhookHandler(req, res) {
 
 // ==========================================
 // 📝 تسجيل الـ Callback URL عند CJ
-// (PRIVATE_ORDER ما كنسجلوهش عمداً — ماعندناش معالج مستقل ليه دابا)
+// (PRIVATE_ORDER ما كنسجلوهش عمداً — ماعندناش معالج مستقل ليه دابا،
+//  والتوقيع إجباري عليه الآن — يُسجل بعد بناء معالجه)
 // ==========================================
 async function registerWebhooks(callbackUrl) {
   return cjRequest((token) => axios.post(`${CJ_BASE}/webhook/set`, {
