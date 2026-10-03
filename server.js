@@ -1687,6 +1687,11 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
 
 // ==========================================
 // مسار الدفع المحصن (Bank-Grade Checkout مع تتبع الإعلانات والكوبونات)
+// 🩹 Hardening 2026-10-03:
+//   FIX-SM: allowed_countries من shipping_matrix (222 دولة CJ-verified — مبنية بـ build_shipping_matrix)
+//           كان: ALL_WORLD_COUNTRIES نظرية — تضمنت دول غير مدعومة (يمن، الفاتيكان، العراق...)
+//           الزبون كان يستطيع الدفع من دولة لا يشحن إليها CJ = فاتورة ضائعة
+//   FIX-ERR: err.message لم يعد يُكشف للعميل (كان يسرّب تفاصيل Stripe)
 // ==========================================
 app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
   try {
@@ -1695,7 +1700,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
     let baseUrl = origin && origin.startsWith('http') ? origin : (process.env.FRONTEND_URL || 'https://laclarc.com');
     baseUrl = baseUrl.replace(/\/+$/, '');
 
-    // حساب الأسعار والـ vid حصراً من قاعدة البيانات
+    // حساب الأسعار والـ vid حصراً من قاعدة البيانات (Tenet #1)
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
     const optionalUser = getOptionalUser(req);
 
@@ -1720,7 +1725,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
       );
     }
 
-    // تصادق الكوبون عبر الـ Helper الموحد
+    // تصادق الكوبون عبر الـ Helper الموحد (Tenet #20)
     const { applied: couponApplied, discount: couponDiscount, clamped, coupon: couponRow } =
       await applyCouponToTotal(pool, couponCode, serverTotal);
 
@@ -1731,6 +1736,22 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
         ? { percent_off: parseFloat(couponRow.discount_value), duration: 'once' }
         : { amount_off: Math.round(couponDiscount * 100), currency: 'usd', duration: 'once' };
       stripeDiscounts = [{ coupon: await getOrCreateStripeCoupon(couponData) }];
+    }
+
+    // 🩹 FIX-SM — allowed_countries من shipping_matrix (CJ-verified 2026-10-03)
+    //    222 دولة مؤكدة بالمسح الفعلي — 16 مستبعدة (اليمين الفاتيكان العراق موريتانيا...)
+    //    الزبون من دولة غير مدعومة لا يصل لصفحة الدفع أصلاً — صفر فاتورة ميتة
+    //    ⚠️ fallback: إن كان الجدول فارغاً (لم تُبنَ المصفوفة بعد) → ALL_WORLD_COUNTRIES (السلوك القديم)
+    let allowedCountries = ALL_WORLD_COUNTRIES;
+    try {
+      const { rows: supported } = await pool.query(
+        'SELECT country_code FROM shipping_matrix WHERE is_supported = true'
+      );
+      if (supported.length > 0) {
+        allowedCountries = supported.map(r => r.country_code);
+      }
+    } catch (smErr) {
+      console.warn('⚠️ [Checkout] shipping_matrix unavailable — falling back to ALL_WORLD_COUNTRIES:', smErr.message);
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -1747,7 +1768,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
         };
       }),
       mode: 'payment',
-      shipping_address_collection: { allowed_countries: ALL_WORLD_COUNTRIES },
+      shipping_address_collection: { allowed_countries: allowedCountries },   // 🩹 FIX-SM
       phone_number_collection: { enabled: true },
       discounts: stripeDiscounts,
       shipping_options: [
@@ -1757,7 +1778,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
       metadata: {
         orderId: orderId.toString(),
         couponCode: couponApplied ? String(couponCode).toUpperCase() : '',
-        utmSource: utmSource, // توثيق مصدر الإعلان في Stripe
+        utmSource: utmSource,
         utmCampaign: utmCampaign || ''
       },
       success_url: `${baseUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
@@ -1766,13 +1787,14 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
 
     await pool.query("UPDATE orders SET stripe_session_id = $1 WHERE id = $2", [session.id, orderId]);
     res.json({ url: session.url });
-    } catch (err) {
-    // 🧹 إلا فشل Stripe session، الـ pending عمرو ما يتخلص
+  } catch (err) {
+    // 🧹 فشل Stripe session → pending يُلغى ذرياً (لا يتيم في الـ Reconcile)
     if (orderId) {
       await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status = 'pending'", [orderId]).catch(() => {});
     }
     logger.logError('Create Checkout Session', err);
-    res.status(500).json({ error: err.message });
+    // 🩹 FIX-ERR — كان err.message (يسرب تفاصيل Stripe: session limits, card errors API...)
+    res.status(500).json({ error: 'Failed to create checkout session. Please try again.' });
   }
 });
 
