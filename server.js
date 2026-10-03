@@ -2288,7 +2288,7 @@ app.get('/api/exchange/:orderId/options', async (req, res) => {
     }
     if (status === 'manual') {
       // 🆕 manual = معالجة جارية (استرداد يدوي أو triage) — لا نؤكد استرداداً لم يحدث
-      return res.json({ status: 'processing' });
+      return res.json({ status: 'processing', detail: 'manual' });
     }
     if (status === 'paid' && (exchangeInFlight.has(orderId) || !cj_order_number)) {
       // 🆕 paid بلا رقم CJ = الـ fulfillment مازال جاري — ما نقولوش "exchanged" قبل ما CJ يقبل
