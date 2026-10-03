@@ -2528,27 +2528,35 @@ cron.schedule('30 2 * * *', async () => {
 });
 
 // 2. إضافة تقييمات جديدة لـ 5 منتجات يومياً (الساعة 4 صباحاً)
-cron.schedule('0 4 * * *', async () => {
-  const authors = ["Emma", "Liam", "Olivia", "Noah", "Ava", "Ethan", "Sophia", "Mason"];
-  const contents = ["Highly recommend!", "Exactly as described.", "Great quality.", "Fast shipping, very happy."];
-
-  try {
-    const { rows } = await pool.query("SELECT id FROM products WHERE stock_status = true ORDER BY random() LIMIT 5");
-    for (const p of rows) {
-      const author = authors[Math.floor(Math.random() * authors.length)];
-      const content = contents[Math.floor(Math.random() * contents.length)];
-      const rating = Math.random() > 0.2 ? 5 : 4;
-
-      await pool.query(
-        'INSERT INTO reviews (product_id, author, rating, content, country) VALUES ($1, $2, $3, $4, $5)',
-        [p.id, author, rating, content, 'United States']
-      );
-    }
-    console.log('✅ [Auto-Cron] Added 5 new reviews successfully!');
-  } catch (err) {
-    console.error('❌ [Auto-Cron] Error seeding reviews:', err.message);
-  }
-});
+// 🛑 DISABLED (2026-10-03) — fake-reviews strategy retired before first ad campaign:
+//   • Meta/Google ToS risk — seeded reviews = misleading claims once ads drive traffic
+//   • customer trust: identical names/phrases detected in seconds — worse than none
+//   • the 237K legacy reviews stay UNTIL first campaign, then:
+//     cleanup via cleanup_fake_reviews.js (user_id IS NULL = seeded/admin, real = kept)
+//   • replacement strategy (Backlog): Verified-Purchase Review Invitation —
+//     7 days after DELIVERED webhook → email the buyer → real reviews only
+// Re-enable ONLY if the strategy ever changes back (not recommended).
+// cron.schedule('0 4 * * *', async () => {
+//   const authors = ["Emma", "Liam", "Olivia", "Noah", "Ava", "Ethan", "Sophia", "Mason"];
+//   const contents = ["Highly recommend!", "Exactly as described.", "Great quality.", "Fast shipping, very happy."];
+//
+//   try {
+//     const { rows } = await pool.query("SELECT id FROM products WHERE stock_status = true ORDER BY random() LIMIT 5");
+//     for (const p of rows) {
+//       const author = authors[Math.floor(Math.random() * authors.length)];
+//       const content = contents[Math.floor(Math.random() * contents.length)];
+//       const rating = Math.random() > 0.2 ? 5 : 4;
+//
+//       await pool.query(
+//         'INSERT INTO reviews (product_id, author, rating, content, country) VALUES ($1, $2, $3, $4, $5)',
+//         [p.id, author, rating, content, 'United States']
+//       );
+//     }
+//     console.log('✅ [Auto-Cron] Added 5 new reviews successfully!');
+//   } catch (err) {
+//     console.error('❌ [Auto-Cron] Error seeding reviews:', err.message);
+//   }
+// });
 
 // 3. دمج الطلبات على CJ تلقائياً (كل ساعة)
 cron.schedule('0 * * * *', async () => {
