@@ -11,6 +11,7 @@
  */
 const crypto = require('crypto');
 const https = require('https');
+const pool = require('../db');   // 🩹 db.js ورقة مستقلة — لا دائرية
 
 // ─── Config (server-side فقط — ممنوع NEXT_PUBLIC_) ───
 const META_PIXEL_ID  = process.env.META_CAPI_PIXEL_ID  || '';
@@ -284,6 +285,19 @@ async function secondShotConversion(orderId) {
     console.warn(`🎯 [CAPI] second-shot purch_${orderId} non-fatal: ${e.message}`);
     await auditEvent('CAPI_SECOND_SHOT_FAIL', orderId, { error: e.message }, 'warning');
     return { ok: false, error: e.message };
+  }
+}
+// 🩹 FIX — auditEvent محلي (كان مستعملاً بلا تعريف → second-shot ميت 100% منذ Mission #13)
+// local copy لتجنب circular require مع cjService (cjService يستورد conversionService)
+// TODO (backlog): lib/audit الموحد — يُلغي كل النسخ المحلية
+async function auditEvent(eventType, orderId, details = {}, severity = 'info') {
+  try {
+    await pool.query(
+      `INSERT INTO system_events (event_type, order_id, details, severity) VALUES ($1, $2, $3, $4)`,
+      [eventType, orderId || null, JSON.stringify(details), severity]
+    );
+  } catch (e) {
+    console.warn(`⚠️ [CAPI Audit] ${eventType}#${orderId}: ${e.message}`);
   }
 }
 module.exports = { sendPurchaseConversion, setConversionContext ,secondShotConversion};
