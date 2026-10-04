@@ -1700,6 +1700,19 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
     let baseUrl = origin && origin.startsWith('http') ? origin : (process.env.FRONTEND_URL || 'https://laclarc.com');
     baseUrl = baseUrl.replace(/\/+$/, '');
 
+    // ═══ 🌍 M#25 Live Bridge — المنتجات الحية من CJ تُستورد آلياً قبل الـ checkout ═══
+    for (const item of clientItems || []) {
+      if (item.live_pid) {
+        try {
+          const imported = await ensureProductImported(item.live_pid);
+          item.id = imported.id;
+          item.live_pid = undefined;
+          console.log(`🌍 [LiveBridge] checkout: CJ pid → local #${imported.id}`);
+        } catch (e) {
+          return res.status(400).json({ error: `Product ${item.live_pid} is no longer available from supplier.` });
+        }
+      }
+    }
     // حساب الأسعار والـ vid حصراً من قاعدة البيانات (Tenet #1)
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
     const optionalUser = getOptionalUser(req);
