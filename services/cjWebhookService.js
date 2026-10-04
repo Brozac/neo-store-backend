@@ -309,6 +309,14 @@ async function handleOrderUpdate(params = {}) {
     return;
   }
 
+
+    // 🌟 M#27 — Track delivered_at for Review Invitation (first delivery only)
+    if (mapped === 'completed' && !order.review_submitted_at) {
+      await pool.query(
+        "UPDATE orders SET delivered_at = NOW() WHERE id = $1 AND delivered_at IS NULL",
+        [order.id]
+      ).catch(() => {});
+    }
   // ✅ completed وغيره
   await pool.query(
     `UPDATE orders

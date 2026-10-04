@@ -3485,7 +3485,165 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
     res.json({ reply: FALLBACK_REPLIES[lang].error });
   }
 });
+// ==========================================
+// 🌟 M#27 — Verified-Purchase Review Invitation (يومياً 10:00 صباحاً)
+// الزبون استلم طلبه (completed) — 5-10 أيام → دعوة مراجعة بالكوبون
+// Anti-spam: review_invited_at IS NULL → دعوة واحدة للأبد
+// ==========================================
+cron.schedule('0 10 * * *', async () => {
+  console.log('🌟 [ReviewInvite] Checking for delivered orders...');
+  try {
+    const { rows: toInvite } = await pool.query(`
+      SELECT id, customer_name, customer_email, review_token
+      FROM orders
+      WHERE status = 'completed'
+        AND delivered_at BETWEEN NOW() - INTERVAL '10 days' AND NOW() - INTERVAL '5 days'
+        AND customer_email IS NOT NULL
+        AND customer_email NOT LIKE '%@laclarc.com'
+        AND review_invited_at IS NULL
+      LIMIT 20;
+    `);
+    if (toInvite.length === 0) { console.log('🌟 [ReviewInvite] nothing to invite.'); return; }
 
+    for (const order of toInvite) {
+      const reviewUrl = `${process.env.FRONTEND_URL || 'https://laclarc.com'}/review/${order.id}?t=${order.review_token}`;
+
+      const itemsRes = await pool.query(`
+        SELECT p.title, p.image_url FROM order_items oi
+        JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1
+      `, [order.id]);
+      const product = itemsRes.rows[0];
+
+      await sendEmail({
+        to: order.customer_email,
+        subject: `⭐ How was your ${product?.title || 'order'}? Get 5% off!`,
+        html: `
+          <div style="font-family:Arial;max-width:550px;margin:auto;background:#F9F8FC;padding:25px;border-radius:16px;border:1px solid #E5E7EB;">
+            <div style="text-align:center;margin-bottom:20px;">
+              <h1 style="color:#1D1E3C;margin:0;font-size:24px;">Laclarc</h1>
+              <p style="color:#8B78C6;font-weight:bold;font-size:12px;margin:4px 0 0;">Your opinion matters 💜</p>
+            </div>
+            <p style="color:#4B5563;font-size:14px;line-height:1.6;">
+              Hello <strong>${order.customer_name || 'there'}</strong>,<br>
+              Your order <strong>#${order.id}</strong> has been delivered! 🎉<br><br>
+              We'd love to hear about your experience. Your honest review helps other shoppers and helps us improve.
+            </p>
+            ${product?.image_url ? `<div style="text-align:center;margin:20px 0;"><img src="${product.image_url}" style="max-width:200px;border-radius:12px;border:1px solid #E5E7EB;" /></div>` : ''}
+            <div style="background:#FFF;border:2px dashed #8B78C6;padding:15px;border-radius:12px;text-align:center;margin-bottom:25px;">
+              <p style="margin:0 0 5px;color:#1D1E3C;font-size:12px;font-weight:bold;">WRITE A REVIEW & GET:</p>
+              <span style="display:inline-block;background:#8B78C6;color:#fff;padding:6px 16px;border-radius:6px;font-weight:bold;font-size:15px;letter-spacing:1px;">5% OFF NEXT ORDER</span>
+            </div>
+            <div style="text-align:center;">
+              <a href="${reviewUrl}" style="display:inline-block;background:#8B78C6;color:#fff;padding:14px 32px;border-radius:30px;font-weight:bold;text-decoration:none;font-size:14px;">
+                Write My Review ⭐
+              </a>
+            </div>
+            <p style="text-align:center;color:#9CA3AF;font-size:11px;margin-top:25px;">
+              This link is unique to your order and expires after use.
+            </p>
+          </div>
+        `
+      });
+
+      await pool.query('UPDATE orders SET review_invited_at = NOW() WHERE id = $1', [order.id]);
+      console.log(`🌟 [ReviewInvite] Invitation sent for #${order.id} → ${order.customer_email}`);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  } catch (err) {
+    console.error('❌ [ReviewInvite] Error:', err.message);
+  }
+});
+
+// ==========================================
+// 🌟 M#27 — Verified-Review Endpoints (token-gated)
+// ==========================================
+
+// GET — verify token + load order details (public)
+app.get('/api/review/verify/:orderId', async (req, res) => {
+  const orderId = parseInt(req.params.orderId, 10);
+  const token = String(req.query.t || '');
+  if (!Number.isInteger(orderId) || orderId <= 0 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token)) {
+    return res.status(400).json({ error: 'Invalid link' });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, customer_name, status, review_submitted_at FROM orders
+       WHERE id = $1 AND review_token = $2`,
+      [orderId, token]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Link invalid' });
+    if (rows[0].review_submitted_at) return res.status(409).json({ error: 'Review already submitted' });
+    if (rows[0].status !== 'completed') return res.status(400).json({ error: 'Order not delivered yet' });
+
+    const itemsRes = await pool.query(
+      `SELECT oi.product_id, oi.quantity, oi.price_at_purchase, p.title, p.image_url
+       FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id
+       WHERE oi.order_id = $1`,
+      [orderId]
+    );
+
+    res.json({ orderId, customerName: rows[0].customer_name, items: itemsRes.rows });
+  } catch (e) {
+    logger.logError('Review Verify', e);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// POST — submit verified review (token-gated, one-time)
+app.post('/api/review/invite/:orderId', async (req, res) => {
+  const orderId = parseInt(req.params.orderId, 10);
+  const token = String(req.body?.token || '');
+  const rating = parseInt(req.body?.rating, 10);
+  const content = String(req.body?.content || '').trim();
+  const images = Array.isArray(req.body?.images) ? req.body.images : [];
+
+  if (!Number.isInteger(orderId) || orderId <= 0 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token)) {
+    return res.status(400).json({ success: false, error: 'Invalid link' });
+  }
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return res.status(400).json({ success: false, error: 'Rating must be 1-5' });
+  }
+  if (content.length < 10) {
+    return res.status(400).json({ success: false, error: 'Review must be at least 10 characters.' });
+  }
+
+  try {
+    // Verify token + status + not already submitted
+    const { rows } = await pool.query(
+      `SELECT id, customer_name, user_id FROM orders
+       WHERE id = $1 AND review_token = $2 AND status = 'completed' AND review_submitted_at IS NULL`,
+      [orderId, token]
+    );
+    if (!rows.length) return res.status(404).json({ success: false, error: 'Link already used or invalid' });
+
+    // Get first product_id from order
+    const itemsRes = await pool.query(
+      'SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1',
+      [orderId]
+    );
+    const productId = itemsRes.rows[0]?.product_id;
+    if (!productId) return res.status(400).json({ success: false, error: 'No product in order' });
+
+    // 🩹 Images — Cloudinary only
+    const safeImages = images.filter((u) => typeof u === 'string' && u.startsWith('https://res.cloudinary.com/'));
+    // 💾 Insert — user_id من الـ order owner → تصير "حقيقية" بالفلتر تاعنا!
+    await pool.query(
+      `INSERT INTO reviews (product_id, author, user_id, rating, content, country, images)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [productId, rows[0].customer_name || 'Verified Buyer', rows[0].user_id, rating, content, 'Verified Purchase', safeImages]
+    );
+
+    // Mark token consumed (one-time use)
+    await pool.query('UPDATE orders SET review_submitted_at = NOW() WHERE id = $1', [orderId]);
+    await auditEvent('VERIFIED_REVIEW_SUBMITTED', orderId, { productId, rating }, 'info');
+
+    res.json({ success: true, message: 'Review published! Use NEXT5 for 5% off your next order.' });
+  } catch (e) {
+    logger.logError('Review Submit', e);
+    res.status(500).json({ success: false, error: 'Internal error' });
+  }
+});
 // ==========================================
 // 404 ومعالجة الأخطاء العامة
 // ==========================================
