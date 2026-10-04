@@ -681,6 +681,56 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
       return 'halt';
     };
 
+    // ═══ 🩹 M#32 — CreateOrderV2 أولاً (payType=2 balance payment) ═══
+    //    V2 + payType=2 → دفع مباشر من المحفظة → ربط شحن فوري → لا logisticsMiss
+    //    V3 يبقى fallback للـ multi-warehouse (Auto-Split) أو لو V2 فشل
+    if (!orderNumberOverride || orderNumberOverride === baseNumber) {
+      try {
+        await new Promise(r => setTimeout(r, 1200)); // Tenet #6
+        const v2Response = await cjRequest((token, config) =>
+          axios.post(`${CJ_API}/shopping/order/createOrderV2`,
+            {
+              orderNumber: orderNumberSeed,
+              shippingZip: addr.postal_code || '10001',
+              shippingCountry: addr.country || 'United States',
+              shippingCountryCode: addr.country || 'US',
+              shippingProvince: addr.state || addr.city || 'State',
+              shippingCity: addr.city || 'City',
+              shippingPhone: customerDetails?.phone || '1234567890',
+              shippingCustomerName: safeCustomerName,
+              shippingAddress: safeLine1,
+              shippingAddress2: addr.line2 || '',
+              email: safeEmail,
+              payType: 2,                    // ⬅️ balance payment — ربط فوري
+              logisticName: logisticsToTry[0] || 'CJPacket Ordinary',
+              fromCountryCode: 'CN',
+              platform: 'others',
+              shopLogisticsType: 3,
+              orderFlow: 1,
+              isSandbox: isSandbox,
+              products: cjProducts.map(p => ({ vid: p.vid, quantity: p.quantity })),
+            },
+            { ...config, headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+          )
+        );
+
+        if (v2Response.data?.code === 200) {
+          console.log(`🚀 [V2] Order #${orderId} created + paid from balance — no logisticsMiss path!`);
+          orderSuccess = true;
+          cjCreated = true;
+          successfulCJOrderNumber = extractCjNumber(v2Response.data?.data) || orderNumberSeed;
+          await saveCjNumber(successfulCJOrderNumber);
+        } else {
+          console.warn(`⚠️ [V2] #${orderId} code=${v2Response.data?.code} — falling back to V3`);
+          lastError = v2Response.data;
+        }
+      } catch (v2Err) {
+        console.warn(`⚠️ [V2] failed: ${v2Err.message} — falling back to V3`);
+        lastError = v2Err.message;
+      }
+    }
+
+    // ═══ V3 gauntlet (fallback) — يُنفذ فقط إذا V2 فشل ═══
     // 1. محاولة الإرسال المجمّع
     for (let li = 0; li < logisticsToTry.length; li++) {
       const logisticName = logisticsToTry[li];
@@ -752,9 +802,11 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
             );
             break;
           }
+          
           await saveCjNumber(successfulCJOrderNumber);
           break; // ✅ نجاح عادي
         }
+        
 
         lastError = cjResponse.data;
 
@@ -818,6 +870,7 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
         console.warn(`🚫 [Shipping-Block] product #${prodId} blocked (order #${orderId}) — M#28`);
       }
     }
+    
 
     // 2. Auto-Split (V3)
     if (!orderSuccess && needsSplitting) {
