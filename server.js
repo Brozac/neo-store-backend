@@ -2976,6 +2976,162 @@ cron.schedule('15 * * * *', async () => {
 // ==========================================
 // 9. كرون التتبع v2 — fallback ديال الويب هوك (كل نصف ساعة)
 // ==========================================
+
+// ==========================================
+// 🌍 M#26 — Auto-Import Top-Sellers (يومياً 5 صباحاً)
+// الكتالوج ينمو آلياً بمنتجات CJ مجرّبة عالمياً — فلترة ثلاثية
+// ==========================================
+cron.schedule('0 5 * * *', async () => {
+  console.log('🌍 [TopSellers] Auto-import starting...');
+  const startedAt = Date.now();
+  let imported = 0, skipped = 0, rejected = 0, errors = 0;
+
+  const CATEGORIES = [
+    '', 'kitchen gadget', 'phone accessories', 'pet supplies',
+    'home decor', 'fitness', 'beauty tool',
+    'car accessories', 'toys', 'led light',
+  ];
+  const DAILY_LIMIT = 100;
+  const MIN_CJ_ORDERS = 50;
+  let importedThisRun = 0;
+
+  try {
+    let supportedCountries = [];
+    try {
+      const { rows } = await pool.query('SELECT country_code FROM shipping_matrix WHERE is_supported = true');
+      supportedCountries = rows.map(r => r.country_code);
+    } catch (e) {
+      console.warn('⚠️ [TopSellers] shipping_matrix unavailable — skipping shipping filter');
+    }
+
+    outer:
+    for (const keyword of CATEGORIES) {
+      if (importedThisRun >= DAILY_LIMIT) break outer;
+
+      for (let pageNum = 1; pageNum <= 3; pageNum++) {
+        if (importedThisRun >= DAILY_LIMIT) break outer;
+
+        let cjProducts;
+        try {
+          const listRes = await cjRequest((token, config) =>
+            axios.get(`${CJ_API}/product/list`, {
+              ...config,
+              headers: { 'CJ-Access-Token': token },
+              params: {
+                pageNum, pageSize: 20,
+                ...(keyword ? { productNameEn: keyword } : { searchType: 2 }),
+              }
+            })
+          );
+          cjProducts = listRes.data?.data?.list || [];
+        } catch (listErr) {
+          console.warn(`⚠️ [TopSellers] list "${keyword}" p${pageNum} failed: ${listErr.message}`);
+          continue;
+        }
+
+        if (cjProducts.length === 0) break;
+
+        for (const cjItem of cjProducts) {
+          if (importedThisRun >= DAILY_LIMIT) break outer;
+          const pid = cjItem.pid ? String(cjItem.pid) : null;
+          if (!pid) continue;
+
+          const exists = await pool.query('SELECT id FROM products WHERE cj_product_id = $1', [pid]);
+          if (exists.rows.length > 0) { skipped++; continue; }
+
+          await new Promise(r => setTimeout(r, 1200));
+
+          try {
+            const detailRes = await cjRequest((token, config) =>
+              axios.get(`${CJ_API}/product/query`, {
+                ...config,
+                headers: { 'CJ-Access-Token': token },
+                params: { pid, features: 'enable_video' }
+              })
+            );
+
+            const details = detailRes.data?.data;
+            if (!details) { rejected++; continue; }
+
+            const strippedDesc = (details.description || '').replace(/<[^>]*>/g, '').trim() || '';
+            const ordersCount = Number(details.ordersCount) || 0;
+            const rating = Number(details.rating) || 0;
+
+            if (!details.productNameEn?.trim() ||
+                !details.bigImage?.startsWith('http') ||
+                details.productImageSet?.length < 2 ||
+                strippedDesc.length < 20 ||
+                parseNumeric(details.sellPrice) < 1 ||
+                details.variants?.length < 1 ||
+                details.isGlobalShipping === false) {
+              rejected++; continue;
+            }
+
+            if (ordersCount < MIN_CJ_ORDERS && rating < 4.0) {
+              rejected++; continue;
+            }
+
+            if (supportedCountries.length > 0 && !supportedCountries.includes('US')) {
+              rejected++; continue;
+            }
+
+            const lowerTitle = (details.productNameEn || '').toLowerCase();
+            if (phoneAccRegex.test(lowerTitle) || pcBlacklistRegex.test(lowerTitle)) {
+              rejected++; continue;
+            }
+
+            const cjPrice = parseNumeric(details.sellPrice);
+            let sellingPrice = cjPrice <= 5 ? cjPrice * 3.5 : cjPrice <= 15 ? cjPrice * 2.8 : cjPrice <= 30 ? cjPrice * 2.2 : cjPrice * 1.8;
+            sellingPrice = Math.max(9.99, Math.floor(sellingPrice) - 0.01);
+            const safePrice = parseFloat(sellingPrice.toFixed(2));
+            const safeOriginalPrice = parseFloat((safePrice * 1.5).toFixed(2));
+            const parsedData = parseVariants(details.variants || []);
+            const categorySlug = getCategorySlug(`${details.categoryName} ${details.productNameEn}`);
+
+            let videoUrl = '';
+            try {
+              const videoRes = await cjRequest((token) =>
+                axios.post(`${CJ_API}/product/queryVideosByProductId`, { productId: pid },
+                  { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
+              if (videoRes.data.code === 200 && videoRes.data.data?.length > 0)
+                videoUrl = videoRes.data.data[0].videoUrl;
+            } catch (e) { console.warn(`⚠️ [TopSellers] video query failed for ${pid}: ${e.message}`); }
+
+            await pool.query(`
+              INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id, is_sourced)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11, $12, $13, $14, false)
+              ON CONFLICT (cj_product_id) DO NOTHING
+            `, [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage,
+                details.productImageSet, JSON.stringify(details.variants || []),
+                parsedData.colors, parsedData.sizes, details.pid, details.description,
+                'Premium Quality', categorySlug, videoUrl, details.categoryId]);
+
+            imported++;
+            importedThisRun++;
+            console.log(`🌍 [TopSellers] ✅ imported #${importedThisRun}: ${String(details.productNameEn).slice(0, 50)} (${keyword || 'trending'}, CJ orders: ${ordersCount})`);
+
+          } catch (productErr) {
+            errors++;
+            console.warn(`⚠️ [TopSellers] product ${pid} failed: ${productErr.message}`);
+          }
+        }
+      }
+    }
+
+    clearProductsCache();
+    const tookSec = Math.round((Date.now() - startedAt) / 1000);
+    console.log(`🌍 [TopSellers] done in ${tookSec}s — imported=${imported} skipped=${skipped} rejected=${rejected} errors=${errors}`);
+
+    await auditEvent('TOPSELLERS_IMPORT', null, {
+      imported, skipped, rejected, errors,
+      categories: CATEGORIES.length, dailyLimit: DAILY_LIMIT,
+      durationSec: tookSec,
+    }, 'info');
+
+  } catch (err) {
+    logger.logError('TopSellers Cron Fatal', err);
+  }
+});
 cron.schedule('30 * * * *', async () => {
   console.log('⏳ [CJ Logistics v3] Batch tracking (1 call / up to 50 orders)...');
   try {
