@@ -56,7 +56,7 @@ async function prepareSecureItems(pool, clientItems) {
   const productRes = await pool.query(
     `SELECT id, title, price, image_url, variants 
      FROM products 
-     WHERE id = ANY($1::int[]) AND stock_status = true`,
+     WHERE id = ANY($1::int[]) AND COALESCE(shipping_blocked, false) = false AND stock_status = true`,
     [productIds]
   );
 

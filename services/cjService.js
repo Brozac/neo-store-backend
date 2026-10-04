@@ -601,6 +601,7 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
     let orderNumberSeed = numberFor(baseNumber, numberBump);
     let bumpsThisCall = 0;
     let halted = null; // { reason, ... } — توقف لا تحله إعادة المحاولة → manual + alert (ماشي S1/S2/refund)
+    let logisticsMissCount = 0;   // 🩹 M#28 — عدّاد الشحن المرفوض (شحن مرفوض ×3 = منتج محظور)
 
     let safeLine1 = (addr.line1 || 'Main Street 1').trim();
     if (!/\d/.test(safeLine1)) safeLine1 += ' 1';
@@ -711,6 +712,7 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
 
           if (cjResponse.data?.data?.logisticsMiss === true) {
             console.warn(`[CJ] #${orderId} logisticsMiss=true (${logisticName}) — repair attempt...`);
+              logisticsMissCount++;   // 🩹 M#28 — عدّاد المرفوض
             const rep = await autoRepairLogistics(successfulCJOrderNumber);
             if (rep.repaired) {
               console.log(`[CJ] #${orderId} logistics bound: ${rep.logisticsName} ($${rep.postage})`);
@@ -792,6 +794,20 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
           break; // success | halt
         }
         lastError = err.response?.data || err.message;
+      }
+    }
+        // 🩹 M#28 — Shipping-Blocked flag: إذا ≥3 ناقلين رفضوا الربط
+    //    المنتج مسموم شحنياً — احظره من الشراء المستقبلي (يُمنع في prepareSecureItems)
+    if (logisticsMissCount >= 3) {
+      const prodRes = await pool.query(`
+        SELECT p.id FROM products p
+        JOIN order_items oi ON oi.product_id = p.id
+        WHERE oi.order_id = $1 LIMIT 1`, [orderId]);
+      const prodId = prodRes.rows[0]?.id;
+      if (prodId) {
+        await pool.query('UPDATE products SET shipping_blocked = true WHERE id = $1', [prodId]);
+        await auditEvent('SHIPPING_BLOCKED_FLAG', prodId, { orderId, reason: 'logisticsMiss_x3', bumps: bumpsThisCall }, 'warning');
+        console.warn(`🚫 [Shipping-Block] product #${prodId} blocked (order #${orderId}) — M#28`);
       }
     }
 
@@ -1232,6 +1248,7 @@ async function zeroTouchRecovery(orderId, { country, vids, totalAmount, customer
           AND p.price BETWEEN
             (SELECT price * 0.7 FROM order_items WHERE order_id = $1 LIMIT 1) AND
             (SELECT price * 1.3 FROM order_items WHERE order_id = $1 LIMIT 1)
+  AND COALESCE(p.shipping_blocked, false) = false
           AND p.category = (SELECT category FROM products WHERE id = (SELECT product_id FROM order_items WHERE order_id = $1 LIMIT 1))
         ORDER BY p.created_at DESC
         LIMIT 3
