@@ -710,6 +710,14 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
 
           successfulCJOrderNumber = extractCjNumber(cjResponse.data?.data) || targetOrderNumber;
 
+            // 🩹 M#31 — interceptOrderReasons: السبب الرسمي من CJ لرفض الربط
+            //    كان logisticsMiss=true لغزاً مظلماً — الآن CJ يشرح نفسه في الحقل المخصص
+            const intercepts = cjResponse.data?.data?.interceptOrderReasons || [];
+            if (intercepts.length > 0) {
+              console.warn(`🛑 [CJ] #${orderId} interceptOrderReasons:`);
+              intercepts.forEach(i => console.warn(`   → code=${i.code}: ${i.message}`));
+              await auditEvent('CJ_INTERCEPT_REASON', orderId, { intercepts, carrier: logisticName }, 'critical');
+            }
           if (cjResponse.data?.data?.logisticsMiss === true) {
             console.warn(`[CJ] #${orderId} logisticsMiss=true (${logisticName}) — repair attempt...`);
               logisticsMissCount++;   // 🩹 M#28 — عدّاد المرفوض
