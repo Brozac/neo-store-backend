@@ -219,7 +219,7 @@ async function haltOrderManual(orderId, info, lastErr) {
      <pre style="background:#f5f5f5;padding:10px;border-radius:6px">${JSON.stringify(info, null, 2)}</pre>
      <p><b>آخر رد من CJ:</b> <code>${errStr.slice(0, 400).replace(/</g, '&lt;')}</code></p>
      <p>الحالة → manual. افحص الطلب في CJ Dashboard (هل موجود فعلاً؟) ثم قرّر: إعادة إرسال يدوية أو refund.</p>`
-  ).catch(() => {});
+  ).catch(e => console.warn(`📧 [CJ] halt admin-alert FAILED #${orderId}: ${e.message}`));
 }
 
 function extractCjNumber(dataObj) {
@@ -781,7 +781,7 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
               await saveCjNumber(successfulCJOrderNumber);
               console.log(`✅ [CJ] #${orderId} تسجل بـ orderFlow=0 — عمّر المحفظة باش يمشي للشحن`);
             }
-          } catch (e) { /* للفشل العادي تحت */ }
+          } catch (e) { console.warn(`⚠️ [CJ] #${orderId} orderFlow:0 retry failed: ${e.message} — falling through`); }
           break;
         }
 
@@ -996,10 +996,10 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
           }
         } catch (ztErr) {
           console.warn(`🤖 [ZeroTouch] fatal-path failed: ${ztErr.message}`);
-          await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]).catch(() => {});
+          await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]).catch(e => console.warn(`⚠️ [CJ] #${orderId} manual update failed: ${e.message}`));
         }
       } else {
-        await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]).catch(() => {});
+        await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]).catch(e => console.warn(`⚠️ [CJ] #${orderId} manual update failed: ${e.message}`));
       }
     }
     return { success: false, error: err.message };
@@ -1138,7 +1138,7 @@ async function executeS3(orderId, { totalAmount, customerEmail }) {
       customerEmail,
       `طلبك #${orderId} — استردادك قيد التنفيذ`,
       `<div style="direction:rtl;text-align:right;font-family:Arial,sans-serif"><p>انتهت مهلة اختيار البديل. استردادك ($${totalAmount}) قيد المعالجة — سنتواصل معك لتأكيد تفاصيل التحويل.</p></div>`
-    ).catch(() => {});
+    ).catch(e => console.warn(`📧 [CJ] S3 gateway email FAILED #${orderId}: ${e.message}`));
   }
   return { recovered: false, strategy: 'S3_manual_gateway' };
 }
