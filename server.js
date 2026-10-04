@@ -271,6 +271,25 @@ app.use(require('./routes/paymentGateways'));
 // راوتر الدفع
 const paymentRoutes = require('./controllers/paymentController');
 app.use('/api/payment', paymentRoutes);
+// ==========================================
+// 🩹 M#29 — Status Labels (human-readable, unified)
+// ==========================================
+function getStatusLabel(status) {
+  const MAP = {
+    'pending':           '⏳ Awaiting Payment',
+    'paid':              '✅ Payment Confirmed',
+    'awaiting_exchange': '📦 Alternative Offered — Check Email',
+    'processing':        '⏳ Processing',
+    'manual':            '⏳ Under Review',
+    'fulfilled':         '🚚 Shipped',
+    'completed':         '✅ Delivered',
+    'refunded':          '💰 Refunded',
+    'cancelled':         '❌ Cancelled',
+    'expired':           '⏱ Expired',
+    'archived':          '📦 Archived',
+  };
+  return MAP[String(status || '').toLowerCase()] || String(status || '');
+}
 
 // دوال التحقق من هوية الزبائن
 const authenticateToken = (req, res, next) => {
@@ -1980,7 +1999,8 @@ app.get('/api/orders/my-orders', authenticateToken, async (req, res) => {
       `SELECT * FROM orders WHERE user_id = $1 OR (customer_email = $2 AND status != 'pending') ORDER BY id DESC`,
       [req.user.id, userEmail]
     );
-    res.json(result.rows);
+    const withLabels = result.rows.map(order => ({ ...order, status_label: getStatusLabel(order.status) }));
+    res.json(withLabels);
   } catch (err) {
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
@@ -2021,7 +2041,7 @@ app.get('/api/orders/track/:identifier', trackLimiter, async (req, res) => {
 
     const result = await pool.query(queryStr, params);
     if (result.rows.length === 0) return res.status(404).json({ error: 'No orders found' });
-    res.json(result.rows);
+    res.json(result.rows.map(o => ({ ...o, status_label: getStatusLabel(o.status) })));
   } catch (err) {
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
