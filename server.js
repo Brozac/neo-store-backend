@@ -3649,8 +3649,8 @@ app.post('/api/review/invite/:orderId', async (req, res) => {
     const safeImages = images.filter((u) => typeof u === 'string' && u.startsWith('https://res.cloudinary.com/'));
     // 💾 Insert — user_id من الـ order owner → تصير "حقيقية" بالفلتر تاعنا!
     await pool.query(
-      `INSERT INTO reviews (product_id, author, user_id, rating, content, country, images)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      `INSERT INTO reviews (product_id, author, user_id, rating, content, country, images, verified_purchase)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, true)`,
       [productId, rows[0].customer_name || 'Verified Buyer', rows[0].user_id, rating, content, 'Verified Purchase', safeImages]
     );
 
