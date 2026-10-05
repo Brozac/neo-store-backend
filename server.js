@@ -1448,18 +1448,21 @@ app.put('/api/admin/retry-fulfillment/:id', async (req, res) => {
 
 app.get('/api/admin/failed-orders', async (req, res) => {
   try {
-    // 🩹 FIX-C1 — أعمدة محددة (كان SELECT * يخرج stripe_session_id + exchange_token)
-    //    + 🩹 FIX-C2 — يعرض HALTED flag حتى يفهم الأدمن لماذا الطلب مقفول
+    // 🩹 FIX — أعمدة محددة + customer_phone + payment_method + halt_details
+    //    (كان SELECT * — يخرج stripe_session_id + exchange_token)
+    //    halt_details inline: الأدمن يرى سبب الـ HALT مباشرة بلا لوج
     const result = await pool.query(`
       SELECT
         o.id,
         o.customer_name,
         o.customer_email,
+        o.customer_phone,
         o.total_amount,
         o.status,
         o.created_at,
         o.cj_order_number,
         o.manual_since,
+        o.payment_method,
         (SELECT details FROM system_events se
          WHERE se.order_id = o.id AND se.event_type = 'CJ_ORDER_HALTED'
          ORDER BY created_at DESC LIMIT 1) AS halt_details
