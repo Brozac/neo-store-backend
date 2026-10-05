@@ -197,10 +197,16 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
 
     (async () => {
       try {
+        // 🩹 M#33 FIX: fallback لـ Stripe API الجديد:
         const customerName = session.customer_details?.name || 'Guest Customer';
         const customerEmail = normalizeEmail(session.customer_details?.email);   // 🩹 FIX#8
-        const customerPhone = session.customer_details?.phone || '';
-        const addr = session.customer_details?.address;
+        const customerPhone = session.customer_details?.phone
+                           || session.collected_information?.shipping_details?.phone
+                           || session.collected_information?.phone_number
+                           || '';
+        const addr = session.customer_details?.address
+                  || session.collected_information?.shipping_details?.address
+                  || null;
         const shippingAddress = addr ? JSON.stringify(addr) : JSON.stringify({ line1: 'Online Store Purchase', country: 'US' });
         const totalAmount = session.amount_total / 100;
 
@@ -1870,10 +1876,16 @@ app.post('/api/payment/verify-session', async (req, res) => {
       });
     }
 
+// 🩹 M#33 FIX: fallback لـ Stripe API الجديد (collected_information):
     const customerName = session.customer_details?.name || 'Valued Customer';
     const customerEmail = normalizeEmail(session.customer_details?.email || '');   // 🩹 FIX#8
-    const customerPhone = session.customer_details?.phone || '';
-    const addr = session.customer_details?.address;
+    const customerPhone = session.customer_details?.phone
+                       || session.collected_information?.shipping_details?.phone
+                       || session.collected_information?.phone_number
+                       || '';
+    const addr = session.customer_details?.address
+              || session.collected_information?.shipping_details?.address
+              || null;
     const shippingAddress = addr
       ? JSON.stringify(addr)
       : JSON.stringify({ line1: 'Online Store Purchase', country: 'US' });
