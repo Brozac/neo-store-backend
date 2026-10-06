@@ -211,10 +211,21 @@ const UPSERT_PRODUCT_SQL_V2 = `
 `;
 
 async function upsertProductRow(pool, row) {
-  await pool.query(UPSERT_PRODUCT_SQL, [
+  await pool.query(UPSERT_PRODUCT_SQL_V2, [
     row.title, row.price, row.original_price, row.image_url, row.images, row.variants,
     row.colors, row.sizes, row.patterns, row.stock_status, row.is_sourced, row.cj_product_id,
-    row.description, row.material, row.category, row.video_url, row.cj_category_id
+    row.description, row.material, row.category, row.video_url, row.cj_category_id,
+    // 🩹 v2 — الحقول الجديدة (defaults آمنة لو row قديم بلا الحقول)
+    row.listed_num ?? 0,
+    row.warehouse_inventory ?? 0,
+    row.verified_warehouse ?? false,
+    row.has_video_flag ?? false,
+    row.free_shipping_flag ?? false,
+    row.delivery_cycle ?? null,
+    row.has_ce_cert ?? false,
+    row.product_type_cj ?? 'ORDINARY_PRODUCT',
+    row.product_props ?? ['COMMON'],
+    row.weight_grams ?? null
   ]);
 }
 
@@ -224,5 +235,5 @@ module.exports = {
   fetchProductVideoUrl,
   buildProductRow, 
   upsertProductRow, 
-  UPSERT_PRODUCT_SQL 
+  UPSERT_PRODUCT_SQL: UPSERT_PRODUCT_SQL_V2   // 🩹 v2
 };
