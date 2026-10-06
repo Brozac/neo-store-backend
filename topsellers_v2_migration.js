@@ -12,7 +12,10 @@ const MIGRATIONS = [
   { name: 'products.delivery_cycle',           sql: `ALTER TABLE products ADD COLUMN IF NOT EXISTS delivery_cycle VARCHAR(20);` },
   { name: 'products.has_ce_cert',              sql: `ALTER TABLE products ADD COLUMN IF NOT EXISTS has_ce_cert BOOLEAN DEFAULT false;` },
   { name: 'products.product_type_cj',          sql: `ALTER TABLE products ADD COLUMN IF NOT EXISTS product_type_cj VARCHAR(30);` },
+  // 🩹 FIX — sales_count كان مفقوداً (يستعمله كرون TopSellers في INSERT)
+  { name: 'products.sales_count',              sql: `ALTER TABLE products ADD COLUMN IF NOT EXISTS sales_count INTEGER DEFAULT 0;` },
   { name: 'idx: cj_listed_num DESC',           sql: `CREATE INDEX IF NOT EXISTS idx_products_listed_num ON products (cj_listed_num DESC);` },
+  { name: 'idx: sales_count DESC',             sql: `CREATE INDEX IF NOT EXISTS idx_products_sales_count ON products (sales_count DESC);` },
   { name: 'idx: verified_warehouse',           sql: `CREATE INDEX IF NOT EXISTS idx_products_verified_warehouse ON products (verified_warehouse) WHERE verified_warehouse = true;` },
   { name: 'idx: free_shipping',                sql: `CREATE INDEX IF NOT EXISTS idx_products_free_shipping ON products (free_shipping) WHERE free_shipping = true;` },
 ];

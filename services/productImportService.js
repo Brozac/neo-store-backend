@@ -75,6 +75,7 @@ async function fetchProductVideoUrl(productId) {
 // ==========================================
 // 4. بناء صف المنتج المحصن (Safe Row Builder)
 // ==========================================
+// 🩹 v2 — buildProductRow مع الحقول الجديدة (M#26 v2 + M#34)
 async function buildProductRow(details, options = {}) {
   if (!isProductEligible(details)) return null;
 
@@ -93,15 +94,13 @@ async function buildProductRow(details, options = {}) {
   }
 
   const parsedData = parseVariants(details.variants || []);
-  
-  // ✨ تأمين طول المواد والخامات لمنع تجاوز VARCHAR(255)
+
   let material = 'Premium Quality';
   if (Array.isArray(details.materialNameEnSet) && details.materialNameEnSet.length > 0) {
     const joined = details.materialNameEnSet.filter(m => m && String(m).trim() !== '').join(', ');
     if (joined) material = joined.slice(0, 250);
   }
 
-  // ✨ تأمين وتنظيف مصفوفة الصور لـ PostgreSQL TEXT[]
   let safeImages = [];
   if (Array.isArray(details.productImageSet)) {
     safeImages = details.productImageSet.filter(img => typeof img === 'string' && img.startsWith('http'));
@@ -113,28 +112,28 @@ async function buildProductRow(details, options = {}) {
     safeImages = [details.bigImage];
   }
 
-  // جلب الفيديو عند الحاجة فقط بناءً على وثيقة CJ الرسمية
   let videoUrl = '';
   if (fetchVideo) {
-    // ✨ حقل productVideo يرجع فقط إذا مررنا features=enable_video في الاستعلام
     if (Array.isArray(details.productVideo) && details.productVideo.length > 0) {
-      // نأخذ أول فيديو من القائمة (قد يكون رابطاً أو كائناً يحتوي على الرابط)
       const firstVideo = details.productVideo[0];
-      if (typeof firstVideo === 'string' && firstVideo.startsWith('http')) {
-        videoUrl = firstVideo;
-      } else if (firstVideo && typeof firstVideo === 'object' && firstVideo.videoUrl) {
-        videoUrl = firstVideo.videoUrl;
-      }
+      if (typeof firstVideo === 'string' && firstVideo.startsWith('http')) videoUrl = firstVideo;
+      else if (firstVideo && typeof firstVideo === 'object' && firstVideo.videoUrl) videoUrl = firstVideo.videoUrl;
     }
-    
-    // كخطة بديلة: إذا لم نجد الرابط في productVideo، نبحث في نقطة الفيديوهات المخصصة
-    if (!videoUrl) {
-      videoUrl = await fetchProductVideoUrl(details.pid);
-    }
+    if (!videoUrl) videoUrl = await fetchProductVideoUrl(details.pid);
   }
 
-  // ✨ تأمين طول العنوان لمنع تجاوز VARCHAR(255)
   const safeTitle = (details.productNameEn || 'Premium Product').trim().slice(0, 250);
+
+  // 🩹 v2 — بيانات الشحن والجودة (من Product Details مباشرة)
+  const weightGrams = parseInt(details.productWeight) || parseInt(details.packingWeight) || 0;
+  const productProps = Array.isArray(details.productProEnSet) ? details.productProEnSet : ['COMMON'];
+  const hasVideo = details.isVideo === 1 || Boolean(videoUrl);
+  const freeShipping = details.addMarkStatus === 1;
+  const deliveryCycle = details.deliveryCycle || '';
+  const hasCECert = details.hasCECertification === 1;
+  const productTypeCj = details.productType || 'ORDINARY_PRODUCT';
+  const listedNum = details.listedNum || 0;
+  const warehouseInventory = details.warehouseInventoryNum || 0;
 
   return {
     title: safeTitle,
@@ -153,20 +152,34 @@ async function buildProductRow(details, options = {}) {
     material,
     category: categorySlug || 'other',
     video_url: videoUrl,
-    cj_category_id: cjCategoryId ? String(cjCategoryId) : null
+    cj_category_id: cjCategoryId ? String(cjCategoryId) : null,
+    // 🩹 v2 — الحقول الجديدة
+    listed_num: listedNum,
+    warehouse_inventory: warehouseInventory,
+    verified_warehouse: details.verifiedWarehouse === 1,
+    has_video_flag: hasVideo,
+    free_shipping_flag: freeShipping,
+    delivery_cycle,
+    has_ce_cert: hasCECert,
+    product_type_cj: productTypeCj,
+    product_props: productProps,
+    weight_grams: weightGrams,
   };
 }
 
 // ==========================================
 // 5. استعلام الـ Upsert المحصن
 // ==========================================
-const UPSERT_PRODUCT_SQL = `
+const UPSERT_PRODUCT_SQL_V2 = `
   INSERT INTO products (
-    title, price, original_price, image_url, images, variants, colors, 
-    sizes, patterns, stock_status, is_sourced, cj_product_id, description, 
-    material, category, video_url, cj_category_id
+    title, price, original_price, image_url, images, variants, colors,
+    sizes, patterns, stock_status, is_sourced, cj_product_id, description,
+    material, category, video_url, cj_category_id,
+    cj_listed_num, warehouse_inventory, verified_warehouse,
+    has_video, free_shipping, delivery_cycle, has_ce_cert,
+    product_type_cj, product_props, weight_grams
   )
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
   ON CONFLICT (cj_product_id) DO UPDATE SET
     title = EXCLUDED.title,
     price = EXCLUDED.price,
@@ -183,7 +196,18 @@ const UPSERT_PRODUCT_SQL = `
     material = EXCLUDED.material,
     category = EXCLUDED.category,
     video_url = CASE WHEN EXCLUDED.video_url <> '' THEN EXCLUDED.video_url ELSE products.video_url END,
-    cj_category_id = EXCLUDED.cj_category_id
+    cj_category_id = EXCLUDED.cj_category_id,
+    -- 🩹 v2 — الحقول الجديدة
+    cj_listed_num = EXCLUDED.cj_listed_num,
+    warehouse_inventory = EXCLUDED.warehouse_inventory,
+    verified_warehouse = EXCLUDED.verified_warehouse,
+    has_video = EXCLUDED.has_video,
+    free_shipping = EXCLUDED.free_shipping,
+    delivery_cycle = EXCLUDED.delivery_cycle,
+    has_ce_cert = EXCLUDED.has_ce_cert,
+    product_type_cj = EXCLUDED.product_type_cj,
+    product_props = EXCLUDED.product_props,
+    weight_grams = EXCLUDED.weight_grams
 `;
 
 async function upsertProductRow(pool, row) {
