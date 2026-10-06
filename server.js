@@ -3167,6 +3167,171 @@ cron.schedule('0 5 * * *', async () => {
     logger.logError('TopSellers Cron Fatal', err);
   }
 });
+
+// ==========================================
+// 🌍 M#26 v2 — Top-Sellers Auto-Import (يومياً 5 صباحاً)
+// مبني على Product List V2 — الفلاتر مدمجة في الـ endpoint نفسه
+// لا تخمين حقول — كل شيء من الوثيقة الرسمية
+// ==========================================
+cron.schedule('0 5 * * *', async () => {
+  console.log('🌍 [TopSellers v2] Auto-import starting...');
+  const startedAt = Date.now();
+  let imported = 0, skipped = 0, rejected = 0, errors = 0;
+  let importedThisRun = 0;
+  const DAILY_LIMIT = 100;
+
+  // ─── فلترة ذكية مدمجة في Product List V2 ───
+  // كل config = استراتيجية استيراد مختلفة
+  const SEARCH_CONFIGS = [
+    // 1. Trending Global — الأكثر مبيعاً عالمياً (CJ نفسه يرشحهم)
+    { label: 'trending-global', params: {
+        page: 1, size: 50,
+        productFlag: 0,                  // Trending products
+        verifiedWarehouse: 1,            // مستودع موثق فقط
+        startWarehouseInventory: 100,    // مخزون ≥ 100
+        features: ['enable_category', 'enable_description', 'enable_video'],
+    }},
+    // 2. New Arrivals — منتجات جديدة ناجحة
+    { label: 'new-arrivals', params: {
+        page: 1, size: 30,
+        productFlag: 1,                  // New products
+        verifiedWarehouse: 1,
+        startWarehouseInventory: 50,
+        features: ['enable_category', 'enable_description'],
+    }},
+    // 3. Free Shipping — أعلى تحويل
+    { label: 'free-shipping', params: {
+        page: 1, size: 30,
+        addMarkStatus: 1,               // Free shipping فقط
+        verifiedWarehouse: 1,
+        startWarehouseInventory: 50,
+        features: ['enable_category', 'enable_description'],
+    }},
+    // 4. Video Products — للـ Reels والـ social proof
+    { label: 'video-products', params: {
+        page: 1, size: 20,
+        productType: 10,                 // Video products
+        verifiedWarehouse: 1,
+        features: ['enable_category', 'enable_description', 'enable_video'],
+    }},
+  ];
+
+  try {
+    for (const config of SEARCH_CONFIGS) {
+      if (importedThisRun >= DAILY_LIMIT) break;
+
+      try {
+        const listRes = await cjRequest((token, cfg) =>
+          axios.get(`${CJ_API}/product/listV2`, {
+            ...cfg,
+            headers: { 'CJ-Access-Token': token },
+            params: { ...config.params, page: 1, size: 50 },
+          })
+        );
+
+        if (listRes.data?.code !== 200) {
+          console.warn(`⚠️ [TopSellers v2] ${config.label}: code=${listRes.data?.code}`);
+          continue;
+        }
+
+        // 🩹 البنية الفعلية: content[0].productList (وليس content مباشرة)
+        const content = listRes.data?.data?.content || [];
+        const productList = content[0]?.productList || [];
+
+        console.log(`📊 [TopSellers v2] ${config.label}: ${productList.length} منتج مؤهل`);
+
+        for (const p of productList) {
+          if (importedThisRun >= DAILY_LIMIT) break;
+
+          const pid = p.id;
+          if (!pid) { skipped++; continue; }
+
+          // Dedup — موجود في DB؟
+          const exists = await pool.query('SELECT id FROM products WHERE cj_product_id = $1', [pid]);
+          if (exists.rows.length > 0) { skipped++; continue; }
+
+          await new Promise(r => setTimeout(r, 800)); // pacing أخف — listV2 أسرع
+
+          try {
+            // 💰 التسعير — discountPrice (أفضل سعر CJ) أو sellPrice
+            const cjPrice = parseFloat(p.discountPrice || p.sellPrice) || 0;
+            if (cjPrice < 0.5) { rejected++; continue; }
+
+            let sellingPrice = cjPrice <= 5 ? cjPrice * 3.5
+              : cjPrice <= 15 ? cjPrice * 2.8
+              : cjPrice <= 30 ? cjPrice * 2.2
+              : cjPrice * 1.8;
+            sellingPrice = Math.max(9.99, Math.floor(sellingPrice) - 0.01);
+            const safePrice = parseFloat(sellingPrice.toFixed(2));
+            const safeOriginalPrice = parseFloat((safePrice * 1.5).toFixed(2));
+
+            // 🏷️ Category — من الاستجابة مباشرة (threeCategoryName موجود!)
+            const categorySlug = getCategorySlug(
+              p.threeCategoryName || p.twoCategoryName || p.oneCategoryName || config.label
+            );
+
+            // 💾 Insert — بجميع الحقول الحقيقية من listV2
+            const insert = await pool.query(`
+              INSERT INTO products (
+                title, price, original_price, image_url, images,
+                stock_status, cj_product_id, description, category,
+                is_sourced, sales_count,
+                cj_listed_num, warehouse_inventory, verified_warehouse,
+                has_video, free_shipping, delivery_cycle, has_ce_cert, product_type_cj
+              )
+              VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, true, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+              ON CONFLICT (cj_product_id) DO NOTHING
+              RETURNING id
+            `, [
+              p.nameEn,
+              safePrice, safeOriginalPrice,
+              p.bigImage,
+              [], // images تُستكمل في Product Details fetch
+              pid,
+              p.description || 'High quality product from Laclarc Global Catalog.',
+              categorySlug.toLowerCase().replace(/\s+/g, '-'),
+              true,                             // is_sourced — منتج CJ مؤهل
+              p.listedNum || 0,                 // sales_count = listedNum الحقيقي
+              p.warehouseInventoryNum || 0,     // warehouse_inventory
+              p.verifiedWarehouse === 1,        // verified_warehouse
+              p.isVideo === 1,                  // has_video
+              p.addMarkStatus === 1,            // free_shipping
+              p.deliveryCycle || '7-15',        // delivery_cycle
+              p.hasCECertification === 1,       // has_ce_cert
+              p.productType || 'ORDINARY_PRODUCT', // product_type_cj
+            ]);
+
+            if (insert.rowCount > 0) {
+              imported++;
+              importedThisRun++;
+              console.log(`🌍 [TopSellers v2] ✅ #${importedThisRun}: ${p.nameEn?.slice(0, 50)} (${config.label}, listedNum=${p.listedNum}, inventory=${p.warehouseInventoryNum})`);
+            }
+          } catch (prodErr) {
+            errors++;
+            console.warn(`⚠️ [TopSellers v2] product ${pid} failed: ${prodErr.message}`);
+          }
+        }
+      } catch (configErr) {
+        console.error(`❌ [TopSellers v2] ${config.label} failed: ${configErr.message}`);
+        errors++;
+      }
+    }
+
+    clearProductsCache();
+    const tookSec = Math.round((Date.now() - startedAt) / 1000);
+    console.log(`🌍 [TopSellers v2] done in ${tookSec}s — imported=${imported} skipped=${skipped} rejected=${rejected} errors=${errors}`);
+
+    await auditEvent('TOPSELLERS_V2_IMPORT', null, {
+      imported, skipped, rejected, errors,
+      strategies: SEARCH_CONFIGS.map(c => c.label),
+      durationSec: tookSec,
+    }, 'info');
+
+  } catch (err) {
+    logger.logError('TopSellers v2 Fatal', err);
+  }
+});
+
 cron.schedule('30 * * * *', async () => {
   console.log('⏳ [CJ Logistics v3] Batch tracking (1 call / up to 50 orders)...');
   try {
