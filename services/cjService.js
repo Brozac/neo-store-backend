@@ -572,6 +572,32 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
       await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
       return { success: false, reason: 'NO_CJ_VARIANTS' };
     }
+        // ═══ 🩹 M#34b — Precision Shipping Data (from single Product Details call) ═══
+    //    الموضع: بعد cjProducts extraction · قبل freightCalculate
+    //    من نداء واحد: productProp · shippingWeight(g) · volume(cm³) · warehouses · hsCode
+    let shippingData = null;
+    try {
+      const precisionSvc = require('./cjProductDetailsService');
+
+      // استخراج pid من أول عنصر في الطلب
+      const pidRes = await pool.query(
+        `SELECT p.cj_product_id FROM order_items oi
+         JOIN products p ON p.id = oi.product_id
+         WHERE oi.order_id = $1 LIMIT 1`,
+        [orderId]
+      );
+      const cjPid = pidRes.rows[0]?.cj_product_id;
+
+      if (cjPid) {
+        const shipping = await precisionSvc.getShippingData(cjPid);
+        if (shipping.ok) {
+          shippingData = shipping;
+          console.log(`🔬 [Precision] #${orderId}: weight=${shippingData.shippingWeightG}g · vol=${shippingData.volumeCm3}cm³ · prop=${JSON.stringify(shippingData.productProp)} · warehouses=${JSON.stringify(shippingData.warehouseCountries)}${shippingData.isMultiWarehouse ? ' ⚠️ MULTI-WAREHOUSE' : ''}`);
+        }
+      }
+    } catch (e) {
+      console.warn(`⚠️ [Precision] #${orderId}: ${e.message} — using defaults`);
+    }
 
     // استعلام شركات الشحن
     let logisticsToTry = [];

@@ -33,7 +33,7 @@ const migrate = async () => {
 
     // 2. تحديث جدول المنتجات بكافة الأعمدة الحديثة
     console.log('⏳ Updating products table schema...');
-    await client.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS cj_category_id VARCHAR(100);`);
+    await client.query(`ADD COLUMN IF NOT EXISTS cj_category_id VARCHAR(100);`);
     await client.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS patterns TEXT[];`);
     await client.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS is_sourced BOOLEAN DEFAULT false;`);
     await client.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0;`);
