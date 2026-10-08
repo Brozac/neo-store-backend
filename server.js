@@ -912,6 +912,37 @@ app.post('/api/admin/backfill-categories', async (req, res) => {
 // ==========================================
 // مزامنة منتجات CJ و 1688
 // ==========================================
+// ═══ 🆕 Reels server-side — الفيديوهات فقط، بلا كاتالوغ كامل ═══
+app.get('/api/admin/videos', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, title, price, image_url, video_url
+         FROM products
+        WHERE video_url IS NOT NULL AND video_url <> ''
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 200`
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('[admin/videos] query failed:', e.message);
+    res.status(500).json({ error: 'Failed to load video products' });
+  }
+});
+
+// ═══ 🆕 /admin/settings GET — زوج الـ PUT /admin/settings/:key ═══
+app.get('/api/admin/settings', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT value FROM store_settings WHERE key = 'show_reels' LIMIT 1`
+    );
+    const v = rows[0]?.value;
+    res.json({ show_reels: v === undefined ? true : (v === true || v === 'true') });
+  } catch (e) {
+    console.error('[admin/settings GET] failed:', e.message);
+    res.status(500).json({ error: 'Failed to load settings' });
+  }
+});
+
 app.get('/api/sync-cj-products', requireAdmin, async (req, res) => {
   const keyword = req.query.keyword || '';
   res.json({ message: `Sync started in background for keyword: ${keyword || 'Trending'}. Check server logs for progress.` });
@@ -1566,15 +1597,39 @@ app.get('/api/products', async (req, res) => {
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
 
     // 1. الطلب العام بدون بحث (يخدم ملايين الزوار من الذاكرة اللحظية)
+    // 🆕 minimal mode — للـ sitemap: ids+dates فقط (~400KB بدل 26MB)
+    if (req.query.minimal === '1') {
+      const { rows } = await pool.query(
+        'SELECT id, created_at, updated_at FROM products WHERE stock_status = true ORDER BY id DESC'
+      );
+      res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400');
+      return res.json(rows);
+    }
+
+    // 1. الطلب العام بدون بحث
     if (search === '' && category === 'All') {
+      // 🆕 الـ limit ولّى مطبَّق — HeroSection(12) و products/[id](100) عمرو ما استافدو بيه
+      const limitParam = parseInt(req.query.limit, 10);
+      if (Number.isFinite(limitParam) && limitParam > 0) {
+        const q = await pool.query(
+          'SELECT id, title, price, original_price, image_url, category, video_url, created_at FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC LIMIT $1',
+          [Math.min(limitParam, 200)]
+        );
+        return res.json(q.rows);
+      }
       if (productsCache && (Date.now() - cacheTime < CACHE_TTL)) {
         return res.json(productsCache);
       }
+      const FULL_CAP = 5000; // 🆕 سقف أمان — الذاكرة/الـ payload ما يطيروش مع نمو الكاتالوغ
       const result = await pool.query(
-        'SELECT id, title, price, original_price, image_url, category, video_url, created_at FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC'
+        'SELECT id, title, price, original_price, image_url, category, video_url, created_at FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC LIMIT $1',
+        [FULL_CAP]
       );
       productsCache = result.rows;
       cacheTime = Date.now();
+      if (result.rowCount >= FULL_CAP) {
+        console.warn(`[products] FULL_CAP=${FULL_CAP} hit — homepage should pass ?limit=`); // بلا صمت
+      }
       return res.json(result.rows);
     }
 
@@ -1601,6 +1656,29 @@ app.get('/api/products', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error('❌ Error fetching products:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// ═══ 🆕 Favorites by-ids — N+1 kill: الصفحة كيطلب غير المفضلة (KB بدل الكاتالوغ كامل) ═══
+app.get('/api/products/by-ids', async (req, res) => {
+  try {
+    const ids = String(req.query.ids || '')
+      .split(',').map(s => parseInt(s, 10))
+      .filter(n => Number.isInteger(n) && n > 0).slice(0, 100);
+    if (ids.length === 0) return res.json([]);
+    const { rows } = await pool.query(
+      `SELECT id, title, price, original_price, image_url, category, video_url
+         FROM products
+        WHERE stock_status = true AND id = ANY($1::int[])
+        ORDER BY sort_order ASC, id DESC
+        LIMIT 100`,
+      [ids]
+    );
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+    res.json(rows);
+  } catch (err) {
+    console.error('❌ /api/products/by-ids:', err.message);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });

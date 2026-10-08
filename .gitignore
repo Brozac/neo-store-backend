@@ -35,6 +35,7 @@ check_*.js
 prep_*.js
 show_*.js
 stop_*.js
+
 # ─── Backups ───
 *.bak
 *.bak2
