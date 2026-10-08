@@ -1665,8 +1665,8 @@ app.get('/api/products', async (req, res) => {
       paramIndex++;
     }
 
-    query += ` ORDER BY sort_order ASC, id DESC`;
-
+    query += ` ORDER BY sort_order ASC, id DESC LIMIT 200`;
+    
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
