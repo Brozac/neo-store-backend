@@ -276,6 +276,7 @@ app.use(require('./routes/paymentGateways'));
 
 // راوتر الدفع
 const paymentRoutes = require('./controllers/paymentController');
+app.use('/api/cj-live', require('./routes/cjLiveBridge'));
 app.use('/api/payment', paymentRoutes);
 // ==========================================
 // 🩹 M#29 — Status Labels (human-readable, unified)

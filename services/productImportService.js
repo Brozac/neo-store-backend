@@ -486,4 +486,6 @@ module.exports = {
   diagnoseShipping,
   extractWarehouseCountries,
   buildPrecisionPayload,
+  sanitizeDescription,
+  estimateShipUsd,
 };
