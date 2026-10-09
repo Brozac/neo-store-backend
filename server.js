@@ -1620,6 +1620,44 @@ app.get('/api/products', async (req, res) => {
       res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
       return res.json(rows);
     }
+        if (req.query.page) {
+      const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const PER = 24;
+      const cat = (req.query.category || '').trim();
+
+      // 🆕 category mode — فئات كبار بلا سقف (BL-CAT-SCROLL)
+      if (cat && cat !== 'All') {
+        const { rows } = await pool.query(
+          `SELECT id, title, price, original_price, image_url, category, video_url
+           FROM products WHERE stock_status = true AND category ILIKE $1
+           ORDER BY sort_order ASC, id DESC LIMIT $2 OFFSET $3`,
+          [`${cat}%`, PER, (pageNum - 1) * PER]
+        );
+        res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+        return res.json(rows);
+      }
+
+      // (المنطق الحالي بلا category يبقى كما هو تحت)
+      const { rows } = await pool.query(
+        `SELECT id, title, price, original_price, image_url, category, video_url
+         FROM products WHERE stock_status = true
+         ORDER BY sort_order ASC, id DESC
+         LIMIT $1 OFFSET $2`,
+        [PER, (pageNum - 1) * PER]
+      );
+      res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+      return res.json(rows);
+    }
+
+    // 🆕 عدّاد الفئة — للـ header ("3,528 products")
+    if (req.query.count === '1') {
+      const cat = (req.query.category || '').trim();
+      const sql = cat && cat !== 'All'
+        ? ['SELECT COUNT(*)::int AS n FROM products WHERE stock_status = true AND category ILIKE $1', [`${cat}%`]]
+        : ['SELECT COUNT(*)::int AS n FROM products WHERE stock_status = true', []];
+      const { rows } = await pool.query(sql[0], sql[1]);
+      return res.json({ count: rows[0].n });
+    }
 
     // 1. الطلب العام بدون بحث
     if (search === '' && category === 'All') {
