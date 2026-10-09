@@ -1607,20 +1607,8 @@ app.get('/api/products', async (req, res) => {
     }
         // 🆕 pagination mode — /all-products infinite scroll (24/شوط)
     // مقصود: بلا productsCache — الكاش للهوم فقط، هادا استعلام خفيف مباشر
+  
     if (req.query.page) {
-      const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
-      const PER = 24;
-      const { rows } = await pool.query(
-        `SELECT id, title, price, original_price, image_url, category, video_url
-         FROM products WHERE stock_status = true
-         ORDER BY sort_order ASC, id DESC
-         LIMIT $1 OFFSET $2`,
-        [PER, (pageNum - 1) * PER]
-      );
-      res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
-      return res.json(rows);
-    }
-        if (req.query.page) {
       const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
       const PER = 24;
       const cat = (req.query.category || '').trim();
