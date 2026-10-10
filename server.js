@@ -1601,7 +1601,7 @@ app.get('/api/products', async (req, res) => {
     // 🆕 minimal mode — للـ sitemap: ids+dates فقط (~400KB بدل 26MB)
     if (req.query.minimal === '1') {
       const { rows } = await pool.query(
-        'SELECT id FROM products WHERE stock_status = true ORDER BY id DESC'
+        'SELECT id, created_at FROM products WHERE stock_status = true ORDER BY id DESC'
       );
       res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400');
       return res.json(rows);
