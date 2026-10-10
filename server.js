@@ -1626,11 +1626,12 @@ app.get('/api/products', async (req, res) => {
         return res.json(rows);
       }
 
-      // (المنطق الحالي بلا category يبقى كما هو تحت)
+      // 🆕 Temu-mosaic: homepage feed متنوع من جميع الفئات — deterministic hash shuffle
+      // (بلا random(): الـ pagination كتبقى متسقة، صفحة N ما كتكررش N-1)
       const { rows } = await pool.query(
         `SELECT id, title, price, original_price, image_url, category, video_url
          FROM products WHERE stock_status = true
-         ORDER BY sort_order ASC, id DESC
+         ORDER BY md5(category || id::text)
          LIMIT $1 OFFSET $2`,
         [PER, (pageNum - 1) * PER]
       );
