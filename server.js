@@ -1599,12 +1599,16 @@ app.get('/api/products', async (req, res) => {
 
     // 1. الطلب العام بدون بحث (يخدم ملايين الزوار من الذاكرة اللحظية)
     // 🆕 minimal mode — للـ sitemap: ids+dates فقط (~400KB بدل 26MB)
+    // 🆕 minimal chunked — sitemap يتوسع بلا حدود cache (20k/chunk · ~1.1MB كل chunk · سقف مُقفل دائماً)
     if (req.query.minimal === '1') {
+      const minimalPage = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const CHUNK = 20000;
       const { rows } = await pool.query(
-        'SELECT id, created_at FROM products WHERE stock_status = true ORDER BY id DESC'
+        'SELECT id, created_at FROM products WHERE stock_status = true ORDER BY id DESC LIMIT $1 OFFSET $2',
+        [CHUNK, (minimalPage - 1) * CHUNK]
       );
       res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400');
-      return res.json(rows);
+      return res.json({ page: minimalPage, chunkSize: CHUNK, count: rows.length, products: rows });
     }
         // 🆕 pagination mode — /all-products infinite scroll (24/شوط)
     // مقصود: بلا productsCache — الكاش للهوم فقط، هادا استعلام خفيف مباشر
