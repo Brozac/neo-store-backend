@@ -1603,12 +1603,15 @@ app.get('/api/products', async (req, res) => {
     if (req.query.minimal === '1') {
       const minimalPage = Math.max(1, parseInt(req.query.page, 10) || 1);
       const CHUNK = 20000;
-      const { rows } = await pool.query(
-        'SELECT id, created_at FROM products WHERE stock_status = true ORDER BY id DESC LIMIT $1 OFFSET $2',
-        [CHUNK, (minimalPage - 1) * CHUNK]
-      );
+      const [{ rows }, { rows: totalRows }] = await Promise.all([
+        pool.query(
+          'SELECT id, created_at FROM products WHERE stock_status = true ORDER BY id DESC LIMIT $1 OFFSET $2',
+          [CHUNK, (minimalPage - 1) * CHUNK]
+        ),
+        pool.query('SELECT COUNT(*)::int AS total FROM products WHERE stock_status = true'),
+      ]);
       res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400');
-      return res.json({ page: minimalPage, chunkSize: CHUNK, count: rows.length, products: rows });
+      return res.json({ page: minimalPage, chunkSize: CHUNK, count: rows.length, total: totalRows[0].total, products: rows });
     }
         // 🆕 pagination mode — /all-products infinite scroll (24/شوط)
     // مقصود: بلا productsCache — الكاش للهوم فقط، هادا استعلام خفيف مباشر
