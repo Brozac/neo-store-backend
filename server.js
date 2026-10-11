@@ -688,28 +688,39 @@ function clearProductsCache() {
 
 app.post('/api/admin/add-product', async (req, res) => {
   try {
-    let { title, price: costPrice, image_url, images, description, material, colors, sizes, category } = req.body;
+    let { title, price: costPrice, original_price, image_url, images, description, material, colors, sizes, category } = req.body;
     if (!title || !costPrice || !image_url) return res.status(400).json({ error: 'Title, cost price, and image_url are required' });
+
+    // 🩹 v1.1 — floor enforced server-side (نفس قانون v3.1 — الكلفة عند الإدخال هنا هي cost)
+    const costNum = Number(costPrice) || 0;
+    if (costNum < 1.0) return res.status(400).json({ error: `Cost price must be ≥ $1.00 — got: ${costPrice}` });
 
     const cjProductId = `MANUAL_${Date.now()}`;
     const imagesArray = images && images.length > 0 ? images : [image_url];
     const colorsArray = colors || [];
     const sizesArray = sizes || [];
 
-    const costNum = Number(costPrice) || 0;
-    let sellingPrice = costNum <= 5 ? costNum * 3.5 : costNum <= 15 ? costNum * 2.8 : costNum <= 30 ? costNum * 2.2 : costNum * 1.8;
-    sellingPrice = Math.max(9.99, Math.floor(sellingPrice) - 0.01);
-    const safePrice = parseFloat(sellingPrice.toFixed(2));
-    const safeOldPrice = parseFloat((safePrice * 1.5).toFixed(2));
+    // 🩹 v1.1 — weight-optional: المنتج اليدوي بلا وزن → تمرير 0 → محرك v3.1 كيحسب بـ min 50g
+    // 💰 THE single pricing engine (v3.1) — بلا مضاعفات محلية
+    const { calculateSellingPrice } = require('./services/productImportService');
+    const { safePrice, safeOriginalPrice: _ignored } = calculateSellingPrice(costNum, 0);
+
+    // 🩹 قرار 1: original_price — يدوي كامل الصلاحية إلا عطاه الأدمن، وإلا null (بلا 1.5x)
+    const parsedOriginal = Number(original_price);
+    const safeOldPrice = (Number.isFinite(parsedOriginal) && parsedOriginal > safePrice) ? parsedOriginal : null;
+
+    // 🩹 قرار 2: material بلا شعار مجاني · description بلا filler
+    const safeMaterial = (material && String(material).trim()) || '';
+    const safeDescription = (description && String(description).trim()) || '';
 
     await pool.query(
       `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-      [title, safePrice, safeOldPrice, image_url, imagesArray, JSON.stringify([]), colorsArray, sizesArray, true, cjProductId, description || 'High quality product from Laclarc.', material || 'Premium Quality', category || 'other']
+      [title, safePrice, safeOldPrice, image_url, imagesArray, JSON.stringify([]), colorsArray, sizesArray, true, cjProductId, safeDescription, safeMaterial, category || 'other']
     );
 
     clearProductsCache();
-    res.status(201).json({ message: 'Product added successfully with Auto-Pricing!', calculatedPrice: safePrice, originalPrice: safeOldPrice });
+    res.status(201).json({ message: 'Product added successfully with v3.1 pricing!', calculatedPrice: safePrice, originalPrice: safeOldPrice });
   } catch (err) {
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
@@ -1317,6 +1328,7 @@ app.get('/api/admin/manual-orders', async (req, res) => {
 // ==========================================
 
 app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
+  // 🆕 v2 — verified_amount / declared_amount / mismatch (audit trail, optional)
   try {
     const id = parseInt(req.params.id, 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid order id' });
@@ -1347,6 +1359,23 @@ app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
       return res.status(409).json({ error: `Order is '${exists.rows[0].status}' — already processed` });
     }
     const order = updateRes.rows[0];
+
+    // 🆕 v2 — BARIDIMOB_VERIFIED: audit trail للتسعير المُتحقق منه يدوياً
+    const { verified_amount, declared_amount, mismatch } = req.body || {};
+    await pool.query(
+      `INSERT INTO system_events (event_type, order_id, details, severity)
+       VALUES ('BARIDIMOB_VERIFIED', $1, $2, 'info')`,
+      [
+        id,
+        JSON.stringify({
+          declared: Number(declared_amount ?? order.total_amount) || null,
+          verified: Number(verified_amount) || null,
+          mismatch: mismatch === true,
+          approved_by_admin: true,
+          at: new Date().toISOString(),
+        }),
+      ]
+    );
 
     res.json({ message: 'Order approved. Sending to CJ in background...' });
 
@@ -2301,11 +2330,26 @@ app.put('/api/admin/update-product/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { title, price, original_price, image_url, images, description, material, colors, sizes, category } = req.body;
-    // ⚠️ موثق: يفرغ الحقول الغائبة — واجهتك تبعت الـ form كاملاً
-    //    Backlog: dynamic SET للأعمدة المرسومة فقط
+
+    // 🆕 v1.1 — financial guard: floor + required fields (نفس قانون v3.1)
+    const parsedPrice = Number(price);
+    if (!Number.isFinite(parsedPrice) || parsedPrice < 9.99) {
+      return res.status(400).json({ error: `Price must be ≥ $9.99 (v3.1 floor) — got: ${price}` });
+    }
+    if (!title || !String(title).trim()) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+
+    // قرار 1: original_price — null إذا فارغ/سالب (لا 0 مزيف)
+    const parsedOriginal = Number(original_price);
+    const safeOriginal = Number.isFinite(parsedOriginal) && parsedOriginal > parsedPrice
+      ? parsedOriginal
+      : null;
+
+    // ⚠️ موثق: يفرغ الحقول الغائبة — Backlog: dynamic SET للأعمدة المرسلة فقط
     await pool.query(
       `UPDATE products SET title = $1, price = $2, original_price = $3, image_url = $4, images = $5, description = $6, material = $7, colors = $8, sizes = $9, category = $10 WHERE id = $11`,
-      [title || null, Number(price) || 0, Number(original_price) || 0, image_url || null, images || null, description || null, material || null, colors || null, sizes || null, category || 'other', id]
+      [String(title).trim(), parsedPrice, safeOriginal, image_url || null, images || null, description || null, material || null, colors || null, sizes || null, category || 'other', id]
     );
     clearProductsCache();
     res.json({ message: 'Product updated successfully' });
