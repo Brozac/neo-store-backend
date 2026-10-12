@@ -420,6 +420,12 @@ router.post('/crypto', checkoutLimiter, async (req, res) => {
     res.json({ url: response.data.invoice_url });
   } catch (error) {
     // 🩹 FIX — قنّع الخطأ (كان يسرّب تفاصيل NowPayments للعميل)
+    console.error('🔍 [Crypto-DEBUG] full error:', JSON.stringify({
+      msg: error.message,
+      npData: error.response?.data,
+      npStatus: error.response?.status,
+      stack: error.stack?.split('\n').slice(0, 3)
+    }));
     logger.logError('Crypto Checkout Error', error.response?.data || error);
     res.status(500).json({ error: 'Payment processing failed' });
   }
