@@ -378,7 +378,7 @@ router.post('/crypto', checkoutLimiter, async (req, res) => {
 
     const orderResult = await pool.query(
       `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id)
-       VALUES ($1, $2, $3, $4, $5, 'pending', 'Crypto', $6, $7, $8, $9, $10) RETURNING id`,
+       VALUES ($1, $2, $3, $4, $5, 'pending', 'Crypto', $6, $7, $8, $9, $10, $11) RETURNING id`,
       [
         hasCustomerDetails ? String(customerName).trim().slice(0, 150) : 'Pending Crypto',
         String(customerPhone || '').trim().slice(0, 30) || null,
