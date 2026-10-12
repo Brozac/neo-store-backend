@@ -7,6 +7,11 @@
 //   • Crypto callback: address-guard (paid without shipping address → manual, never ships to N/A)
 //   • checkoutLimiter on all payment entry routes
 //   • coupon cache DB-backed (FIX#12 — matches server.js)
+// 🆕 v2 — Crypto Autonomous Fix (M#47):
+//   • /crypto يقبل بيانات الزبون (اسم/هاتف/إيميل/عنوان) قبل إنشاء فاتورة NowPayments
+//   • → العنوان مخزن في orders قبل الدفع → Address Guard يمر → fulfillment آلي 100%
+//   • البيانات اختيارية للتوافق مع العملاء القدامى — الغياب = Address Guard (manual + alert) كما كان
+//   • النتيجة: زبون crypto حقيقي يدفع → CJ يجهز → صفر تدخل يدوي
 const express = require('express');
 const router = express.Router();
 const Stripe = require('stripe');
@@ -17,12 +22,11 @@ const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
-const pool = require('../db'); // ✨ الـ Pool الموحد حصراً
-const { fulfillCJOrder, auditEvent } = require('../services/cjService'); // 🩹 + auditEvent
+const pool = require('../db');
+const { fulfillCJOrder, auditEvent } = require('../services/cjService');
 const { prepareSecureItems } = require('../utils/secureCheckout');
-const { applyCouponToTotal } = require('../utils/couponHelper'); // ✨ Helper الكوبون الموحد
+const { applyCouponToTotal } = require('../utils/couponHelper');
 const logger = require('../logger');
-// 🆕 FILE 4: خدمة الـ Conversions API — تخزين سياق المتصفح (IP/UA) للـ Dedup matching
 const { setConversionContext } = require('../services/conversionService');
 
 // إعداد Cloudinary لتخزين إيصالات بريدي موب
@@ -207,7 +211,7 @@ function getOptionalUser(req) {
 // ==========================================
 // 2. Paysera Checkout & Callback
 // ==========================================
-router.post('/paysera', checkoutLimiter, async (req, res) => {   // 🩹 FIX — limiter
+router.post('/paysera', checkoutLimiter, async (req, res) => {
   try {
     const { items: clientItems, couponCode } = req.body;
     const utm = extractUtm(req.body);
@@ -232,7 +236,7 @@ router.post('/paysera', checkoutLimiter, async (req, res) => {   // 🩹 FIX —
 
     const data = {
       projectid: process.env.PAYSERA_PROJECT_ID,
-      orderid: String(orderId),                                    // 🩹 FIX — Paysera يريد string
+      orderid: String(orderId),
       amount: Math.round(chargeTotal * 100),
       currency: 'USD',
       accepturl: `${process.env.FRONTEND_URL}/success?method=paysera`,
@@ -266,7 +270,6 @@ router.get('/paysera/callback', async (req, res) => {
       .update(data + process.env.PAYSERA_PASSWORD)
       .digest('hex');
 
-    // 🩹 — timing-safe comparison (كان !== — نظرياً timing attack)
     const a = Buffer.from(expectedSign), b = Buffer.from(String(ss1));
     const signOk = a.length === b.length && crypto.timingSafeEqual(a, b);
     if (!signOk) return res.status(400).send('Bad signature');
@@ -276,18 +279,15 @@ router.get('/paysera/callback', async (req, res) => {
     const orderId = params.get('orderid');
     const status = params.get('status');
 
-    // 🩹 — جلب الطلب أولاً (لازم لتحقق المبلغ)
     const orderRowRes = await pool.query('SELECT total_amount FROM orders WHERE id = $1', [orderId]);
     const orderRow = orderRowRes.rows[0];
     if (!orderRow) { res.send('OK'); return; }
 
     if (status === '1') {
-      // 🩹 FIX — تحقق المبلغ: التوقيع يضمن أن Paysera أرسل — لا أن المبلغ يطابق الطلب!
-      //    (حوافز/تحويلات/اختلاف — بدون هذا الفحص أقل من المطلوب يعليم paid)
       const paidCents = parseInt(params.get('amount'), 10) || 0;
       const expectedCents = Math.round(Number(orderRow.total_amount) * 100);
 
-      if (paidCents + 50 < expectedCents) {   // تسامح 50 cents
+      if (paidCents + 50 < expectedCents) {
         await pool.query(
           "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'pending'",
           [orderId]
@@ -317,7 +317,6 @@ router.get('/paysera/callback', async (req, res) => {
             }, items);
 
             if (cjResponse && cjResponse.success) {
-              // 🧹 FIX: الوسم كان [Crypto] بالغلط — اللوجات هي الحقيقة المطلقة
               console.log(`📤 [Paysera] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
             }
 
@@ -337,27 +336,57 @@ router.get('/paysera/callback', async (req, res) => {
     res.status(500).send('Error');
   }
 });
+
 // ==========================================
 // 3. Crypto (NowPayments) Checkout & IPN
+// 🆕 v2 — بيانات الزبون تُجمع قبل الفاتورة → fulfillment آلي حقيقي
 // ==========================================
-router.post('/crypto', checkoutLimiter, async (req, res) => {   // 🩹 FIX — limiter
-  // 🩹 FIX — 503 gate: المفتاح غائب = رفض نظيف فوري (ماشي 500 مع تسريب بعد اختيار الزبون للدفع)
+router.post('/crypto', checkoutLimiter, async (req, res) => {
+  // 🩹 FIX — 503 gate: المفتاح غائب = رفض نظيف فوري
   if (!process.env.NOWPAYMENTS_API_KEY) {
     return res.status(503).json({ error: 'Crypto payments are temporarily unavailable.' });
   }
 
   try {
-    const { items: clientItems, couponCode } = req.body;
+    // 🆕 v2 — بيانات الزبون (اختيارية للتوافق مع العملاء القدامى — الإجباري في الواجهة v2)
+    const { items: clientItems, couponCode,
+            customerName, customerPhone, customerEmail,
+            customerAddress, customerCity, customerState, customerZip } = req.body;
     const utm = extractUtm(req.body);
     const optionalUser = getOptionalUser(req);
+
+    // 🆕 v2 — إذا توفرت بيانات: إيميل إجباري + عنوان مبنى منظم
+    //        إذا غابت (عميل قديم): fallback للنمط القديم — Address Guard كيضمن أمان ما بعد الدفع
+    const hasCustomerDetails = Boolean(customerEmail && customerAddress);
+    if (customerEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail)) {
+      return res.status(400).json({ error: 'Invalid email address.' });
+    }
 
     const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
     const { total: chargeTotal } = await applyCouponToTotal(pool, couponCode, serverTotal);
 
+    // 🆕 v2 — العنوان: إما من الـ form الجديد أو 'Pending' (Address Guard يكفل البقية)
+    const fullAddress = hasCustomerDetails
+      ? JSON.stringify({
+          line1: String(customerAddress).trim().slice(0, 300),
+          city: String(customerCity || '').trim().slice(0, 100),
+          state: String(customerState || '').trim().slice(0, 100),
+          postal_code: String(customerZip || '').trim().slice(0, 20),
+          country: String(customerState && /alger|dz/i.test(customerState) ? 'DZ' : '').trim() || 'ZZ'
+        })
+      : 'Pending';
+
     const orderResult = await pool.query(
-      `INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id)
-       VALUES ($1, $2, $3, $4, $5, 'Crypto', $6, $7, $8, $9, $10) RETURNING id`,
-      ['Pending Crypto', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null, utm.source, utm.medium, utm.campaign, utm.clickId]
+      `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id)
+       VALUES ($1, $2, $3, $4, $5, 'pending', 'Crypto', $6, $7, $8, $9, $10) RETURNING id`,
+      [
+        hasCustomerDetails ? String(customerName).trim().slice(0, 150) : 'Pending Crypto',
+        String(customerPhone || '').trim().slice(0, 30) || null,
+        hasCustomerDetails ? normalizeEmail(customerEmail) : 'pending@laclarc.com',
+        fullAddress,
+        chargeTotal, 'pending', optionalUser ? optionalUser.id : null,
+        utm.source, utm.medium, utm.campaign, utm.clickId
+      ]
     );
     const orderId = orderResult.rows[0].id;
 
@@ -384,12 +413,13 @@ router.post('/crypto', checkoutLimiter, async (req, res) => {   // 🩹 FIX — 
     });
 
     if (response.data.id) {
+      // 📝 توثيق: receipt_url هنا يحمل NP invoice id (semantic reuse — آمن، موثق)
       await pool.query("UPDATE orders SET receipt_url = $1 WHERE id = $2", [response.data.id.toString(), orderId]);
     }
 
     res.json({ url: response.data.invoice_url });
   } catch (error) {
-    // 🩹 FIX — قنّع الخطأ (كان error.response?.data?.message يسرّب تفاصيل NowPayments للعميل)
+    // 🩹 FIX — قنّع الخطأ (كان يسرّب تفاصيل NowPayments للعميل)
     logger.logError('Crypto Checkout Error', error.response?.data || error);
     res.status(500).json({ error: 'Payment processing failed' });
   }
@@ -406,6 +436,8 @@ function sortObject(obj) {
   }, {});
 }
 
+// ⚠️ Address Guard يبقى هنا كدرع احتياطي — إلا وصل طلب بلا عنوان (عميل قديم)
+//    الحالة الحقيقية بعد v2: العنوان مخزن قبل الدفع → Guard يمر → fulfillment آلي
 router.post('/crypto/callback', async (req, res) => {
   try {
     const ipnSecret = process.env.NOWPAYMENTS_IPN_SECRET;
@@ -418,7 +450,6 @@ router.post('/crypto/callback', async (req, res) => {
     hmac.update(JSON.stringify(sortedParams));
     const expectedSig = hmac.digest('hex');
 
-    // 🩹 — timing-safe comparison (كان !== — نظرياً timing attack)
     const a = Buffer.from(expectedSig), b = Buffer.from(String(receivedSig));
     const sigOk = a.length === b.length && crypto.timingSafeEqual(a, b);
     if (!sigOk) return res.status(400).send('Invalid signature');
@@ -439,10 +470,7 @@ router.post('/crypto/callback', async (req, res) => {
         const updatedOrder = updateRes.rows[0];
         res.status(200).send('OK');
 
-        // 🩹 FIX — حارس العنوان (أهم إصلاح في هذا الملف):
-        //    NowPayments invoice لا يجمع عنوان شحن — أول زبون crypto حقيقي كان:
-        //    يدفع USDT حقيقي → paid → fulfillment لعنوان 'N/A' → بضاعة ضائعة.
-        //    الآن: المال يُستقبل ✓ الزبون يُبلَّغ ✓ أنت تُنبَّه فوراً ✓ ولا شحن لعنوان وهمي ✓
+        // 🩹 Address Guard — احتياطي فقط بعد v2 (الطلبات الجديدة عندهم عنوان مخزن قبل الدفع)
         const rawAddr = String(updatedOrder.shipping_address || '').trim();
         const addrLooksFake = !rawAddr || rawAddr === 'Pending' || /N\/A/i.test(rawAddr);
         if (addrLooksFake) {
@@ -451,8 +479,7 @@ router.post('/crypto/callback', async (req, res) => {
           sendAdminAlert(`🚨 Crypto paid بلا عنوان شحن — #${orderId}`,
             `<p>عميل دفع <b>$${updatedOrder.total_amount}</b> عبر Crypto لكن <b>لا يوجد عنوان شحن</b> في الطلب.</p>
              <p><b>الإجراء:</b> تواصل مع الزبون لجمع العنوان، ثم fulfillment يدوي من retry-fulfillment.</p>
-             <p>Email: ${updatedOrder.customer_email || '—'} · Payment ref: ${updatedOrder.payment_ref || '—'}</p>
-             <p style="color:#FF6B9D;font-size:12px;">Backlog: خطوة جمع العنوان قبل فاتورة Crypto (شرط تفعيل Crypto الحقيقي).</p>`);
+             <p>Email: ${updatedOrder.customer_email || '—'} · Payment ref: ${updatedOrder.payment_ref || '—'}</p>`);
           return;
         }
 
@@ -461,15 +488,25 @@ router.post('/crypto/callback', async (req, res) => {
             const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [orderId]);
             const items = itemsRes.rows;
 
+            // 🆕 v2 — العنوان الحقيقي من الـ order (المخزن قبل الدفع) — بلا N/A
+            let parsedAddr = {};
+            try { parsedAddr = JSON.parse(updatedOrder.shipping_address); }
+            catch (e) { parsedAddr = { line1: updatedOrder.shipping_address }; }
+
             const customerDetails = {
-              address: { line1: updatedOrder.shipping_address || 'N/A', city: updatedOrder.customer_city || 'N/A', country: 'US', state: 'N/A', postal_code: '00000' },
+              address: {
+                line1: parsedAddr.line1 || updatedOrder.shipping_address || 'N/A',
+                city: parsedAddr.city || updatedOrder.customer_city || 'N/A',
+                state: parsedAddr.state || 'N/A',
+                postal_code: parsedAddr.postal_code || '00000',
+                country: parsedAddr.country || 'US'
+              },
               phone: updatedOrder.customer_phone || '0000000000'
             };
 
             const cjResponse = await fulfillCJOrder(orderId, updatedOrder.customer_name, customerDetails, items);
 
             if (cjResponse && cjResponse.success) {
-              // 🐛 FIX #1 (سابق): كان #${order.id} — ReferenceError كان يقتل الإيميل بصمت
               console.log(`📤 [Crypto] #${updatedOrder.id} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
             }
 
@@ -494,7 +531,7 @@ router.post('/crypto/callback', async (req, res) => {
 // ==========================================
 // ⚡ مسار التحقق المالي اللحظي للكريبتو (JIT NowPayments Verifier)
 // ==========================================
-router.post('/crypto/verify', checkoutLimiter, async (req, res) => {   // 🩹 FIX — limiter
+router.post('/crypto/verify', checkoutLimiter, async (req, res) => {
   const { order_id } = req.body;
 
   if (!order_id) {
@@ -509,7 +546,6 @@ router.post('/crypto/verify', checkoutLimiter, async (req, res) => {   // 🩹 F
 
     const order = orderRes.rows[0];
 
-    // 🆕 FILE 4-a + Mission #4: الزبون الحقيقي هو لي يزور /success
     setConversionContext(order.id, {
       clientIp: req.ip,
       userAgent: req.headers['user-agent'],
@@ -517,7 +553,6 @@ router.post('/crypto/verify', checkoutLimiter, async (req, res) => {   // 🩹 F
       fbc: typeof req.body?._fbc === 'string' ? req.body._fbc.slice(0, 500) : undefined,
     });
 
-    // 🆕 FILE 4-b: items مطلوبة فكل الردود (أساس event_id matching فالمتصفح)
     const itemsRes = await pool.query(`
       SELECT oi.*, p.title, p.image_url
       FROM order_items oi
@@ -527,7 +562,6 @@ router.post('/crypto/verify', checkoutLimiter, async (req, res) => {   // 🩹 F
     const items = itemsRes.rows;
     const pixelItems = items.map(i => ({ productId: i.product_id, quantity: i.quantity }));
 
-    // 🐛 FIX #3: DECIMAL يرجع string من pg — بلا parseFloat البكسل يطلع $0.00
     const verifiedAmount = parseFloat(order.total_amount);
 
     // الفرع A: سبقنا الـ IPN webhook — الطلب مدفوع خلاص، رد كامل فوري
@@ -568,7 +602,7 @@ router.post('/crypto/verify', checkoutLimiter, async (req, res) => {   // 🩹 F
 
         (async () => {
           try {
-            // 🩹 FIX — نفس حارس العنوان (JIT يسبق IPN أحياناً — نفس الفجوة نفس الحل)
+            // 🩹 Address Guard (JIT) — احتياطي بعد v2
             const rawAddr = String(order.shipping_address || '').trim();
             const addrLooksFake = !rawAddr || rawAddr === 'Pending' || /N\/A/i.test(rawAddr);
             if (addrLooksFake) {
@@ -580,14 +614,24 @@ router.post('/crypto/verify', checkoutLimiter, async (req, res) => {   // 🩹 F
               return;
             }
 
+            // 🆕 v2 — العنوان الحقيقي من الـ order
+            let parsedAddr = {};
+            try { parsedAddr = JSON.parse(order.shipping_address); }
+            catch (e) { parsedAddr = { line1: order.shipping_address }; }
+
             const customerDetails = {
-              address: { line1: order.shipping_address || 'Online Purchase', country: 'US' },
+              address: {
+                line1: parsedAddr.line1 || order.shipping_address || 'Online Purchase',
+                city: parsedAddr.city || order.customer_city || 'N/A',
+                state: parsedAddr.state || 'N/A',
+                postal_code: parsedAddr.postal_code || '00000',
+                country: parsedAddr.country || 'US'
+              },
               phone: order.customer_phone || '1234567890'
             };
 
             const cjResponse = await fulfillCJOrder(order.id, order.customer_name, customerDetails, items);
             if (cjResponse && cjResponse.success) {
-              // 🐛 FIX #2 (سابق): كان #${orderId} — ReferenceError كان يقتل الإيميل
               console.log(`📤 [Crypto] #${order.id} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
             }
 
@@ -602,7 +646,6 @@ router.post('/crypto/verify', checkoutLimiter, async (req, res) => {   // 🩹 F
         console.log(`ℹ️ [Crypto JIT] Order #${order.id} was already locked/processed by IPN webhook.`);
       }
 
-      // 🆕 FILE 4-c: رد كامل فالفرعين (winner + loser) — الزبون يستحق البكسل فالحالتين
       return res.json({
         success: true,
         verified: true,
@@ -629,11 +672,10 @@ router.post('/crypto/verify', checkoutLimiter, async (req, res) => {   // 🩹 F
 
 // ==========================================
 // 4. BaridiMob / CCP (Manual Upload - Algeria)
-// ملاحظة معلّمة: حالياً معطّل من payment_gateways (قرار تشغيلي) —
-// المسار كامل وجاهز، والإيميل هنا مؤقتاً "Confirmed" — يُصحح لـ "قيد المراجعة"
-// عند تفعيل BaridiMob (Backlog — يُربط بمصير تفعيل البوابة)
+// 🆕 v2 — يقبل verified_amount/declared_amount/mismatch من الواجهة (audit trail)
+//         receipts في Cloudinary ✓ (anti-ephemeral — مؤكد)
 // ==========================================
-router.post('/manual', checkoutLimiter, upload.single('receipt'), async (req, res) => {   // 🩹 FIX — limiter
+router.post('/manual', checkoutLimiter, upload.single('receipt'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'يرجى رفع صورة الإيصال' });
 
@@ -705,7 +747,6 @@ router.post('/manual', checkoutLimiter, upload.single('receipt'), async (req, re
 // ==========================================
 // 💳 ⬇️ REMOVED — /api/payment/gateways (ميت بالبرهان):
 //    PaymentModal يستعمل /api/payment/gateways تاع paymentGateways router
-//    (الجدولي — fail-closed) — هذه النسخة كانت تقرأ store_settings القديم
 // ==========================================
 
 module.exports = router;

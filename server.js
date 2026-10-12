@@ -1949,14 +1949,19 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
       stripeDiscounts = [{ coupon: await getOrCreateStripeCoupon(couponData) }];
     }
 
-    // 🎡 WHEEL_V1 — خصم العجلة من token موقّع فقط (client نسبة عارية لا تُقبل)
+
+    // 🩹 FIX-SM — allowed_countries من shipping_matrix (CJ-verified 2026-10-03)
+    //    222 دولة مؤكدة بالمسح الفعلي — 16 مستبعدة (اليمين الفاتيكان العراق موريتانيا...)
+    //    الزبون من دولة غير مدعومة لا يصل لصفحة الدفع أصلاً — صفر فاتورة ميتة
+    //    ⚠️ fallback: إن كان الجدول فارغاً (لم تُبنَ المصفوفة بعد) → ALL_WORLD_COUNTRIES (السلوك القديم)
+    // 🎡 WHEEL_V1 — خصم العجلة من token موقّع فقط
     let wheelPct = 0;
     try {
       if (wheelToken) {
         const wheelClaim = jwt.verify(wheelToken, JWT_SECRET);
         if (wheelClaim.type === 'wheel') wheelPct = Math.min(15, Math.max(0, wheelClaim.pct));
       }
-    } catch { /* token قديم/مزور — بلا خصم، الطلب يكمل بالسعر الكامل */ }
+    } catch { /* token قديم/مزور — بلا خصم */ }
     if (wheelPct > 0) {
       const wheelOff = Math.round(serverTotal * wheelPct / 100 * 100);
       if (wheelOff > 0) {
@@ -1964,10 +1969,6 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
       }
     }
 
-    // 🩹 FIX-SM — allowed_countries من shipping_matrix (CJ-verified 2026-10-03)
-    //    222 دولة مؤكدة بالمسح الفعلي — 16 مستبعدة (اليمين الفاتيكان العراق موريتانيا...)
-    //    الزبون من دولة غير مدعومة لا يصل لصفحة الدفع أصلاً — صفر فاتورة ميتة
-    //    ⚠️ fallback: إن كان الجدول فارغاً (لم تُبنَ المصفوفة بعد) → ALL_WORLD_COUNTRIES (السلوك القديم)
     let allowedCountries = ALL_WORLD_COUNTRIES;
     try {
       const { rows: supported } = await pool.query(
