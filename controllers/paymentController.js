@@ -376,16 +376,21 @@ router.post('/crypto', checkoutLimiter, async (req, res) => {
         })
       : 'Pending';
 
+    // 🩹 v2.1 — 12 عمود = 10 placeholders + 2 حروف ('pending', 'Crypto') — محسوب بالحرف
     const orderResult = await pool.query(
       `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id)
-       VALUES ($1, $2, $3, $4, $5, 'pending', 'Crypto', $6, $7, $8, $9, $10, $11) RETURNING id`,
+       VALUES ($1, $2, $3, $4, $5, 'pending', 'Crypto', $6, $7, $8, $9, $10) RETURNING id`,
       [
-        hasCustomerDetails ? String(customerName).trim().slice(0, 150) : 'Pending Crypto',
-        String(customerPhone || '').trim().slice(0, 30) || null,
-        hasCustomerDetails ? normalizeEmail(customerEmail) : 'pending@laclarc.com',
-        fullAddress,
-        chargeTotal, 'pending', optionalUser ? optionalUser.id : null,
-        utm.source, utm.medium, utm.campaign, utm.clickId
+        hasCustomerDetails ? String(customerName).trim().slice(0, 150) : 'Pending Crypto',  // $1
+        String(customerPhone || '').trim().slice(0, 30) || null,                            // $2
+        hasCustomerDetails ? normalizeEmail(customerEmail) : 'pending@laclarc.com',         // $3
+        fullAddress,                                                                        // $4
+        chargeTotal,                                                                        // $5
+        optionalUser ? optionalUser.id : null,                                              // $6 = user_id
+        utm.source,                                                                         // $7
+        utm.medium,                                                                         // $8
+        utm.campaign,                                                                       // $9
+        utm.clickId                                                                         // $10
       ]
     );
     const orderId = orderResult.rows[0].id;
