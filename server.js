@@ -1870,6 +1870,19 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
   }
 });
 
+// 2) قبل التعليق "🩹 FIX-SM — allowed_countries" — لصق هادا:
+// ═══ 🎡 WHEEL_V1 — Spin Wheel claim → JWT-signed token (server = only truth) ═══
+app.post('/api/wheel/claim', async (req, res) => {
+  try {
+    const pct = Math.min(15, Math.max(1, Math.round(Number(req.body?.pct) || 0)));
+    if (!pct) return res.status(400).json({ error: 'Invalid wheel result' });
+    const wheelToken = jwt.sign({ type: 'wheel', pct }, JWT_SECRET, { expiresIn: '24h' });
+    res.json({ pct, wheelToken });
+  } catch (e) {
+    logger.logError('wheel/claim', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 // ==========================================
 // مسار الدفع المحصن (Bank-Grade Checkout مع تتبع الإعلانات والكوبونات)
 // 🩹 Hardening 2026-10-03:
@@ -1881,7 +1894,7 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
 app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
   try {
     let orderId = null;
-    const { items: clientItems, origin, couponCode, utm } = req.body;
+    const { items: clientItems, origin, couponCode, utm, wheelToken } = req.body;
     let baseUrl = origin && origin.startsWith('http') ? origin : (process.env.FRONTEND_URL || 'https://laclarc.com');
     baseUrl = baseUrl.replace(/\/+$/, '');
 
@@ -1934,6 +1947,21 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
         ? { percent_off: parseFloat(couponRow.discount_value), duration: 'once' }
         : { amount_off: Math.round(couponDiscount * 100), currency: 'usd', duration: 'once' };
       stripeDiscounts = [{ coupon: await getOrCreateStripeCoupon(couponData) }];
+    }
+
+    // 🎡 WHEEL_V1 — خصم العجلة من token موقّع فقط (client نسبة عارية لا تُقبل)
+    let wheelPct = 0;
+    try {
+      if (wheelToken) {
+        const wheelClaim = jwt.verify(wheelToken, JWT_SECRET);
+        if (wheelClaim.type === 'wheel') wheelPct = Math.min(15, Math.max(0, wheelClaim.pct));
+      }
+    } catch { /* token قديم/مزور — بلا خصم، الطلب يكمل بالسعر الكامل */ }
+    if (wheelPct > 0) {
+      const wheelOff = Math.round(serverTotal * wheelPct / 100 * 100);
+      if (wheelOff > 0) {
+        stripeDiscounts.push({ coupon: await getOrCreateStripeCoupon({ amount_off: wheelOff, currency: 'usd', duration: 'once' }) });
+      }
     }
 
     // 🩹 FIX-SM — allowed_countries من shipping_matrix (CJ-verified 2026-10-03)
