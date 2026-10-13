@@ -114,6 +114,7 @@ async function getJourney(orderId, customerEmail) {
   return {
     order: {
       id: order.id,
+      order_number: order.order_number,   // 🩹 v1.1 — customer-facing
       status: order.status,
       tracking: order.tracking_number,
       destination: order.customer_city,
