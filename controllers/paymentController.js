@@ -222,10 +222,11 @@ router.post('/paysera', checkoutLimiter, async (req, res) => {
 
     const orderResult = await pool.query(
       `INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id)
-       VALUES ($1, $2, $3, $4, $5, 'Paysera', $6, $7, $8, $9, $10) RETURNING id`,
+       VALUES ($1, $2, $3, $4, $5, 'Paysera', $6, $7, $8, $9, $10) RETURNING id, order_number`,
       ['Pending Paysera', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null, utm.source, utm.medium, utm.campaign, utm.clickId]
     );
     const orderId = orderResult.rows[0].id;
+    const orderNumber = orderResult.rows[0].order_number;
 
     for (const item of secureItems) {
       await pool.query(
@@ -243,6 +244,7 @@ router.post('/paysera', checkoutLimiter, async (req, res) => {
       cancelurl: `${process.env.FRONTEND_URL}/cart`,
       callbackurl: `${process.env.BACKEND_URL}/api/payment/paysera/callback`,
       test: process.env.NODE_ENV === 'production' ? 0 : 1,
+      orderid: orderNumber || String(orderId),
     };
 
     const encodedData = Buffer.from(
@@ -379,7 +381,7 @@ router.post('/crypto', checkoutLimiter, async (req, res) => {
     // 🩹 v2.1 — 12 عمود = 10 placeholders + 2 حروف ('pending', 'Crypto') — محسوب بالحرف
     const orderResult = await pool.query(
       `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id)
-       VALUES ($1, $2, $3, $4, $5, 'pending', 'Crypto', $6, $7, $8, $9, $10) RETURNING id`,
+       VALUES ($1, $2, $3, $4, $5, 'pending', 'Crypto', $6, $7, $8, $9, $10) RETURNING id, order_numbe`,
       [
         hasCustomerDetails ? String(customerName).trim().slice(0, 150) : 'Pending Crypto',  // $1
         String(customerPhone || '').trim().slice(0, 30) || null,                            // $2
@@ -394,6 +396,7 @@ router.post('/crypto', checkoutLimiter, async (req, res) => {
       ]
     );
     const orderId = orderResult.rows[0].id;
+    const orderNumber = orderResult.rows[0].order_number;
 
     for (const item of secureItems) {
       await pool.query(
@@ -406,7 +409,7 @@ router.post('/crypto', checkoutLimiter, async (req, res) => {
       price_amount: chargeTotal,
       price_currency: 'usd',
       order_id: orderId.toString(),
-      order_description: `Laclarc Order #${orderId}`,
+      order_description: `Laclarc Order ${orderNumber || '#' + orderId}`,
       ipn_callback_url: `${process.env.BACKEND_URL}/api/payment/crypto/callback`,
       success_url: `${process.env.FRONTEND_URL}/success?method=crypto&order_id=${orderId}`,
       cancel_url: `${process.env.FRONTEND_URL}/cart`,
@@ -422,7 +425,7 @@ router.post('/crypto', checkoutLimiter, async (req, res) => {
       await pool.query("UPDATE orders SET receipt_url = $1 WHERE id = $2", [response.data.id.toString(), orderId]);
     }
 
-    res.json({ url: response.data.invoice_url });
+    res.json({ url: response.data.invoice_url, orderNumber });
   } catch (error) {
     // 🩹 FIX — قنّع الخطأ (كان يسرّب تفاصيل NowPayments للعميل)
     console.error('🔍 [Crypto-DEBUG] full error:', JSON.stringify({

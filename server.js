@@ -2267,8 +2267,9 @@ app.get('/api/orders/track/:identifier', trackLimiter, async (req, res) => {
     }
 
     // 🆕 v1.1 — identifier = orderId فقط (ماشي إيميل) + email match إجباري
+    // 🩹 ON1 — backward-compat: يقبل order_number الجديد (LC-...) ولا id القديم
     queryStr = `SELECT ${SAFE_COLUMNS} FROM orders
-                WHERE id::text = $1 AND customer_email ILIKE $2
+                WHERE (order_number = $1 OR id::text = $1) AND customer_email ILIKE $2
                 ORDER BY id DESC`;
     params = [identifier, normalizeEmail(email)];
 
