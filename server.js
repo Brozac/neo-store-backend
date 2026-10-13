@@ -2258,32 +2258,28 @@ app.get('/api/orders/track/:identifier', trackLimiter, async (req, res) => {
     const { identifier } = req.params;
     const { email } = req.query;
 
-    // 🛡️ الأعمدة الآمنة فقط — لا shipping_address، لا phone، لا session_id، لا exchange_token
-    const SAFE_COLUMNS = `id, status, total_amount, created_at, tracking_number, payment_method, customer_name`;
+    // 🛡️ v1.1 — الأعمدة الآمنة فقط + email إجباري (IDOR مقفول)
+    const SAFE_COLUMNS = 'id, status, total_amount, created_at, tracking_number, payment_method, customer_name';
 
-    let queryStr = '';
-    let params = [];
-
-    if (email) {
-      queryStr = `SELECT ${SAFE_COLUMNS} FROM orders
-                  WHERE (id::text = $1 OR customer_email ILIKE $2) AND customer_email ILIKE $2
-                  ORDER BY id DESC`;
-      params = [identifier, normalizeEmail(email)];
-    } else if (identifier.includes('@')) {
-      queryStr = `SELECT ${SAFE_COLUMNS} FROM orders
-                  WHERE customer_email ILIKE $1
-                  ORDER BY id DESC`;
-      params = [normalizeEmail(identifier)];
-    } else {
-      return res.status(400).json({ error: 'Email is required to track an order by ID.' });
+    // 🆕 v1.1 — الإيميل إجباري دائماً — لا lookup بالإيميل وحده
+    if (!email || !String(email).includes('@')) {
+      return res.status(400).json({ error: 'Email is required for shipment verification' });
     }
 
+    // 🆕 v1.1 — identifier = orderId فقط (ماشي إيميل) + email match إجباري
+    queryStr = `SELECT ${SAFE_COLUMNS} FROM orders
+                WHERE id::text = $1 AND customer_email ILIKE $2
+                ORDER BY id DESC`;
+    params = [identifier, normalizeEmail(email)];
+
     const result = await pool.query(queryStr, params);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'No orders found' });
-    res.json(result.rows.map(o => ({ ...o, status_label: getStatusLabel(o.status) })));
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'No orders found matching this Order ID and Email combination.' });
+    }
+    res.json(result.rows);
   } catch (err) {
-      logger.logError('Route Handler', err);
-    res.status(500).json({ error: 'Server error' });
+    logger.logError('Track Orders', err);
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
