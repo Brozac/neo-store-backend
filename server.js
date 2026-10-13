@@ -2259,7 +2259,8 @@ app.get('/api/orders/track/:identifier', trackLimiter, async (req, res) => {
     const { email } = req.query;
 
     // 🛡️ v1.1 — الأعمدة الآمنة فقط + email إجباري (IDOR مقفول)
-    const SAFE_COLUMNS = 'id, status, total_amount, created_at, tracking_number, payment_method, customer_name';
+    // 🩹 v1.1 — shipping_address مضاف (مؤمن بالـ email matching — المالك فقط يشوف عنوانو)
+    const SAFE_COLUMNS = 'id, status, total_amount, created_at, tracking_number, payment_method, customer_name, shipping_address';
 
     // 🆕 v1.1 — الإيميل إجباري دائماً — لا lookup بالإيميل وحده
     if (!email || !String(email).includes('@')) {
