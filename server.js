@@ -384,6 +384,44 @@ const upload = multer({ storage: storage, limits: { fileSize: 5 * 1024 * 1024 } 
 // ==========================================
 // مسارات الأدمن غير المحمية (Login / Logout فقط)
 // ==========================================
+// ═══ 🔐 SOCIAL LOGIN (Google OAuth) — identity موثقة من Google، JWT تاع laclarc ═══
+app.post('/api/auth/social', authLimiter, async (req, res) => {
+  try {
+    const { email, name, provider } = req.body;
+    if (!email || !provider) return res.status(400).json({ error: 'email and provider required' });
+    if (!['google'].includes(provider)) return res.status(400).json({ error: 'Unsupported provider' });
+
+    const cleanEmail = normalizeEmail(email);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    // موجود؟ → login · جديد → register (provider موثق الإيميل أصلاً — بلا password)
+    let userRes = await pool.query('SELECT id, name, email FROM users WHERE email = $1', [cleanEmail]);
+    let user;
+
+    if (userRes.rows.length > 0) {
+      user = userRes.rows[0];
+      console.log(`🔐 [Social] login via ${provider}: ${cleanEmail}`);
+    } else {
+      const insert = await pool.query(
+        `INSERT INTO users (name, email, password_hash, provider) VALUES ($1, $2, NULL, $3) RETURNING id, name, email`,
+        [String(name || cleanEmail.split('@')[0]).slice(0, 100), cleanEmail, provider]
+      );
+      user = insert.rows[0];
+      console.log(`🆕 [Social] registered via ${provider}: ${cleanEmail}`);
+      await auditEvent('SOCIAL_REGISTER', user.id, { provider, email: cleanEmail }, 'info').catch(()=>{});
+    }
+
+    // JWT نفس النظام — session bridging مكتمال
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
+  } catch (e) {
+    logger.logError('Social Auth', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.post('/api/admin/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
