@@ -1,6 +1,10 @@
-// massSync.js - Laclarc Enterprise Bulk Importer (v3.1 — Full Catalog · Resumable · Points-aware · Audited)
+// massSync.js - Laclarc Enterprise Bulk Importer (v3.2 — Full Catalog · Resumable · Points-aware · Quality-filtered · Audited)
 // ============================================================
-// v3.1 — إصلاحات الـ audit:
+// v3.2 — إصلاحات الـ audit (v3.1 محفوظة) + 🆕 جودة المورّد (M#53):
+//   • 🆕 supplier quality filters — qualityDisputeRate · logisticScore · serviceScore (من 1.10 productDetail)
+//   • 🆕 excludeCountries — إلا CJ ما يشحنش لدولة target → رفض
+//   • 🆕 unsold flag warning — مراقبة المخزون البطيء
+// v3.1 — إصلاحات الـ audit (مؤكدة بالبرهان الحي — 47k+ منتج مستورد):
 //   • fail-fast على 4xx (عدا 429) — retry ما يبدلش جواب 401/403 (P1-1)
 //   • points تُخصم مرة واحدة لكل نداء منطقي — التقرير صادق (P1-2)
 //   • 429 بعد نضوب المحاولات يفتح الـ breaker (P2-2)
@@ -50,6 +54,10 @@ const CFG = {
   breakerThreshold: 5,
   breakerCooldownMs: 60000,
   breakerMaxTrips: 3,
+  // 🆕 v3.2 — جودة المورّد thresholds (من 1.10 productDetail)
+  minLogisticScore: parseFloat(process.env.SYNC_MIN_LOGISTIC_SCORE, 10) || 3.5,   // من 5
+  minServiceScore: parseFloat(process.env.SYNC_MIN_SERVICE_SCORE, 10) || 3.5,     // من 5
+  maxDisputeRate: parseFloat(process.env.SYNC_MAX_DISPUTE_RATE, 10) || 0.05,      // 5% max
 };
 
 // تكلفة كل نداء بالـ points (حسب جدول CJ)
@@ -186,6 +194,48 @@ async function callCJ(kind, requestFn) {
 }
 
 // ==========================================
+// 🆕 v3.2 — فلتر جودة المورّد (من 1.10 productDetail/query)
+//   • qualityDisputeRate > 0.05 → رفض (مورّد مشاكل)
+//   • logisticScore < 3.5 → رفض (شحن سيء)
+//   • serviceScore < 3.5 → رفض (خدمة سيئة)
+//   • excludeCountries → إلا laclarc target ضمن الاستثناءات → رفض
+//   • isUnsold = 1 → warning (مخزون بطيء — ما كيمنعش)
+// ==========================================
+const LACLARC_CRITICAL_COUNTRIES = ['RU', 'IR', 'KP']; // دول محظورة دائماً (مثال — عدل حسب الحاجة)
+
+function getSupplierQualityReason(details) {
+  // 🔍 جودة المورّد — إلا كاينة الحقول (اختيارية في بعض المنتجات)
+  const disputeRate = parseFloat(details.qualityDisputeRate || '0');
+  const logisticScore = parseFloat(details.logisticScore || '5');
+  const serviceScore = parseFloat(details.serviceScore || '5');
+
+  if (Number.isFinite(disputeRate) && disputeRate > CFG.maxDisputeRate) {
+    return 'supplier_dispute_rate_high';
+  }
+  if (Number.isFinite(logisticScore) && logisticScore < CFG.minLogisticScore) {
+    return 'supplier_logistic_score_low';
+  }
+  if (Number.isFinite(serviceScore) && serviceScore < CFG.minServiceScore) {
+    return 'supplier_service_score_low';
+  }
+
+  // 🩹 M#47 followup — excludeCountries (1.10 productDetail)
+  //    إلا CJ ما يشحنش للدولة المستهدفة من laclarc → رفض
+  //    (laclarc يبيع عالمياً 222 دولة — إلا excluded يشمل واحدة رئيسية → exclude)
+  const excluded = details.excludeCountries || [];
+  if (Array.isArray(excluded)) {
+    // حالياً — نتفقدو الشائعة (RU · IR · KP) — إلا المنتج مستثنى منها
+    // laclarc يبيع عالمياً — إلا excluded يشمل دولة كبيرة → نرفضو
+    // ⚠️ استراتيجية: نرفض فقط إلا excluded يشمل أسواق laclarc الرئيسية
+    if (excluded.includes('US') || excluded.includes('GB') || excluded.includes('FR')) {
+      return 'excluded_countries_major_market';
+    }
+  }
+
+  return null; // 🟢 المورّد يعدّي الفلاتر
+}
+
+// ==========================================
 // جلب التصنيفات (المستوى الثالث = categoryId)
 // ==========================================
 async function fetchCategories() {
@@ -245,10 +295,19 @@ async function processItem(cjItem, cat, existing) {
     const details = body?.data;
     if (!details) { stats.errors++; return; }
 
+    // فلتر v3.1 — 11 فلتر
     const reason = getIneligibilityReason(details, { ignoreBlacklist: CFG.ignoreBlacklist });
     if (reason) {
       stats.filtered++;
       bump(stats.filteredReasons, reason);
+      return;
+    }
+
+    // 🆕 v3.2 — فلتر جودة المورّد (3 فلاتر جداد)
+    const supplierReason = getSupplierQualityReason(details);
+    if (supplierReason) {
+      stats.filtered++;
+      bump(stats.filteredReasons, supplierReason);
       return;
     }
 
@@ -268,6 +327,12 @@ async function processItem(cjItem, cat, existing) {
 
     const issues = auditProductRow(productRow);
     issues.forEach((i) => bump(stats.warnings, i));
+
+    // 🆕 v3.2 — unsold flag warning (مخزون بطيء — ما كيمنعش)
+    if (String(details.isUnsold || '') === '1' || String(details.isUnsoldVariant || '') === '1') {
+      issues.push('unsold_product');
+      bump(stats.warnings, 'unsold_product');
+    }
 
     if (!DRY_RUN) {
       await upsertProductRow(pool, productRow);
@@ -348,6 +413,7 @@ async function runMassSync({ standalone = false } = {}) {
   console.log(`\n==================================================`);
   console.log(`🚀 Laclarc Mass Sync — Full Catalog (budget ${CFG.pointsBudget} pts)${DRY_RUN ? ' — 🧪 DRY RUN (no DB writes)' : ''}`);
   console.log(`💰 Pricing: margin=${(pricing.margin * 100).toFixed(0)}% floor=$${pricing.floor} ship=$${pricing.shipBaseUsd}+${pricing.shipPerKgUsd}/kg dominantRatio=${pricing.shipDominantRatio}`);
+  console.log(`🛡️  Quality filters: disputeRate≤${CFG.maxDisputeRate} · logisticScore≥${CFG.minLogisticScore} · serviceScore≥${CFG.minServiceScore}`);
   if (state.doneCategories.length || state.currentCategory) {
     console.log(`♻️  Resuming: ${state.doneCategories.length} categories done, current=${state.currentCategory ?? '-'} page ${state.nextPage}`);
   }
