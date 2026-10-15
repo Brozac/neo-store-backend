@@ -1,10 +1,82 @@
+# ═══════════════════════════════════════════════════════
+# Laclarc — .gitattributes v1.1
+# المبدأ: LF في الـ repo · CRLF في الـ Windows working dir (للـ .bat/.ps1)
+# ═══════════════════════════════════════════════════════
+
+# ─── Normalization العام ───
 * text=auto eol=lf
+
+# ─── Windows scripts — CRLF في working dir (cmd/PowerShell يتطلبوه) ───
 *.bat text eol=crlf
+*.cmd text eol=crlf
 *.ps1 text eol=crlf
+*.psm1 text eol=crlf
+
+# ─── Shell scripts — LF صارم (bash يكسر بـ CRLF! 🩹 درس Git Bash) ───
+*.sh text eol=lf
+*.bash text eol=lf
+
+# ─── Python — LF (نفس درس sed/python) ───
+*.py text eol=lf
+
+# ─── SQL — LF ───
+*.sql text eol=lf
+
+# ─── Config / Data — LF ───
+*.json text
+*.yml text
+*.yaml text
+*.toml text
+*.env text
+*.env.* text
+*.md text
+*.txt text
+*.xml text
+*.html text
+*.css text
+*.scss text
+*.js text
+*.ts text
+*.tsx text
+*.jsx text
+
+# ─── Binary — لا normalization أبداً (تلف الملفات) ───
 *.png binary
 *.jpg binary
 *.jpeg binary
+*.gif binary
+*.webp binary
+*.avif binary
 *.ico binary
+*.icns binary
 *.pdf binary
 *.woff binary
 *.woff2 binary
+*.ttf binary
+*.eot binary
+*.otf binary
+*.mp4 binary
+*.mp3 binary
+*.webm binary
+*.wav binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.rar binary
+*.7z binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.wasm binary
+
+# ─── Diff settings (تحسين العرض) ───
+*.json diff
+*.md diff=markdown
+
+# ─── Security — خلي scripts غير executable من git (chmod يُدار محلياً) ───
+*.sh -whitespace
+
+# ─── Export ignore (git archive — لا يضمّن الـ tests) ───
+export-ignore
+tests/ export-ignore
