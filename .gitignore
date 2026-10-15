@@ -1,16 +1,41 @@
 # ═══════════════════════════════════════════════════════
 # Laclarc Backend — .gitignore
 # المبدأ: السرّ لا يعيش في Git — Render env فقط
+# المبدأ 36: كل ما يُولّد آلياً أو محلياً = لا يدخل الـ repo
 # ═══════════════════════════════════════════════════════
 
 # ─── 🔐 P0: Environment — السرّ الحقيقي ───
 .env
 .env.*
 .env.local
+.env.production
+.env.development
+.env.test
 !.env.example
+.env.oauth_template
+
+# ─── 🔐 Security keys / secrets (حتى باسم مختلف) ───
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+secrets.json
+secrets*.json
+credentials*.json
+serviceAccountKey*.json
 
 # ─── Dependencies ───
 node_modules/
+package-lock.json.bak
+
+# ─── 🗺️ Checkpoints — runtime state (massSync · massTargeted) ───
+massSync.state.json
+massSync.state.json.tmp
+massTargeted.state.json
+massTargeted.state.json.tmp
+*.state.json
+*.state.json.tmp
 
 # ─── Logs ───
 logs/
@@ -35,32 +60,68 @@ check_*.js
 prep_*.js
 show_*.js
 stop_*.js
+category_report*.js
+probe_*.js
+*_probe.js
 
-# ─── Backups ───
+# ─── Backups (laclarc v9+ — جراحة المحتوى) ───
 *.bak
 *.bak2
+*.bak-*
 *~
+*.bak_*
+*.bak-*
+*.orig
 
 # ─── Temp / Cache ───
 tmp/
 temp/
 .cache/
+*.tmp
+*.swp
+*.swo
+.cache
+
+# ─── Reports (local diagnostics) ───
+*report*.json
+*report*.txt
+*report*.log
 
 # ─── Coverage / Test artifacts ───
 coverage/
 .nyc_output/
 
+# ─── Databases local (لا SQLite محلي) ───
+*.sqlite
+*.sqlite3
+*.db
+
 # ─── OS junk ───
 .DS_Store
 Thumbs.db
 desktop.ini
+desktop.ini.*
 
 # ─── Editors ───
 .idea/
 .vscode/
+*.swp
+*.swo
+*.swn
+.vs/
 
 # ─── Node internals ───
 .npm/
-.node_repl_history*.bak-xchg
-*.bak-xchg
-*.bak-xchg
+.node_repl_history
+.node_repl_history.*
+.eslintcache
+
+# ─── TypeScript build artifacts ───
+dist/
+build/
+*.tsbuildinfo
+
+# ─── Uploads (ephemeral — Render disk) ───
+uploads/
+uploads/*
+!uploads/.gitkeep
