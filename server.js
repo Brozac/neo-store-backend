@@ -1762,8 +1762,9 @@ app.get('/api/products', async (req, res) => {
     }
 
     if (category !== 'All') {
-      query += ` AND category ILIKE $${paramIndex}`;
-      params.push(`${category}%`);
+      // 🩹 v1.1 — matching صارم: exact + prefix فقط (لا خلط بين الفئات المتشابهة)
+      query += ` AND (category = $${paramIndex} OR category LIKE $${paramIndex} || '/%')`;
+      params.push(category);
       paramIndex++;
     }
 
