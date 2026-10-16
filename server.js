@@ -1,5 +1,10 @@
 // server.js — Laclarc Enterprise Dropshipping Engine (hardened)
 // Full audit applied 2026-10-02 (findings #1–#28 across session)
+// 🩹 HOTFIX v2.0.1 — تهريب wildcards ديال LIKE/ILIKE (% _ \) — PostgreSQL كيستعمل \ كـ escape افتراضي
+function escapeLikeSafe(s) {
+  return String(s).replace(/[\\%_]/g, '\\$&');
+}
+
 require('dotenv').config();
 
 const express = require('express');
