@@ -1680,9 +1680,9 @@ app.get('/api/products', async (req, res) => {
       res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400');
       return res.json({ page: minimalPage, chunkSize: CHUNK, count: rows.length, total: totalRows[0].total, products: rows });
     }
-        // 🆕 pagination mode — /all-products infinite scroll (24/شوط)
+
+    // 🆕 pagination mode — /all-products infinite scroll (24/شوط)
     // مقصود: بلا productsCache — الكاش للهوم فقط، هادا استعلام خفيف مباشر
-  
     if (req.query.page) {
       const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
       const PER = 24;
@@ -1694,7 +1694,7 @@ app.get('/api/products', async (req, res) => {
           `SELECT id, title, price, original_price, image_url, category, video_url
            FROM products WHERE stock_status = true AND category ILIKE $1
            ORDER BY sort_order ASC, id DESC LIMIT $2 OFFSET $3`,
-          [`${cat}%`, PER, (pageNum - 1) * PER]
+          [`${escapeLikeSafe(cat)}%`, PER, (pageNum - 1) * PER]  // 🩹 FIX-LIKE
         );
         res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
         return res.json(rows);
@@ -1702,10 +1702,13 @@ app.get('/api/products', async (req, res) => {
 
       // 🆕 Temu-mosaic: homepage feed متنوع من جميع الفئات — deterministic hash shuffle
       // (بلا random(): الـ pagination كتبقى متسقة، صفحة N ما كتكررش N-1)
+      // 🩹 FIX-TIE — `, id DESC` tiebreaker: نظرياً md5 collision غير مستحيل رياضياً — الباب تسدّ
+      // 📌 تكلفة موثقة: hash+sort كامل فوق الجدول في كل cache miss — البديل المستقبلي:
+      //    عمود shuffle bucket يُحفظ عند massSync (يقتل الحساب الكامل)
       const { rows } = await pool.query(
         `SELECT id, title, price, original_price, image_url, category, video_url
          FROM products WHERE stock_status = true
-         ORDER BY md5(category || id::text)
+         ORDER BY md5(category || id::text), id DESC
          LIMIT $1 OFFSET $2`,
         [PER, (pageNum - 1) * PER]
       );
@@ -1717,7 +1720,7 @@ app.get('/api/products', async (req, res) => {
     if (req.query.count === '1') {
       const cat = (req.query.category || '').trim();
       const sql = cat && cat !== 'All'
-        ? ['SELECT COUNT(*)::int AS n FROM products WHERE stock_status = true AND category ILIKE $1', [`${cat}%`]]
+        ? ['SELECT COUNT(*)::int AS n FROM products WHERE stock_status = true AND category ILIKE $1', [`${escapeLikeSafe(cat)}%`]]  // 🩹 FIX-LIKE
         : ['SELECT COUNT(*)::int AS n FROM products WHERE stock_status = true', []];
       const { rows } = await pool.query(sql[0], sql[1]);
       return res.json({ count: rows[0].n });
@@ -1757,23 +1760,27 @@ app.get('/api/products', async (req, res) => {
 
     if (search) {
       query += ` AND (title ILIKE $${paramIndex} OR description ILIKE $${paramIndex})`;
-      params.push(`%${search}%`);
+      params.push(`%${escapeLikeSafe(search)}%`);  // 🩹 FIX-LIKE — wildcards مقفولة
       paramIndex++;
     }
 
     if (category !== 'All') {
       // 🩹 v1.1 — matching صارم: exact + prefix فقط (لا خلط بين الفئات المتشابهة)
+      // 📌 ملاحظة موثقة: page-mode فوق يستعمل `cat%` (prefix واسع) وهذا الفرع صارم —
+      //    دلالتان مختلفتان لنفس الحقل (مقصودتان اليوم — توحيد محتمل في backlog)
       query += ` AND (category = $${paramIndex} OR category LIKE $${paramIndex} || '/%')`;
-      params.push(category);
+      params.push(escapeLikeSafe(category));  // 🩹 FIX-LIKE — يحمي نصف الـ LIKE (exact ما يتأثرش عملياً)
       paramIndex++;
     }
 
     query += ` ORDER BY sort_order ASC, id DESC LIMIT 200`;
-    
+
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
+    // 🩹 FIX-ERRCACHE — الخطأ ما يرثش public cache من الأعلى
     console.error('❌ Error fetching products:', err);
+    res.set('Cache-Control', 'no-store');
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -1781,9 +1788,10 @@ app.get('/api/products', async (req, res) => {
 // ═══ 🆕 Favorites by-ids — N+1 kill: الصفحة كيطلب غير المفضلة (KB بدل الكاتالوغ كامل) ═══
 app.get('/api/products/by-ids', async (req, res) => {
   try {
+    // 🩹 FIX-IDS-BOUND — حدّ int32: id أكبر من 2147483647 كان يفجّر cast $1::int[] → 500
     const ids = String(req.query.ids || '')
       .split(',').map(s => parseInt(s, 10))
-      .filter(n => Number.isInteger(n) && n > 0).slice(0, 100);
+      .filter(n => Number.isInteger(n) && n > 0 && n <= 2147483647).slice(0, 100);
     if (ids.length === 0) return res.json([]);
     const { rows } = await pool.query(
       `SELECT id, title, price, original_price, image_url, category, video_url
@@ -1797,6 +1805,7 @@ app.get('/api/products/by-ids', async (req, res) => {
     res.json(rows);
   } catch (err) {
     console.error('❌ /api/products/by-ids:', err.message);
+    res.set('Cache-Control', 'no-store');  // 🩹 FIX-ERRCACHE
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -1804,9 +1813,13 @@ app.get('/api/products/by-ids', async (req, res) => {
 app.get('/api/products/deals', async (req, res) => {
   try {
     const result = await pool.query("SELECT id, title, price, original_price, image_url FROM products WHERE stock_status = true AND is_sourced = true ORDER BY id DESC LIMIT 10");
+    // 🩹 FIX-DEALSCACHE — كان بلا كاش: كل زائر deals = ضربة DB
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
     res.json(result.rows);
   } catch (err) {
-      logger.logError('Route Handler', err);
+    // 🩹 FIX-DEALS-LOG — stdout هو اللي يوصل لـ log drain (Render disk = ephemeral)
+    console.error('❌ /api/products/deals:', err);
+    res.set('Cache-Control', 'no-store');  // 🩹 FIX-ERRCACHE
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1817,16 +1830,35 @@ app.get('/api/products/deals', async (req, res) => {
 // التفعيل لاحقاً = I18N_ENABLED=true + إنشاء الجدولين — بلا نشر كود جديد.
 const I18N_ENABLED = process.env.I18N_ENABLED === 'true';
 
+// ⚠️ FIX-SHADOW — عقد ترتيب التسجيل (حرِس عليه أي refactor):
+//    /api/products/by-ids و /api/products/deals لازم يبقاو مسجلين *فوق* هذا المسار —
+//    وإلا ':id' ياكلهم بصمت (':id' = 'by-ids'). الترتيب الحالي صحيح — هذا التعليق حارسه.
 app.get('/api/products/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
+    // 🩹 FIX-ID-404 — حارس رقمي: 'abc' كان يعدي لـ PostgreSQL → invalid input → 500.
+    //    الآن: JSON 404 نظيف (الواجهة تعرض صفحة المنتج غير موجود بدل صفحة خطأ)
+    const pid = parseInt(id, 10);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    const result = await pool.query('SELECT * FROM products WHERE id = $1', [pid]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
 
     let product = result.rows[0];
     if (product.images && typeof product.images === 'string') {
-      try { product.images = JSON.parse(product.images); } catch (e) {}
+      try { product.images = JSON.parse(product.images); } catch (e) {
+        // 🩹 FIX-SILENT — Tenet: catch بلا صوت ممنوع
+        console.warn(`⚠️ [product] images JSON parse failed for #${pid} — serving raw string`);
+      }
     }
+
+    // 🩹 FIX-IDCACHE — صفحة الفلوس كانت الضربة الأكبر: كل مشاهدة منتج = استعلام SELECT *
+    // 60s طازج + 300s stale — نفس عقد طلاقة الفيد (massSync يصل ≤60s)
+    // ⚠️ I18N-TRAP — كي تفعّل I18N_ENABLED: زيد res.set('Vary', 'cf-ipcountry') هنا
+    //    وإلا الكاش يخدم لغة بلد لبلد أخرى
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
 
     const visitorCountry = (req.headers['cf-ipcountry'] || '').toUpperCase();
     const targetLang = getLangFromCountry(visitorCountry);
@@ -1845,6 +1877,8 @@ app.get('/api/products/:id', async (req, res) => {
     }
     res.json(product);
   } catch (err) {
+    console.error('❌ /api/products/:id:', err);
+    res.set('Cache-Control', 'no-store');  // 🩹 FIX-ERRCACHE
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -1852,7 +1886,13 @@ app.get('/api/products/:id', async (req, res) => {
 app.get('/api/products/:id/related', async (req, res) => {
   try {
     const { id } = req.params;
-    const productRes = await pool.query('SELECT category FROM products WHERE id = $1', [id]);
+    // 🩹 FIX-ID-404 — نفس الحارس (نفس فئة الـ 500)
+    const pid = parseInt(id, 10);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    const productRes = await pool.query('SELECT category FROM products WHERE id = $1', [pid]);
     if (productRes.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
 
     const category = productRes.rows[0].category;
@@ -1861,12 +1901,12 @@ app.get('/api/products/:id/related', async (req, res) => {
     let relatedRes = await pool.query(
       `SELECT id, title, price, image_url, category FROM products
        WHERE id != $1 AND category = $2 AND stock_status = true
-       ORDER BY id DESC LIMIT 4`, [id, category]
+       ORDER BY id DESC LIMIT 4`, [pid, category]
     );
 
     if (relatedRes.rows.length < 4 && baseCategory) {
       const existingIds = relatedRes.rows.map(r => r.id);
-      existingIds.push(parseInt(id));
+      existingIds.push(pid);
       const moreRes = await pool.query(
         `SELECT id, title, price, image_url, category FROM products
          WHERE id != ALL($1::int[]) AND category ILIKE $2 AND stock_status = true
@@ -1877,7 +1917,9 @@ app.get('/api/products/:id/related', async (req, res) => {
 
     if (relatedRes.rows.length < 4) {
       const existingIds = relatedRes.rows.map(r => r.id);
-      existingIds.push(parseInt(id));
+      existingIds.push(pid);
+      // 📌 تكلفة موثقة: random() = scan+sort كامل — مسار نادر (فئة فيها <4 منتجات متوفرة)
+      //    backlog: TABLESAMPLE أو اختيار من نطاق id عشوائي
       const randomRes = await pool.query(
         `SELECT id, title, price, image_url, category FROM products
          WHERE id != ALL($1::int[]) AND stock_status = true
@@ -1886,11 +1928,16 @@ app.get('/api/products/:id/related', async (req, res) => {
       relatedRes.rows = [...relatedRes.rows, ...randomRes.rows];
     }
 
+    // 🩹 FIX-RELCACHE — المرتبطون ثابتون نسبياً → كاش CDN
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
     res.json(relatedRes.rows);
   } catch (err) {
+    console.error('❌ /api/products/:id/related:', err);
+    res.set('Cache-Control', 'no-store');  // 🩹 FIX-ERRCACHE
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+
 
 app.put('/api/admin/toggle-deal/:id', async (req, res) => {
   try {
