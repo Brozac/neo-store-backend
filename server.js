@@ -1939,6 +1939,7 @@ app.get('/api/products/:id/related', async (req, res) => {
 });
 
 
+
 app.put('/api/admin/toggle-deal/:id', async (req, res) => {
   try {
     const { id } = req.params;
