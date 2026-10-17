@@ -72,7 +72,7 @@ probe_*.js
 *.bak_*
 *.bak-*
 *.orig
-
+*.bak-*
 # ─── Temp / Cache ───
 tmp/
 temp/

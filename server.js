@@ -80,6 +80,18 @@ if (Sentry.Handlers && typeof Sentry.Handlers.requestHandler === 'function') {
   app.use(Sentry.Handlers.requestHandler());     // v7 فقط — آمن: كيرجع function
 }
 // ──── [/LACLARC::SENTRY-REQ] ────
+
+// ──── [LACLARC::SENTRY-TEST] v1 (Task 16) ────
+// 🔬 marker endpoint — البرهان الحي (منهجية Task 14-c):
+//    curl "https://<host>/__sentry_test?go=1"  →  الحدث فـ dashboard ≤60s
+app.get('/__sentry_test', (req, res) => {
+  if (req.query.go === '1') {
+    Sentry.captureMessage('LACLARC-SENTRY-OK :: test event from ' + (req.ip || 'unknown'), 'info');
+    return res.json({ ok: true, marker: 'LACLARC-SENTRY-OK', note: 'Check your Sentry dashboard within ~60 seconds' });
+  }
+  return res.json({ ok: true, marker: 'LACLARC-SENTRY-OK', hint: 'add ?go=1 to fire a test event' });
+});
+// ──── [/LACLARC::SENTRY-TEST] ────
 const cookieParser = require('cookie-parser');
 app.set('trust proxy', 1);
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
@@ -4247,18 +4259,6 @@ const handleShutdown = async (signal) => {
 
 process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 process.on('SIGINT', () => handleShutdown('SIGINT'));
-
-// ──── [LACLARC::SENTRY-TEST] v1 (Task 16) ────
-// 🔬 marker endpoint — البرهان الحي (منهجية Task 14-c):
-//    curl "https://<host>/__sentry_test?go=1"  →  الحدث فـ dashboard ≤60s
-app.get('/__sentry_test', (req, res) => {
-  if (req.query.go === '1') {
-    Sentry.captureMessage('LACLARC-SENTRY-OK :: test event from ' + (req.ip || 'unknown'), 'info');
-    return res.json({ ok: true, marker: 'LACLARC-SENTRY-OK', note: 'Check your Sentry dashboard within ~60 seconds' });
-  }
-  return res.json({ ok: true, marker: 'LACLARC-SENTRY-OK', hint: 'add ?go=1 to fire a test event' });
-});
-// ──── [/LACLARC::SENTRY-TEST] ────
 
 // ──── [LACLARC::SENTRY-ERR] v1 (Task 16) ────
 // errorHandler — AFTER كامل الـ routes، BEFORE أي error middleware آخر.
