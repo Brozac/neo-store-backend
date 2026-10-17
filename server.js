@@ -67,12 +67,17 @@ Sentry.init({
 
 const app = express();
 
-// ──── [LACLARC::SENTRY-REQ] v1 (Task 16) ────
-// request context — خاصو يكون أول middleware. Runtime-guarded: خدّام v7 و v8 بجوج.
-if (typeof Sentry.expressIntegration === 'function') {
-  app.use(Sentry.expressIntegration());          // @sentry/node v8+
-} else if (Sentry.Handlers && typeof Sentry.Handlers.requestHandler === 'function') {
-  app.use(Sentry.Handlers.requestHandler());     // v7 fallback
+// ──── [LACLARC::SENTRY-REQ] v2 (Task 16-b hotfix) ────
+// request context — v2: تصحيح باغ الإنتاج (TypeError: app.use() requires a middleware function)
+//   الجذر (مثبت بالـ SDK الحقيقي 10.76.2): expressIntegration() كترجع integration object
+//     { name, setupOnce, getShouldHandleError } ماشي middleware → app.use() كيرمي TypeError
+//   بلاصتها الصحيحة فv8+: Sentry.init({ integrations: [Sentry.expressIntegration()] })
+//   القرار لمرحلة 1 (أخطاء فقط · tracesSampleRate: 0):
+//     · v8+/v10: حتى request middleware ما خاص — setupExpressErrorHandler (بلوك SENTRY-ERR)
+//       + httpIntegration (مفعّل by default) كيكفيان لالتقاط الأخطاء مع سياق الطلب
+//     · v7 فقط: Sentry.Handlers.requestHandler() — كيرجع middleware حقيقي (function)
+if (Sentry.Handlers && typeof Sentry.Handlers.requestHandler === 'function') {
+  app.use(Sentry.Handlers.requestHandler());     // v7 فقط — آمن: كيرجع function
 }
 // ──── [/LACLARC::SENTRY-REQ] ────
 const cookieParser = require('cookie-parser');
