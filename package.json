@@ -13,6 +13,7 @@
   "type": "commonjs",
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
+    "@sentry/node": "^10.0.0",
     "axios": "^1.19.0",
     "bcrypt": "^6.0.0",
     "cheerio": "^1.2.0",

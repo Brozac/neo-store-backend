@@ -44,7 +44,37 @@ const cron = require('node-cron');
 // ✨ Pool واحد مشترك من db.js
 const pool = require('./db');
 
+// ──── [LACLARC::SENTRY-INIT] v1 (Task 16) ────
+// 👁️ Sentry Phase 1 — عيون الموقع (Tenet: 记录即真相 / catch 中禁止沉默).
+//    DSN كيجي من البيئة (Render → SENTRY_DSN). بلا DSN = no-op آمن:
+//    النشر كيمشي قبل ما تضبط المفاتيح — صفر خطأ، تفعيل لحظة ما تزيد الـ var.
+//    ⚠️ هاد البلوك قبل أي route — نفس درس first-line injection (Task 14-c).
+const Sentry = require('@sentry/node');
+
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  environment: process.env.NODE_ENV || 'production',
+  release: 'laclarc-server@' + (process.env.RENDER_GIT_COMMIT || 'dev'),
+  tracesSampleRate: 0, // مرحلة 1 = أخطاء فقط (مجاني 5K/شهر)
+  beforeSend(event) {
+    // Privacy scrub — معطيات المستخدمين ما كتمشيش لـ Sentry
+    if (event.user) delete event.user;
+    if (event.request) { delete event.request.cookies; delete event.request.headers; }
+    return event;
+  },
+});
+// ──── [/LACLARC::SENTRY-INIT] ────
+
 const app = express();
+
+// ──── [LACLARC::SENTRY-REQ] v1 (Task 16) ────
+// request context — خاصو يكون أول middleware. Runtime-guarded: خدّام v7 و v8 بجوج.
+if (typeof Sentry.expressIntegration === 'function') {
+  app.use(Sentry.expressIntegration());          // @sentry/node v8+
+} else if (Sentry.Handlers && typeof Sentry.Handlers.requestHandler === 'function') {
+  app.use(Sentry.Handlers.requestHandler());     // v7 fallback
+}
+// ──── [/LACLARC::SENTRY-REQ] ────
 const cookieParser = require('cookie-parser');
 app.set('trust proxy', 1);
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
@@ -85,7 +115,7 @@ async function getOrCreateStripeCoupon(couponData) {
       stripeCouponCache.set(key, persisted.rows[0].value);
       return persisted.rows[0].value;
     }
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     console.warn('⚠️ [CouponCache] read failed: ' + e.message);
   }
 
@@ -167,7 +197,7 @@ app.use((req, res, next) => {
     }
     req.user = decoded;
     return next();
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('ADMIN-SURFACE VIOLATION', new Error(`${req.method} ${req.path} — IP: ${req.ip} — invalid token`));
     return res.status(403).json({ error: 'Access Denied: Invalid administrative token' });
   }
@@ -188,7 +218,7 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
   let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Stripe Webhook Signature', err);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
@@ -254,7 +284,7 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
           sendOrderConfirmationEmail(customerEmail, orderId, totalAmount, items)
             .catch(err => logger.logError('Send Email (Background)', err));
         }
-      } catch (dbErr) {
+      } catch (dbErr) { try { Sentry.captureException(dbErr); } catch (__laclarcGuard) {}
         logger.logError('Stripe Webhook DB Update', dbErr);
       }
     })();
@@ -322,7 +352,7 @@ function getOptionalUser(req) {
   if (!token) return null;
   try {
     return jwt.verify(token, JWT_SECRET);
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     return null;
   }
 }
@@ -346,7 +376,7 @@ async function sendEmail({ to, subject, html }) {
     });
     console.log(`📧 Email sent via Brevo to ${to}`);
     return;
-  } catch (brevoErr) {
+  } catch (brevoErr) { try { Sentry.captureException(brevoErr); } catch (__laclarcGuard) {}
     logger.logError('Send Email (Brevo API)', brevoErr.response?.data || brevoErr.message);
   }
 
@@ -363,7 +393,7 @@ async function sendEmail({ to, subject, html }) {
       }
     });
     console.log(`📧 Email sent via Resend (fallback) to ${to}`);
-  } catch (resendErr) {
+  } catch (resendErr) { try { Sentry.captureException(resendErr); } catch (__laclarcGuard) {}
     logger.logError('Send Email (Resend fallback)', resendErr.response?.data || resendErr.message);
   }
 }
@@ -421,7 +451,7 @@ app.post('/api/auth/social', authLimiter, async (req, res) => {
     // JWT نفس النظام — session bridging مكتمال
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('Social Auth', e);
     res.status(500).json({ error: 'Server error' });
   }
@@ -496,12 +526,12 @@ app.post('/api/admin/scrape-product', scraperLimiter, async (req, res) => {
     if (!data.title && data.images.length === 0) throw new Error('Could not extract product data.');
 
     res.json(data);
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     logger.logError('Scrape Product', error);
     res.status(500).json({ error: 'Failed to scrape this URL. Site might be protected or slow.' });
   } finally {
     if (browser) {
-      try { await browser.close(); } catch (e) {}
+      try { await browser.close(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}}
     }
   }
 });
@@ -517,7 +547,7 @@ app.get('/api/currency/detect', async (req, res) => {
     const data = await detectAndConvert(usd, country);
     res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=1800');
     res.json({ ...data, supported: SUPPORTED.map(s => s.code) });
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('currency/detect', e);
     res.json({ currency: 'USD', rate: 1, symbol: '$', localAmount: usd });
   }
@@ -541,7 +571,7 @@ app.get('/api/admin/analytics/ads', requireAdmin, async (req, res) => {
     `);
 
     res.json({ success: true, stats: rows });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Ad Analytics Query Error', err);
     res.status(500).json({ error: 'Failed to fetch ad analytics' });
   }
@@ -568,7 +598,7 @@ app.post('/api/validate-coupon', couponLimiter, async (req, res) => {
       newTotal: total.toFixed(2),
       message: `Coupon applied! You saved $${discount.toFixed(2)}`
     });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -580,7 +610,7 @@ app.post('/api/admin/add-coupon', async (req, res) => {
     if (!code || !discount_value) return res.status(400).json({ error: 'Code and value are required' });
     await pool.query('INSERT INTO coupons (code, discount_type, discount_value) VALUES ($1, $2, $3) ON CONFLICT (code) DO NOTHING', [code.toUpperCase(), discount_type || 'percentage', discount_value]);
     res.status(201).json({ message: 'Coupon added successfully!' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -594,7 +624,7 @@ app.post('/api/admin/add-coupon', async (req, res) => {
        ON CONFLICT (code) DO NOTHING`
     );
     console.log('🎟️ Recovery coupon RECOVER10 ensured (abandoned-cart emails promise it).');
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     console.warn('Recovery coupon seed skipped:', e.message);
   }
 })();
@@ -605,7 +635,7 @@ app.get('/api/reviews/:productId', async (req, res) => {
     // 🩹 FIX — أعمدة محددة (كان SELECT * يخرج user_id الداخلي في رد عام)
     const result = await pool.query('SELECT id, product_id, author, rating, content, country, images, created_at FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [productId]);
     res.json(result.rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -619,7 +649,7 @@ app.post('/api/admin/add-review', async (req, res) => {
     const safeRating = Math.min(5, Math.max(1, Number(rating) || 5));
     await pool.query('INSERT INTO reviews (product_id, author, rating, content, country) VALUES ($1, $2, $3, $4, $5)', [product_id, author, safeRating, content, country || 'United States']);
     res.status(201).json({ message: 'Review added successfully!' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -637,7 +667,7 @@ app.post('/api/admin/webhook/register', async (req, res) => {
     } else {
       res.status(400).json({ error: response.data?.message || 'Registration failed' });
     }
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Webhook Register', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -650,7 +680,7 @@ app.post('/api/admin/webhook/subscribe', async (req, res) => {
     try {
       const result = await subscribeAllStoreProducts();
       console.log(`📌 [Subscribe] انتهى: ${result.success}/${result.total} منتج مشترك (${result.failed} فاشل/متخطى)`);
-    } catch (err) {
+    } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Webhook Subscribe (Background)', err);
     }
   })();
@@ -689,7 +719,7 @@ app.post('/api/reviews/add', authenticateToken, async (req, res) => {
     );
 
     res.status(201).json({ message: 'Verified review with photos added successfully!' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Add Review with Photos Error', err);
     res.status(500).json({ error: 'Server error saving review' });
   }
@@ -702,7 +732,7 @@ app.post('/api/admin/upload', upload.array('images', 10), (req, res) => {
     if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
     const urls = req.files.map(file => file.path);
     res.status(200).json({ urls });
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     res.status(500).json({ error: 'Failed to upload files' });
   }
 });
@@ -712,7 +742,7 @@ app.post('/api/upload', authenticateToken, upload.array('images', 10), (req, res
     if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
     const urls = req.files.map(file => file.path);
     res.status(200).json({ urls });
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     res.status(500).json({ error: 'Failed to upload files' });
   }
 });
@@ -764,7 +794,7 @@ app.post('/api/admin/add-product', async (req, res) => {
 
     clearProductsCache();
     res.status(201).json({ message: 'Product added successfully with v3.1 pricing!', calculatedPrice: safePrice, originalPrice: safeOldPrice });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -776,7 +806,7 @@ app.delete('/api/admin/delete-product/:id', async (req, res) => {
     await pool.query('UPDATE products SET stock_status = false WHERE id = $1', [id]);
     clearProductsCache();
     res.json({ message: 'Product hidden successfully!' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -794,7 +824,7 @@ app.put('/api/admin/reorder-product/:id', async (req, res) => {
     await pool.query('UPDATE products SET sort_order = $1 WHERE id = $2', [newOrder, id]);
     clearProductsCache();
     res.json({ message: 'Order updated successfully' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -808,7 +838,7 @@ app.put('/api/admin/reorder-products', async (req, res) => {
     await Promise.all(updatePromises);
     clearProductsCache();
     res.json({ message: 'Order updated successfully' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -821,7 +851,7 @@ app.get('/api/admin/disputes', async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.get('https://developers.cjdropshipping.com/api2.0/v1/disputes/getDisputeList', { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/admin/disputes/create', async (req, res) => {
@@ -831,7 +861,7 @@ app.post('/api/admin/disputes/create', async (req, res) => {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/disputes/create', payload, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
     if (response.data.code === 200) res.json({ message: 'Dispute created successfully!' });
     else res.status(400).json({ error: response.data.message || 'Failed to create dispute' });
-  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.get('/api/admin/track/:trackNumber', async (req, res) => {
@@ -840,7 +870,7 @@ app.get('/api/admin/track/:trackNumber', async (req, res) => {
     const response = await cjRequest((token) => axios.get(`https://developers.cjdropshipping.com/api2.0/v1/logistic/trackInfo`, { headers: { 'CJ-Access-Token': token }, params: { trackNumber } }));
     if (response.data.code === 200) res.json(response.data.data);
     else res.status(400).json({ error: response.data.message || 'Tracking number not found' });
-  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ==========================================
@@ -858,7 +888,7 @@ app.post('/api/admin/sync-categories', async (req, res) => {
       const result = await syncCategoriesFromCJ();
       categoryTreeCache = null;
       console.log(`🎉 Categories synced! Level 1: ${result.level1Count}, Level 2: ${result.level2Count}, Level 3: ${result.level3Count}.`);
-    } catch (err) {
+    } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Sync Categories (Background)', err);
     }
   })();
@@ -907,14 +937,14 @@ app.get('/api/categories', async (req, res) => {
         }
       };
       attach(Array.isArray(tree) ? tree : tree?.children || []);
-     } catch (e) {
+     } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
       console.warn('categories image enrichment failed:', e.message); // no silent catch
     }
 
     categoryTreeCache = tree;
     categoryTreeCacheTime = Date.now();
     res.json(tree);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -953,12 +983,12 @@ app.post('/api/admin/backfill-categories', async (req, res) => {
 
           await pool.query('UPDATE products SET cj_category_id = $1, category = $2 WHERE id = $3', [cjCategoryId, newCategory, p.id]);
           updatedCount++;
-        } catch (itemErr) { console.warn('⚠️ [Recat] product ' + (p && p.id) + ' failed: ' + itemErr.message); }
+        } catch (itemErr) { try { Sentry.captureException(itemErr); } catch (__laclarcGuard) {} console.warn('⚠️ [Recat] product ' + (p && p.id) + ' failed: ' + itemErr.message); }
       }
 
       clearProductsCache();
       console.log(`🎉 Backfill complete! Updated: ${updatedCount}`);
-    } catch (err) {
+    } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Backfill Categories (Background)', err);
     }
   })();
@@ -978,7 +1008,7 @@ app.get('/api/admin/videos', requireAdmin, async (req, res) => {
         LIMIT 200`
     );
     res.json(rows);
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     console.error('[admin/videos] query failed:', e.message);
     res.status(500).json({ error: 'Failed to load video products' });
   }
@@ -992,7 +1022,7 @@ app.get('/api/admin/settings', requireAdmin, async (req, res) => {
     );
     const v = rows[0]?.value;
     res.json({ show_reels: v === undefined ? true : (v === true || v === 'true') });
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     console.error('[admin/settings GET] failed:', e.message);
     res.status(500).json({ error: 'Failed to load settings' });
   }
@@ -1046,7 +1076,7 @@ async function runCjVideoSync() {
             { ...config, headers: { 'CJ-Access-Token': token }, params })
         );
         cjProducts = listRes.data?.data?.list || [];
-      } catch (listErr) {
+      } catch (listErr) { try { Sentry.captureException(listErr); } catch (__laclarcGuard) {}
         logger.logError(`CJ Video Sync list (${keyword || 'Trending'} p${pageNum})`, listErr);
         continue;
       }
@@ -1082,7 +1112,7 @@ async function runCjVideoSync() {
             importedCount++;
             console.log(`🎥 [Video Sync] ✅ #${importedCount}: ${String(productRow.title).slice(0, 60)}`);
           }
-        } catch (productErr) {
+        } catch (productErr) { try { Sentry.captureException(productErr); } catch (__laclarcGuard) {}
           console.warn(`⚠️ [Video Sync] product failed: ${productErr.message}`); // 🩹 FIX (كان catch فارغ)
         }
       }
@@ -1135,7 +1165,7 @@ app.post('/api/admin/sync-single-product', async (req, res) => {
 
     clearProductsCache();
     res.status(200).json({ message: '✅ Sourced product synced and marked as Lightning Deal successfully!' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     res.status(500).json({ error: 'Server error or CJ API error' });
   }
 });
@@ -1206,7 +1236,7 @@ async function runCjProductSync(keyword) {
         try {
           const videoRes = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/product/queryVideosByProductId', { productId }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
           if (videoRes.data.code === 200 && videoRes.data.data?.length > 0) videoUrl = videoRes.data.data[0].videoUrl;
-        } catch (e) { console.warn('⚠️ [Import] video query failed for ' + productId + ': ' + e.message); }
+        } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} console.warn('⚠️ [Import] video query failed for ' + productId + ': ' + e.message); }
 
         await pool.query(
           `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id, is_sourced)
@@ -1221,7 +1251,7 @@ async function runCjProductSync(keyword) {
         );
 
         importedCount++;
-      } catch (productErr) { console.error('🔴 [Import] product FAILED: ' + productId + ' — ' + productErr.message); } // 🩹 FIX#P2
+      } catch (productErr) { try { Sentry.captureException(productErr); } catch (__laclarcGuard) {} console.error('🔴 [Import] product FAILED: ' + productId + ' — ' + productErr.message); } // 🩹 FIX#P2
     }
   }
 
@@ -1265,7 +1295,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
     });
 
     res.status(201).json({ message: 'User registered successfully! Please check your email to verify your account.' });
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     logger.logError('Register Error', error);
     res.status(500).json({ message: 'Server error' });
   }
@@ -1279,7 +1309,7 @@ app.get('/api/verify-email', async (req, res) => {
     if (decoded.type !== 'verify') return res.status(400).send('Invalid token type.');            // 🩹 FIX#3
     await pool.query('UPDATE users SET is_verified = true WHERE id = $1', [decoded.id]);
     res.send('<h1 style="color:#8B78C6; text-align:center; margin-top:50px;">Email verified successfully! 🎉</h1><p style="text-align:center;">You can now log in to your account.</p>');
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     res.status(400).send('<h1 style="color:red; text-align:center; margin-top:50px;">Invalid or expired link.</h1>');
   }
 });
@@ -1306,7 +1336,7 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
 
     // anti-enumeration: نفس الرد موجود أم لا
     res.json({ message: 'If that email exists in our system, a reset link has been sent.' });
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     logger.logError('Forgot Password', error);
     res.status(500).json({ message: 'Server error' });
   }
@@ -1325,7 +1355,7 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
     const passwordHash = await bcrypt.hash(newPassword, salt);
     await pool.query('UPDATE users SET password_hash = $1, is_verified = true WHERE id = $2', [passwordHash, decoded.id]);
     res.json({ message: 'Password reset successfully! You can now log in.' });
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     res.status(400).json({ message: 'Invalid or expired token.' });
   }
 });
@@ -1344,7 +1374,7 @@ app.post('/api/login', authLimiter, async (req, res) => {
 
     const token = jwt.sign({ id: user.rows[0].id, name: user.rows[0].name }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ message: 'Logged in successfully', token, user: { id: user.rows[0].id, name: user.rows[0].name, email: user.rows[0].email } });
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     logger.logError('Login Error', error);
     res.status(500).json({ message: 'Server error' });
   }
@@ -1356,7 +1386,7 @@ app.get('/api/admin/manual-orders', async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM orders WHERE payment_method = 'BaridiMob' ORDER BY id DESC");
     res.json(result.rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -1429,7 +1459,7 @@ app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
 
         let parsedAddress = {};
         try { parsedAddress = JSON.parse(order.shipping_address); }
-        catch (e) { parsedAddress = { line1: order.shipping_address, country: 'DZ' }; }
+        catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} parsedAddress = { line1: order.shipping_address, country: 'DZ' }; }
 
         const customerDetails = {
           address: parsedAddress,
@@ -1453,11 +1483,11 @@ app.put('/api/admin/manual-orders/approve/:id', async (req, res) => {
           );
           await sendOrderConfirmationEmail(order.customer_email, order.id, order.total_amount, emailItemsRes.rows);
         }
-      } catch (bgErr) {
+      } catch (bgErr) { try { Sentry.captureException(bgErr); } catch (__laclarcGuard) {}
         logger.logError('Approve BaridiMob Order (Background)', bgErr);
       }
     })();
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Approve BaridiMob Order', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -1477,7 +1507,7 @@ app.put('/api/admin/manual-orders/reject/:id', async (req, res) => {
       return res.status(409).json({ error: `Order is '${exists.rows[0].status}' — not rejectable` });
     }
     res.json({ message: 'Order rejected successfully.' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -1529,7 +1559,7 @@ app.put('/api/admin/retry-fulfillment/:id', async (req, res) => {
 
     let parsedAddress = {};
     try { parsedAddress = JSON.parse(order.shipping_address); }
-    catch (e) { parsedAddress = { line1: order.shipping_address, country: 'US' }; }
+    catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} parsedAddress = { line1: order.shipping_address, country: 'US' }; }
 
     res.json({ message: 'Retry launched — شوف اللوج' });
     (async () => {
@@ -1542,9 +1572,9 @@ app.put('/api/admin/retry-fulfillment/:id', async (req, res) => {
         };
         const r = await fulfillCJOrder(order.id, order.customer_name, customerDetails, itemsRes.rows);
         console.log(`🔁 [Retry] #${order.id} ->`, JSON.stringify(r).slice(0, 200));
-      } catch (bgErr) { logger.logError('Retry Fulfillment', bgErr); }
+      } catch (bgErr) { try { Sentry.captureException(bgErr); } catch (__laclarcGuard) {} logger.logError('Retry Fulfillment', bgErr); }
     })();
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Retry Fulfillment Route', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -1575,7 +1605,7 @@ app.get('/api/admin/failed-orders', async (req, res) => {
       ORDER BY o.id DESC
     `);
     res.json(result.rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -1592,7 +1622,7 @@ app.get('/api/search', async (req, res) => {
   try {
     const result = await pool.query("SELECT id, title, price, image_url FROM products WHERE stock_status = true AND (title ILIKE $1 OR description ILIKE $1) ORDER BY id DESC LIMIT 5", [`%${q}%`]);
     res.json(result.rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -1608,7 +1638,7 @@ app.get('/api/admin/search-products', async (req, res) => {
       result = await pool.query("SELECT id, title, price, original_price, image_url, stock_status, category, is_sourced FROM products ORDER BY id DESC LIMIT 30");
     }
     res.json(result.rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -1642,12 +1672,12 @@ app.post('/api/admin/auto-categorize', async (req, res) => {
       for (const c of changes) {
         try {
           await pool.query('UPDATE products SET category = $1 WHERE id = $2', [c.to, c.id]);
-        } catch (e) { console.warn('⚠️ [BgRecat] product ' + (c && c.id) + ' failed: ' + e.message); }
+        } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} console.warn('⚠️ [BgRecat] product ' + (c && c.id) + ' failed: ' + e.message); }
       }
       clearProductsCache();
       console.log(`✅ Finished auto-categorizing ${changes.length} products.`);
     })();
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -1782,7 +1812,7 @@ app.get('/api/products', async (req, res) => {
 
     const result = await pool.query(query, params);
     res.json(result.rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     // 🩹 FIX-ERRCACHE — الخطأ ما يرثش public cache من الأعلى
     console.error('❌ Error fetching products:', err);
     res.set('Cache-Control', 'no-store');
@@ -1808,7 +1838,7 @@ app.get('/api/products/by-ids', async (req, res) => {
     );
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
     res.json(rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ /api/products/by-ids:', err.message);
     res.set('Cache-Control', 'no-store');  // 🩹 FIX-ERRCACHE
     res.status(500).json({ error: 'Internal Server Error' });
@@ -1821,7 +1851,7 @@ app.get('/api/products/deals', async (req, res) => {
     // 🩹 FIX-DEALSCACHE — كان بلا كاش: كل زائر deals = ضربة DB
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
     res.json(result.rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     // 🩹 FIX-DEALS-LOG — stdout هو اللي يوصل لـ log drain (Render disk = ephemeral)
     console.error('❌ /api/products/deals:', err);
     res.set('Cache-Control', 'no-store');  // 🩹 FIX-ERRCACHE
@@ -1853,7 +1883,7 @@ app.get('/api/products/:id', async (req, res) => {
 
     let product = result.rows[0];
     if (product.images && typeof product.images === 'string') {
-      try { product.images = JSON.parse(product.images); } catch (e) {
+      try { product.images = JSON.parse(product.images); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
         // 🩹 FIX-SILENT — Tenet: catch بلا صوت ممنوع
         console.warn(`⚠️ [product] images JSON parse failed for #${pid} — serving raw string`);
       }
@@ -1876,18 +1906,20 @@ app.get('/api/products/:id', async (req, res) => {
           product = { ...product, title: translated.title, description: translated.description };
           res.set('X-Laclarc-Lang', targetLang); // شارة التصحيح
         }
-      } catch (e) {
+      } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
         console.warn(`🌐 [i18n] product #${product.id} translation skipped: ${e.message}`);
       }
     }
     res.json(product);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ /api/products/:id:', err);
     res.set('Cache-Control', 'no-store');  // 🩹 FIX-ERRCACHE
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
+// 🩹 LACLARC::RELATED-UPGRADED v1 (Task 16) — LIMIT 4→8: ضعف الروابط
+//    الداخلية للـ SEO (8 × كل صفحة منتج). الحارس الثلاثي تأكد قبل التعديل.
 app.get('/api/products/:id/related', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1906,21 +1938,21 @@ app.get('/api/products/:id/related', async (req, res) => {
     let relatedRes = await pool.query(
       `SELECT id, title, price, image_url, category FROM products
        WHERE id != $1 AND category = $2 AND stock_status = true
-       ORDER BY id DESC LIMIT 4`, [pid, category]
+       ORDER BY id DESC LIMIT 8`, [pid, category]
     );
 
-    if (relatedRes.rows.length < 4 && baseCategory) {
+    if (relatedRes.rows.length < 8 && baseCategory) {
       const existingIds = relatedRes.rows.map(r => r.id);
       existingIds.push(pid);
       const moreRes = await pool.query(
         `SELECT id, title, price, image_url, category FROM products
          WHERE id != ALL($1::int[]) AND category ILIKE $2 AND stock_status = true
-         ORDER BY id DESC LIMIT $3`, [existingIds, `${baseCategory}%`, 4 - relatedRes.rows.length]
+         ORDER BY id DESC LIMIT $3`, [existingIds, `${baseCategory}%`, 8 - relatedRes.rows.length]
       );
       relatedRes.rows = [...relatedRes.rows, ...moreRes.rows];
     }
 
-    if (relatedRes.rows.length < 4) {
+    if (relatedRes.rows.length < 8) {
       const existingIds = relatedRes.rows.map(r => r.id);
       existingIds.push(pid);
       // 📌 تكلفة موثقة: random() = scan+sort كامل — مسار نادر (فئة فيها <4 منتجات متوفرة)
@@ -1928,7 +1960,7 @@ app.get('/api/products/:id/related', async (req, res) => {
       const randomRes = await pool.query(
         `SELECT id, title, price, image_url, category FROM products
          WHERE id != ALL($1::int[]) AND stock_status = true
-         ORDER BY random() LIMIT $2`, [existingIds, 4 - relatedRes.rows.length]
+         ORDER BY random() LIMIT $2`, [existingIds, 8 - relatedRes.rows.length]
       );
       relatedRes.rows = [...relatedRes.rows, ...randomRes.rows];
     }
@@ -1936,7 +1968,7 @@ app.get('/api/products/:id/related', async (req, res) => {
     // 🩹 FIX-RELCACHE — المرتبطون ثابتون نسبياً → كاش CDN
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
     res.json(relatedRes.rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ /api/products/:id/related:', err);
     res.set('Cache-Control', 'no-store');  // 🩹 FIX-ERRCACHE
     res.status(500).json({ error: 'Internal Server Error' });
@@ -1956,7 +1988,7 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
 
     clearProductsCache();
     res.json({ message: 'Deal status updated', is_sourced: newStatus });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -1970,7 +2002,7 @@ app.post('/api/wheel/claim', async (req, res) => {
     if (!pct) return res.status(400).json({ error: 'Invalid wheel result' });
     const wheelToken = jwt.sign({ type: 'wheel', pct }, JWT_SECRET, { expiresIn: '24h' });
     res.json({ pct, wheelToken });
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('wheel/claim', e);
     res.status(500).json({ error: 'Server error' });
   }
@@ -1998,7 +2030,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
           item.id = imported.id;
           item.live_pid = undefined;
           console.log(`🌍 [LiveBridge] checkout: CJ pid → local #${imported.id}`);
-        } catch (e) {
+        } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
           return res.status(400).json({ error: `Product ${item.live_pid} is no longer available from supplier.` });
         }
       }
@@ -2069,7 +2101,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
       if (supported.length > 0) {
         allowedCountries = supported.map(r => r.country_code);
       }
-    } catch (smErr) {
+    } catch (smErr) { try { Sentry.captureException(smErr); } catch (__laclarcGuard) {}
       console.warn('⚠️ [Checkout] shipping_matrix unavailable — falling back to ALL_WORLD_COUNTRIES:', smErr.message);
     }
 
@@ -2106,7 +2138,7 @@ app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
 
     await pool.query("UPDATE orders SET stripe_session_id = $1 WHERE id = $2", [session.id, orderId]);
     res.json({ url: session.url });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     // 🧹 فشل Stripe session → pending يُلغى ذرياً (لا يتيم في الـ Reconcile)
     if (orderId) {
       await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status = 'pending'", [orderId]).catch(() => {});
@@ -2134,7 +2166,7 @@ app.post('/api/payment/verify-session', async (req, res) => {
     let session;
     try {
       session = await stripe.checkout.sessions.retrieve(session_id);
-    } catch (e) {
+    } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
       // session_id غير صالح/منتهي → 404 نظيف بدل 500
       return res.status(404).json({ success: false, error: 'Invalid checkout session' });
     }
@@ -2226,7 +2258,7 @@ app.post('/api/payment/verify-session', async (req, res) => {
             sendOrderConfirmationEmail(customerEmail, orderId, paidAmount, items)
               .catch(err => logger.logError('JIT Email Dispatch', err));
           }
-        } catch (bgErr) {
+        } catch (bgErr) { try { Sentry.captureException(bgErr); } catch (__laclarcGuard) {}
           logger.logError('JIT Background CJ Fulfillment', bgErr);
         }
       })();
@@ -2246,7 +2278,7 @@ app.post('/api/payment/verify-session', async (req, res) => {
       items: items.map(i => ({ productId: i.product_id, quantity: i.quantity })),
     });
 
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     logger.logError('JIT Stripe Verification Error', error);
     res.status(500).json({ success: false, error: 'Failed to verify payment with Stripe' });
   }
@@ -2278,7 +2310,7 @@ app.get('/api/orders/:id/items', async (req, res) => {
        WHERE oi.order_id = $1`, [id]
     );
     res.json(result.rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -2294,7 +2326,7 @@ app.get('/api/orders/my-orders', authenticateToken, async (req, res) => {
     );
     const withLabels = result.rows.map(order => ({ ...order, status_label: getStatusLabel(order.status) }));
     res.json(withLabels);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -2333,7 +2365,7 @@ app.get('/api/orders/track/:identifier', trackLimiter, async (req, res) => {
       return res.status(404).json({ error: 'No orders found matching this Order ID and Email combination.' });
     }
     res.json(result.rows);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Track Orders', err);
     res.status(500).json({ error: 'Internal Server Error' });
   }
@@ -2345,7 +2377,7 @@ app.get('/api/track/:trackNumber', trackLimiter, async (req, res) => {
     const response = await cjRequest((token) => axios.get(`https://developers.cjdropshipping.com/api2.0/v1/logistic/trackInfo`, { headers: { 'CJ-Access-Token': token }, params: { trackNumber } }));
     if (response.data.code === 200) res.json(response.data.data);
     else res.status(404).json({ error: 'No tracking info found.' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -2359,7 +2391,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
     const result = await pool.query('SELECT name, email, profile_picture FROM users WHERE id = $1', [req.user.id]);
     if (result.rows.length === 0) return res.status(404).json({ message: "User not found" });
     res.json(result.rows[0]);
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -2373,7 +2405,7 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
       [name, profilePicture, req.user.id]
     );
     res.json(updatedUser.rows[0]);
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -2387,7 +2419,7 @@ app.put('/api/admin/update-category/:id', async (req, res) => {
     await pool.query('UPDATE products SET category = $1 WHERE id = $2', [category, id]);
     clearProductsCache();
     res.json({ message: 'Category updated successfully' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -2409,7 +2441,7 @@ app.get('/api/settings', async (req, res) => {
       return acc;
     }, {});
     res.json(settings);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -2426,7 +2458,7 @@ app.put('/api/admin/settings/:key', async (req, res) => {
       [key, String(value)]
     );
     res.json({ success: true, message: 'Setting updated successfully' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -2439,7 +2471,7 @@ app.delete('/api/admin/videos/:productId', async (req, res) => {
     await pool.query('UPDATE products SET video_url = NULL WHERE id = $1', [productId]);
     clearProductsCache();
     res.json({ success: true, message: 'Video deleted successfully. Product remains in store.' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -2472,7 +2504,7 @@ app.put('/api/admin/update-product/:id', async (req, res) => {
     );
     clearProductsCache();
     res.json({ message: 'Product updated successfully' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -2484,14 +2516,14 @@ app.post('/api/admin/cogs', async (req, res) => {
     const { orderCodes } = req.body;
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/queryCogsBasicDataOrderInfoList', { orderCodesList: orderCodes }, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/admin/merge/match', async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/autoMatchMergeOrderListV3', { filterOrder: true, orderStatus: 100 }, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/admin/merge/submit', async (req, res) => {
@@ -2499,28 +2531,28 @@ app.post('/api/admin/merge/submit', async (req, res) => {
     const { orders } = req.body;
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/submitMergeOrderBatchV3', orders, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.get('/api/admin/makeup/list', async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/makeup/list', { pageNum: 1, pageSize: 20, type: 0 }, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.get('/api/addresses', requireAdmin, async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/privateInventory/address/list', {}, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/addresses/create', requireAdmin, async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/privateInventory/address/create', req.body, { headers: { 'CJ-Access-Token': token } }));
     res.json(response.data);
-  } catch (err) { logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/admin/sourcing/create', async (req, res) => {
@@ -2530,7 +2562,7 @@ app.post('/api/admin/sourcing/create', async (req, res) => {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/product/sourcing/create', { productName, productImage, productUrl: productUrl || '', price: price || 0 }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
     if (response.data.success || response.data.code === 200 || response.data.code === 0) res.status(201).json({ message: 'Sourcing request sent successfully! CJ will review it.' });
     else res.status(400).json({ error: response.data.message || 'Failed to create sourcing request' });
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -2553,7 +2585,7 @@ app.get('/api/admin/system-events', requireAdmin, async (req, res) => {
         );
 
     res.json({ events: rows });
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('system-events API', e);
     res.status(500).json({ error: 'Failed to fetch system events' });
   }
@@ -2622,7 +2654,7 @@ async function runExchangeFulfillment(orderId, ord, chosen) {
     );
     sendAdminAlert(`🚨 Exchange cascade died — #${orderId} → manual`,
       `<p>فشل البديل <b>${chosen.title}</b> ومات الـ cascade قبل إعادة العرض — triage يدوي أو انتظار L0 sweep.</p>`);
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('Exchange fulfillment', e);
     await pool.query(
       "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'paid'",
@@ -2675,7 +2707,7 @@ app.post('/api/exchange/:orderId', async (req, res) => {
       [orderId, chosen.id, Number(chosen.price)]
     );
     await client.query('COMMIT');
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     await client.query('ROLLBACK').catch(() => {});
     logger.logError('Exchange API', e);
     return res.status(500).json({ success: false, code: 'internal', message: 'Internal error — please try again.' });
@@ -2727,7 +2759,7 @@ app.get('/api/exchange/:orderId/options', async (req, res) => {
       return res.json({ status: 'exchanged' });
     }
     return res.json({ status: 'invalid' });
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('exchange-options', e);
     return res.status(500).json({ error: 'internal' });
   }
@@ -2755,7 +2787,7 @@ app.get('/api/tracking/:orderId/journey', async (req, res) => {
     }
 
     res.json(journey);
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('ShipTruth API', e);
     res.status(500).json({ error: 'Journey fetch failed' });
   }
@@ -2825,7 +2857,7 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
       html: htmlContent
     });
     console.log(`📧 Professional confirmation email sent to ${email}`);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Send Order Email', err);
   }
 }
@@ -2863,7 +2895,7 @@ async function postDailyProductToFacebook() {
     });
 
     console.log(`✅ [Auto-Cron] Successfully posted to Facebook! Product: ${product.title}`);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ [Auto-Cron] Error posting to Facebook:', err.response?.data?.error || err.message);
   }
 }
@@ -2897,11 +2929,11 @@ cron.schedule('0 3 * * *', async () => {
         const safePrice = parseFloat(sellingPrice.toFixed(2));
 
         await pool.query("UPDATE products SET price = $1, stock_status = $2 WHERE id = $3", [safePrice, details.isGlobalShipping !== false, p.id]);
-      } catch (e) { console.error('🔴 [PriceSync] product ' + (p && p.id) + ' FAILED: ' + e.message); }
+      } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} console.error('🔴 [PriceSync] product ' + (p && p.id) + ' FAILED: ' + e.message); }
     }
     clearProductsCache();
     console.log('✅ [Auto-Cron] Daily product update completed!');
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ [Auto-Cron] Error updating products:', err.message);
   }
 });
@@ -2943,7 +2975,7 @@ cron.schedule('30 2 * * *', async () => {
 
           updatedCount++;
         }
-      } catch (e) {
+      } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
         // 🩹 FIX#10 — كان catch فارغ تماماً (آخر catch صامت في الملف)
         console.warn(`⚠️ [VariantSync] product ${p.id} failed: ${e.message}`);
       }
@@ -2951,7 +2983,7 @@ cron.schedule('30 2 * * *', async () => {
 
     clearProductsCache();
     console.log(`✅ [Variant Sync] Daily variant update completed! Updated variants for ${updatedCount} products.`);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ [Variant Sync] Error updating variants:', err.message);
   }
 });
@@ -2982,7 +3014,7 @@ cron.schedule('30 2 * * *', async () => {
 //       );
 //     }
 //     console.log('✅ [Auto-Cron] Added 5 new reviews successfully!');
-//   } catch (err) {
+//   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
 //     console.error('❌ [Auto-Cron] Error seeding reviews:', err.message);
 //   }
 // });
@@ -3008,11 +3040,11 @@ cron.schedule('0 * * * *', async () => {
               { headers: { 'CJ-Access-Token': token } }
             )
           );
-        } catch (mergeErr) { console.error('🔴 [Auto-Merge] group submission FAILED: ' + mergeErr.message); }
+        } catch (mergeErr) { try { Sentry.captureException(mergeErr); } catch (__laclarcGuard) {} console.error('🔴 [Auto-Merge] group submission FAILED: ' + mergeErr.message); }
       }
       console.log('✅ Auto-merge completed successfully!');
     }
-  } catch (err) { console.error('🔴 [Auto-Merge] cron FAILED: ' + err.message); }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} console.error('🔴 [Auto-Merge] cron FAILED: ' + err.message); }
 });
 
 // 4. فحص وتنظيف المنتجات المحذوفة من CJ (أسبوعياً)
@@ -3036,11 +3068,11 @@ cron.schedule('0 1 * * 0', async () => {
           await pool.query("UPDATE products SET stock_status = false WHERE id = $1", [p.id]);
           hiddenCount++;
         }
-      } catch (e) { console.warn('⚠️ [WeeklyCleanup] product ' + (p && p.id) + ' failed: ' + e.message); }
+      } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} console.warn('⚠️ [WeeklyCleanup] product ' + (p && p.id) + ' failed: ' + e.message); }
     }
     clearProductsCache();
     console.log(`✅ [Auto-Cron] Weekly cleanup completed! Hidden ${hiddenCount} products.`);
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ [Auto-Cron] Weekly cleanup error:', err.message);
   }
 });
@@ -3052,14 +3084,14 @@ cron.schedule('0 11,18 * * *', async () => {
 
 // 🩺 🩹 (بقيت كما هي — مع FIX من الجلسة السابقة)
 cron.schedule('0 */2 * * *', async () => {
-  try { await selfHealStuckOrders(); } catch (e) { logger.logError('SelfHeal Scheduler', e); }
+  try { await selfHealStuckOrders(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('SelfHeal Scheduler', e); }
 });
 
 // ═══ ⚖️ Dispute Watchdog — مراقبة chargebacks (كل 6 ساعات) ═══
 cron.schedule('0 */6 * * *', async () => {
   try {
     await disputeWatchdogCron();
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('DisputeWatch Scheduler', e); // Tenet #14
   }
 });
@@ -3103,7 +3135,7 @@ cron.schedule('*/15 * * * *', async () => {
 
           let parsedAddress = {};
           try { parsedAddress = JSON.parse(fullOrder.shipping_address); }
-          catch (e) { parsedAddress = { line1: fullOrder.shipping_address, country: 'US' }; }
+          catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} parsedAddress = { line1: fullOrder.shipping_address, country: 'US' }; }
           const customerDetails = {
             address: parsedAddress,
             phone: fullOrder.customer_phone || '0000000000',
@@ -3135,7 +3167,7 @@ cron.schedule('*/15 * * * *', async () => {
           );
           if (upd.rows.length) console.log(`⚠️ [Stripe Reconcile] Order ${order.id} unpaid in Stripe. Cancelled.`);
         }
-      } catch (error) {
+      } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
         logger.logError(`Stripe Reconcile Order #${order.id}`, error);
         await pool.query("UPDATE orders SET status = 'manual' WHERE id = $1 AND status IN ('paid','reconciling')", [order.id]);
       }
@@ -3146,7 +3178,7 @@ cron.schedule('*/15 * * * *', async () => {
     await pool.query(
       "UPDATE orders SET status = 'paid' WHERE status = 'reconciling' AND (cj_order_number IS NULL OR cj_order_number = '') AND (tracking_number IS NULL OR tracking_number = '')"
     );
-  } catch (error) {
+  } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     logger.logError('Stripe Reconcile Cron Fatal', error);
   } finally {
     isReconciling = false;
@@ -3180,7 +3212,7 @@ cron.schedule('0 * * * *', async () => {
     if (result.rowCount > 0) {
       console.log(`🧹 [Sweeper] Cleaned ${result.rowCount} expired pending order(s).`);
     }
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Sweeper Cron', err);
   } finally {
     isSweeping = false;
@@ -3195,7 +3227,7 @@ cron.schedule('0 * * * *', async () => {
 // cron.schedule('*/4 * * * *', async () => {
 //   try {
 //     await pool.query('SELECT 1');
-//   } catch (err) {
+//   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
 //     console.error('Neon keep-alive error:', err.message);
 //   }
 // });
@@ -3292,7 +3324,7 @@ cron.schedule('15 * * * *', async () => {
       console.log(`📧 [Abandoned Cart] Recovery email dispatched to ${order.customer_email} for Order #${order.id}`);
       await new Promise(r => setTimeout(r, 1000));
     }
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ [Abandoned Cart] Error:', err.message);
   }
 });
@@ -3326,7 +3358,7 @@ cron.schedule('0 5 * * *', async () => {
     try {
       const { rows } = await pool.query('SELECT country_code FROM shipping_matrix WHERE is_supported = true');
       supportedCountries = rows.map(r => r.country_code);
-    } catch (e) {
+    } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
       console.warn('⚠️ [TopSellers] shipping_matrix unavailable — skipping shipping filter');
     }
 
@@ -3350,7 +3382,7 @@ cron.schedule('0 5 * * *', async () => {
             })
           );
           cjProducts = listRes.data?.data?.list || [];
-        } catch (listErr) {
+        } catch (listErr) { try { Sentry.captureException(listErr); } catch (__laclarcGuard) {}
           console.warn(`⚠️ [TopSellers] list "${keyword}" p${pageNum} failed: ${listErr.message}`);
           continue;
         }
@@ -3421,7 +3453,7 @@ cron.schedule('0 5 * * *', async () => {
                   { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
               if (videoRes.data.code === 200 && videoRes.data.data?.length > 0)
                 videoUrl = videoRes.data.data[0].videoUrl;
-            } catch (e) { console.warn(`⚠️ [TopSellers] video query failed for ${pid}: ${e.message}`); }
+            } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} console.warn(`⚠️ [TopSellers] video query failed for ${pid}: ${e.message}`); }
 
             await pool.query(`
               INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category, video_url, cj_category_id, is_sourced)
@@ -3436,7 +3468,7 @@ cron.schedule('0 5 * * *', async () => {
             importedThisRun++;
             console.log(`🌍 [TopSellers] ✅ imported #${importedThisRun}: ${String(details.productNameEn).slice(0, 50)} (${keyword || 'trending'}, CJ orders: ${ordersCount})`);
 
-          } catch (productErr) {
+          } catch (productErr) { try { Sentry.captureException(productErr); } catch (__laclarcGuard) {}
             errors++;
             console.warn(`⚠️ [TopSellers] product ${pid} failed: ${productErr.message}`);
           }
@@ -3454,7 +3486,7 @@ cron.schedule('0 5 * * *', async () => {
       durationSec: tookSec,
     }, 'info');
 
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('TopSellers Cron Fatal', err);
   }
 });
@@ -3597,12 +3629,12 @@ cron.schedule('0 5 * * *', async () => {
               importedThisRun++;
               console.log(`🌍 [TopSellers v2] ✅ #${importedThisRun}: ${p.nameEn?.slice(0, 50)} (${config.label}, listedNum=${p.listedNum}, inventory=${p.warehouseInventoryNum})`);
             }
-          } catch (prodErr) {
+          } catch (prodErr) { try { Sentry.captureException(prodErr); } catch (__laclarcGuard) {}
             errors++;
             console.warn(`⚠️ [TopSellers v2] product ${pid} failed: ${prodErr.message}`);
           }
         }
-      } catch (configErr) {
+      } catch (configErr) { try { Sentry.captureException(configErr); } catch (__laclarcGuard) {}
         console.error(`❌ [TopSellers v2] ${config.label} failed: ${configErr.message}`);
         errors++;
       }
@@ -3618,7 +3650,7 @@ cron.schedule('0 5 * * *', async () => {
       durationSec: tookSec,
     }, 'info');
 
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('TopSellers v2 Fatal', err);
   }
 });
@@ -3712,7 +3744,7 @@ cron.schedule('30 * * * *', async () => {
         }
       }
     }
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('CJ Logistics Cron', err);
   }
 });
@@ -3782,12 +3814,12 @@ cron.schedule('17,47 * * * *', async () => {
               const full = oRes.rows[0];
               const iRes = await pool.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
               let addr = {};
-              try { addr = JSON.parse(full.shipping_address); } catch (e) { addr = { line1: full.shipping_address, country: 'US' }; }
+              try { addr = JSON.parse(full.shipping_address); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} addr = { line1: full.shipping_address, country: 'US' }; }
               const r = await fulfillCJOrder(order.id, full.customer_name, {
                 address: addr, phone: full.customer_phone || '', email: full.customer_email || '', name: full.customer_name
               }, iRes.rows);
               console.log('[AutoHeal] recreate #' + order.id + ' ->', JSON.stringify(r).slice(0, 200));
-            } catch (e) { logger.logError('AutoHeal recreate #' + order.id, e); }
+            } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('AutoHeal recreate #' + order.id, e); }
           })();
           continue;
         }
@@ -3808,7 +3840,7 @@ cron.schedule('17,47 * * * *', async () => {
         }
       }
     }
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('AutoHeal Cron', err);
   }
 });
@@ -3936,7 +3968,7 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
           orderContext = `\n[Security: ownership of order #${orderId} could not be verified with this email. Politely apologize and suggest using the "Track My Order" page on the website with the correct email, in the customer's language. Do NOT reveal any order details and do NOT confirm whether the order exists.]`;
         }
       }
-    } catch (dbErr) {
+    } catch (dbErr) { try { Sentry.captureException(dbErr); } catch (__laclarcGuard) {}
       logger.logError('Chat DB Check', dbErr);
     }
   }
@@ -3971,7 +4003,7 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
 
     res.json({ reply: replyText });
 
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('AI Chat Error', err);
     res.json({ reply: FALLBACK_REPLIES[lang].error });
   }
@@ -4040,7 +4072,7 @@ cron.schedule('0 10 * * *', async () => {
       console.log(`🌟 [ReviewInvite] Invitation sent for #${order.id} → ${order.customer_email}`);
       await new Promise(r => setTimeout(r, 1000));
     }
-  } catch (err) {
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ [ReviewInvite] Error:', err.message);
   }
 });
@@ -4075,7 +4107,7 @@ app.get('/api/review/verify/:orderId', async (req, res) => {
     );
 
     res.json({ orderId, customerName: rows[0].customer_name, items: itemsRes.rows });
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('Review Verify', e);
     res.status(500).json({ error: 'internal' });
   }
@@ -4130,7 +4162,7 @@ app.post('/api/review/invite/:orderId', async (req, res) => {
     await auditEvent('VERIFIED_REVIEW_SUBMITTED', orderId, { productId, rating }, 'info');
 
     res.json({ success: true, message: 'Review published! Use NEXT5 for 5% off your next order.' });
-  } catch (e) {
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('Review Submit', e);
     res.status(500).json({ success: false, error: 'Internal error' });
   }
@@ -4169,7 +4201,7 @@ process.on('uncaughtException', async (err) => {
 
   try {
     await pool.end();
-  } catch (e) {} // ✅ Tenet#14 documented exception: already dying — forceExit timer covers
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}} // ✅ Tenet#14 documented exception: already dying — forceExit timer covers
 
   clearTimeout(forceExit);
   process.exit(1);
@@ -4198,7 +4230,7 @@ const handleShutdown = async (signal) => {
     try {
       await pool.end();
       console.log('✅ DB Pool drained.');
-    } catch (e) {} // ✅ Tenet#14 documented exception: exiting anyway
+    } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}} // ✅ Tenet#14 documented exception: exiting anyway
     process.exit(0);
   });
 
@@ -4210,3 +4242,26 @@ const handleShutdown = async (signal) => {
 
 process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 process.on('SIGINT', () => handleShutdown('SIGINT'));
+
+// ──── [LACLARC::SENTRY-TEST] v1 (Task 16) ────
+// 🔬 marker endpoint — البرهان الحي (منهجية Task 14-c):
+//    curl "https://<host>/__sentry_test?go=1"  →  الحدث فـ dashboard ≤60s
+app.get('/__sentry_test', (req, res) => {
+  if (req.query.go === '1') {
+    Sentry.captureMessage('LACLARC-SENTRY-OK :: test event from ' + (req.ip || 'unknown'), 'info');
+    return res.json({ ok: true, marker: 'LACLARC-SENTRY-OK', note: 'Check your Sentry dashboard within ~60 seconds' });
+  }
+  return res.json({ ok: true, marker: 'LACLARC-SENTRY-OK', hint: 'add ?go=1 to fire a test event' });
+});
+// ──── [/LACLARC::SENTRY-TEST] ────
+
+// ──── [LACLARC::SENTRY-ERR] v1 (Task 16) ────
+// errorHandler — AFTER كامل الـ routes، BEFORE أي error middleware آخر.
+// (Sentry كيلقط كمان uncaughtException/unhandledRejection أوتوماتيكياً —
+//  GlobalHandlers integration مفعّلة by default، ما محتاجينش hooks يدوية)
+if (typeof Sentry.setupExpressErrorHandler === 'function') {
+  Sentry.setupExpressErrorHandler(app);          // v8+
+} else if (Sentry.Handlers && typeof Sentry.Handlers.errorHandler === 'function') {
+  app.use(Sentry.Handlers.errorHandler());       // v7 fallback
+}
+// ──── [/LACLARC::SENTRY-ERR] ────
