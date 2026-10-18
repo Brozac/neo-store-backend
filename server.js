@@ -41,6 +41,10 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
 const cron = require('node-cron');
 
+// 🩹 FIX 18-C1 — CJ_API كان غير معرّف فـ server.js (معرّف غير داخل services/*) → ReferenceError
+//   كايقبل كرونات TopSellers (0 5 * * *) كل يوم 5ص بصمت — الميزة كانت ميتة من الولادة (Task 18)
+const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
+
 // ✨ Pool واحد مشترك من db.js
 const pool = require('./db');
 
@@ -742,6 +746,15 @@ app.post('/api/reviews/add', authenticateToken, async (req, res) => {
   }
 });
 
+// 🩹 FIX 18-E — وثائق KYC (receipts = بطاقات تعريف وطنية ديال الزبناء) ما يتحملوش من الويب أبداً
+//   برهان Task 18: GET /uploads/receipt-*.png كان → 200 LIVE (تسريب PII حي). غير receipts ممنوعين.
+app.use('/uploads', (req, res, next) => {
+  if (/receipt-/i.test(req.path)) {
+    logger.logError('UPLOADS-KYC-BLOCKED', new Error(`${req.method} ${req.originalUrl} — IP: ${req.ip}`));
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  return next();
+});
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.post('/api/admin/upload', upload.array('images', 10), (req, res) => {
@@ -2032,6 +2045,28 @@ app.post('/api/wheel/claim', async (req, res) => {
 //           الزبون كان يستطيع الدفع من دولة لا يشحن إليها CJ = فاتورة ضائعة
 //   FIX-ERR: err.message لم يعد يُكشف للعميل (كان يسرّب تفاصيل Stripe)
 // ==========================================
+// ═══ 🩹 FIX 18-D — ensureProductImported كانت مُستدعاة فـ Live Bridge (M#25) وما كايناش
+//   فالـ repo كامل → ReferenceError → أي عربة فيها live_pid كانت كتفشل دايماً (Task 18)
+async function ensureProductImported(livePid) {
+  const pidStr = String(livePid || '').trim();
+  if (!pidStr || pidStr.length > 100) throw new Error('invalid live pid');
+  const existing = await pool.query('SELECT id FROM products WHERE cj_product_id = $1 LIMIT 1', [pidStr]);
+  if (existing.rows.length > 0) return existing.rows[0];
+  const detailRes = await cjRequest((token, config) =>
+    axios.get(`${CJ_API}/product/query`, { ...config, headers: { 'CJ-Access-Token': token }, params: { pid: pidStr } })
+  );
+  const details = detailRes.data?.data;
+  if (!details) throw new Error('product not available from supplier');
+  const productRow = await buildProductRow(details, { fetchVideo: false, isSourced: false });
+  if (!productRow) throw new Error('product failed import validation');
+  await upsertProductRow(pool, productRow);
+  const saved = await pool.query('SELECT id FROM products WHERE cj_product_id = $1 LIMIT 1', [pidStr]);
+  if (!saved.rows.length) throw new Error('import persistence failed');
+  clearProductsCache();
+  console.log(`🌍 [LiveBridge] imported CJ pid ${pidStr} → local #${saved.rows[0].id}`);
+  return saved.rows[0];
+}
+
 app.post('/api/create-checkout-session', checkoutLimiter, async (req, res) => {
   try {
     let orderId = null;
@@ -3356,8 +3391,11 @@ cron.schedule('15 * * * *', async () => {
 // 🌍 M#26 — Auto-Import Top-Sellers (يومياً 5 صباحاً)
 // الكتالوج ينمو آلياً بمنتجات CJ مجرّبة عالمياً — فلترة ثلاثية
 // ==========================================
-cron.schedule('0 5 * * *', async () => {
-  console.log('🌍 [TopSellers] Auto-import starting...');
+// 🩹 FIX 18-C2 — TopSellers v1 معطّل: كان خدّام فنفس الوقت ديال v2 (0 5 * * *) = ضعف استهلاك CJ
+//   v1 كان ميت أصلاً (CJ_API undefined) — v2 (listV2) هو المعتمد. 31 فبراير = ما كيطلقش أبداً.
+//   للرجوع: رجّع '0 5 * * *' فالسطر اللي تحت.
+cron.schedule('0 5 31 2 *', async () => {
+  console.log('🌍 [TopSellers] Auto-import starting... (v1 DISABLED by Task 18 — v2 active)');
   const startedAt = Date.now();
   let imported = 0, skipped = 0, rejected = 0, errors = 0;
 

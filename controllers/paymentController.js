@@ -237,7 +237,7 @@ router.post('/paysera', checkoutLimiter, async (req, res) => {
 
     const data = {
       projectid: process.env.PAYSERA_PROJECT_ID,
-      orderid: String(orderId),
+      // 🩹 FIX 18-B — orderid واحد فقط (كان مكرر: JS كياخد الأخير = LC-...) — Task 18
       amount: Math.round(chargeTotal * 100),
       currency: 'USD',
       accepturl: `${process.env.FRONTEND_URL}/success?method=paysera`,
@@ -281,9 +281,17 @@ router.get('/paysera/callback', async (req, res) => {
     const orderId = params.get('orderid');
     const status = params.get('status');
 
-    const orderRowRes = await pool.query('SELECT total_amount FROM orders WHERE id = $1', [orderId]);
-    const orderRow = orderRowRes.rows[0];
-    if (!orderRow) { res.send('OK'); return; }
+    // 🩹 FIX 18-B2 — orderid من Payserا يمكن يكون LC-... (الطلبات الحية) ولا رقم — حلول آمن للاتنين
+    let orderDbId = null, orderRow = null;
+    if (/^\d+$/.test(String(orderId))) {
+      orderDbId = parseInt(orderId, 10);
+      const byId = await pool.query('SELECT id, total_amount FROM orders WHERE id = $1', [orderDbId]);
+      orderRow = byId.rows[0] || null;
+    } else {
+      const byNum = await pool.query('SELECT id, total_amount FROM orders WHERE order_number = $1 LIMIT 1', [String(orderId)]);
+      if (byNum.rows.length > 0) { orderDbId = byNum.rows[0].id; orderRow = byNum.rows[0]; }
+    }
+    if (!orderRow || !orderDbId) { res.send('OK'); return; }
 
     if (status === '1') {
       const paidCents = parseInt(params.get('amount'), 10) || 0;
@@ -292,9 +300,9 @@ router.get('/paysera/callback', async (req, res) => {
       if (paidCents + 50 < expectedCents) {
         await pool.query(
           "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'pending'",
-          [orderId]
+          [orderDbId]
         );
-        await auditEvent('PAYSERA_AMOUNT_MISMATCH', orderId, { paidCents, expectedCents }, 'critical');
+        await auditEvent('PAYSERA_AMOUNT_MISMATCH', orderDbId, { paidCents, expectedCents }, 'critical');
         logger.logError('Paysera Callback: amount mismatch', new Error(`paid=${paidCents} expected=${expectedCents}`));
         res.send('OK');
         return;
@@ -302,7 +310,7 @@ router.get('/paysera/callback', async (req, res) => {
 
       const updateRes = await pool.query(
         "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING *",
-        [orderId]
+        [orderDbId]
       );
 
       if (updateRes.rows.length > 0) {
@@ -311,10 +319,10 @@ router.get('/paysera/callback', async (req, res) => {
 
         (async () => {
           try {
-            const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [orderId]);
+            const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [orderDbId]);
             const items = itemsRes.rows;
 
-            const cjResponse = await fulfillCJOrder(orderId, order.customer_name, {
+            const cjResponse = await fulfillCJOrder(orderDbId, order.customer_name, {
               address: { line1: order.shipping_address || 'Online Store Purchase', country: 'US' }
             }, items);
 
@@ -323,7 +331,7 @@ router.get('/paysera/callback', async (req, res) => {
             }
 
             if (order.customer_email) {
-              await sendOrderConfirmationEmail(order.customer_email, orderId, order.total_amount, items);
+              await sendOrderConfirmationEmail(order.customer_email, orderDbId, order.total_amount, items);
             }
           } catch (bgErr) {
             logger.logError('Paysera Fulfillment (Background)', bgErr);
@@ -381,7 +389,7 @@ router.post('/crypto', checkoutLimiter, async (req, res) => {
     // 🩹 v2.1 — 12 عمود = 10 placeholders + 2 حروف ('pending', 'Crypto') — محسوب بالحرف
     const orderResult = await pool.query(
       `INSERT INTO orders (customer_name, customer_phone, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id)
-       VALUES ($1, $2, $3, $4, $5, 'pending', 'Crypto', $6, $7, $8, $9, $10) RETURNING id, order_numbe`,
+       VALUES ($1, $2, $3, $4, $5, 'pending', 'Crypto', $6, $7, $8, $9, $10) RETURNING id, order_number`,
       [
         hasCustomerDetails ? String(customerName).trim().slice(0, 150) : 'Pending Crypto',  // $1
         String(customerPhone || '').trim().slice(0, 30) || null,                            // $2
