@@ -3394,7 +3394,9 @@ cron.schedule('15 * * * *', async () => {
 // 🩹 FIX 18-C2 — TopSellers v1 معطّل: كان خدّام فنفس الوقت ديال v2 (0 5 * * *) = ضعف استهلاك CJ
 //   v1 كان ميت أصلاً (CJ_API undefined) — v2 (listV2) هو المعتمد. 31 فبراير = ما كيطلقش أبداً.
 //   للرجوع: رجّع '0 5 * * *' فالسطر اللي تحت.
-cron.schedule('0 5 31 2 *', async () => {
+const TOPSELLERS_V1_ENABLED = false;
+if (TOPSELLERS_V1_ENABLED) {
+cron.schedule('0 5 * * *', async () => {
   console.log('🌍 [TopSellers] Auto-import starting... (v1 DISABLED by Task 18 — v2 active)');
   const startedAt = Date.now();
   let imported = 0, skipped = 0, rejected = 0, errors = 0;
@@ -3545,6 +3547,7 @@ cron.schedule('0 5 31 2 *', async () => {
     logger.logError('TopSellers Cron Fatal', err);
   }
 });
+}
 
 // ==========================================
 // 🌍 M#26 v2 — Top-Sellers Auto-Import (يومياً 5 صباحاً)
