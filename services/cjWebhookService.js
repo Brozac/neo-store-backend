@@ -641,23 +641,91 @@ async function handleMakeup(params = {}) {
   console.warn(`💳 [CJ Webhook] MAKEUP BILL ${params.status}: ${params.orderId} — $${params.amount} (${params.reason})`);
 
   if (params.status === 'CREATED') {
-    // 🩹 FIX#25 — النداء صُحح (كان { to: ... } على توقيع لا يستقبله)
-    await sendAdminEmail({
-      subject: `💳 CJ Makeup Bill Created — $${params.amount} for ${params.relationOrderId}`,
-      html: `<h2>CJ Postage Makeup Bill</h2>
-             <p><strong>Original Order:</strong> ${params.relationOrderId}</p>
-             <p><strong>CJ Order:</strong> ${params.orderId}</p>
-             <p><strong>Amount:</strong> $${params.amount}</p>
-             <p><strong>Reason:</strong> ${params.reason || 'N/A'}</p>
-             <p>Pay it from CJ wallet to avoid fulfillment delays.</p>
-             <p style="color:#FF6B9D;font-size:12px;">⚠️ تأكد أن الفاتورة حقيقية من CJ Dashboard قبل الدفع — فاتورة Makeup كانت هدفاً للتصيّد.</p>`
-    }).catch(err => logger.logError('Makeup Alert Email', err));
+    // 🩹 P0-27 — probe-before-trust: التوقيع راه قابل للتزوير نظرياً (المفتاح يمكن يكون
+    //   openId الظاهر فجسم الحدث نفسو). الفاتورة المالية ما كنثيقش فيها من الويب هوك —
+    //   كنأكّدوها من CJ API مباشرة (نفس endpoint ديال /api/admin/makeup/list) قبل
+    //   ما نصيفطو إيميل "خلّص من المحفظة" — هادا هو قالب التصيّد نفسو إلا كان مزوّر.
+    //   fail-closed: probe فاشل = إيميل UNVERIFIED بلا تعليمات دفع.
+    let verified = false, probeFailed = false;
+    try {
+      for (let pageNum = 1; pageNum <= 3 && !verified; pageNum++) {
+        const listRes = await cjRequest((token) => axios.post(
+          `${CJ_BASE}/shopping/makeup/list`,
+          { pageNum, pageSize: 50, type: 0 },
+          { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' }, timeout: 45000 }
+        ));
+        const list = listRes?.data?.data?.list || listRes?.data?.list || [];
+        if (!Array.isArray(list) || list.length === 0) break;
+        // مطابقة schema-agnostic: معرّف الطلب (BT...) فأي حقل ديال الفاتورة
+        verified = list.some(item => {
+          try { return JSON.stringify(item).includes(String(params.orderId)); } catch { return false; }
+        });
+      }
+    } catch (probeErr) {
+      probeFailed = true;
+      logger.logError('Makeup probe failed', probeErr);
+    }
+
+    if (verified) {
+      // 🩹 FIX#25 — النداء صُحح (كان { to: ... } على توقيع لا يستقبله)
+      await sendAdminEmail({
+        subject: `✅ CJ Makeup Bill VERIFIED — $${params.amount} for ${params.relationOrderId}`,
+        html: `<h2>CJ Postage Makeup Bill</h2>
+               <p style="color:#0a7d33;"><strong>✅ مُتحقّق منها من CJ API (P0-27) — يمكن الخلاص من المحفظة.</strong></p>
+               <p><strong>Original Order:</strong> ${params.relationOrderId}</p>
+               <p><strong>CJ Order:</strong> ${params.orderId}</p>
+               <p><strong>Amount:</strong> $${params.amount}</p>
+               <p><strong>Reason:</strong> ${params.reason || 'N/A'}</p>`
+      }).catch(err => logger.logError('Makeup Alert Email', err));
+    } else {
+      await sendAdminEmail({
+        subject: probeFailed
+          ? `⚠️ Makeup event UNVERIFIED (probe failed) — تحقق يدوياً من CJ Dashboard — ${params.orderId}`
+          : `🚨 FORGED MAKEUP event — الفاتورة ماكايناش فـ CJ! ${params.orderId}`,
+        html: `<h2>${probeFailed ? '⚠️ فاتورة غير مُتحقق منها' : '🚨 حدث MAKEUP مزوّر (تصيّد؟)'}</h2>
+               <p><strong>CJ Order:</strong> ${params.orderId}</p>
+               <p><strong>Amount:</strong> $${params.amount}</p>
+               <p style="color:#b00020;font-size:14px;"><strong>${probeFailed
+                 ? 'الاستجواب فشل (شبكة/CJ طايح) — ما تخلّصش حتى تتحقق يدوياً من CJ Dashboard.'
+                 : 'الويب هوك قال بوجود فاتورة، ولكن CJ API ماكيعرفش عليها = مزوّرة. ما تخلّصش!'}</strong></p>`
+      }).catch(err => logger.logError('Makeup Alert Email', err));
+      if (!probeFailed) {
+        logger.logError('CJ Webhook: forged MAKEUP suspected', new Error(`orderId=${params.orderId} amount=${params.amount} — not found in CJ makeup/list`));
+      }
+    }
   }
 }
 // ==========================================
 // 🎯 المعالج الرئيسي — 200 فوري (< 3s إجباري) + معالجة خلفية كاملة
 // ==========================================
 async function cjWebhookHandler(req, res) {
+  // 🩹 P0-26 — توثيق أحداث الكاتالوغ (PRODUCT/VARIANT/STOCK) بسرّ فالـ URL
+  //   هادو التلاتة كانو كيدخلو DB بلا حتى مصادقة (فقط MAKEUP موقّع):
+  //   VARIANT = مصدر الأسعار (تلاعب بالهوامش!) · PRODUCT DELETE = إخفاء الكاتالوغ
+  //   · STOCK = نفاد مزيف. CJ ماكيوقعش هاد المواضيع → الحل القياسي: سرّ فالـ callback.
+  //   التفعيل اختياري (صفر downtime): زيد CJ_WEBHOOK_SECRET فـ Render → restart
+  //   → POST /api/admin/webhook/register (كيحقن ?k= أوتوماتيكياً — انظر registerWebhooks).
+  const catalogTopic = (() => {
+    try {
+      const t = JSON.parse(req.body.toString('utf8') || '{}').type;
+      return t === 'PRODUCT' || t === 'VARIANT' || t === 'STOCK';
+    } catch { return false; }
+  })();
+  if (catalogTopic) {
+    const secret = process.env.CJ_WEBHOOK_SECRET || '';
+    if (secret) {
+      const provided = String(req.query.k || req.headers['x-cj-secret'] || '');
+      const ok = provided.length === secret.length
+        && crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(secret));
+      if (!ok) {
+        logger.logError('CJ Webhook: catalog event rejected (bad/missing secret)', new Error(`IP: ${req.ip}`));
+        return res.status(403).json({ code: 403, message: 'Forbidden' });
+      }
+    } else {
+      console.warn('⚠️ [CJ Webhook P0-26] CJ_WEBHOOK_SECRET ما مُعدّش — أحداث الكاتالوغ بلا توثيق! زيد السرّ فالـ env وعاود register.');
+    }
+  }
+
   res.status(200).json({ code: 200, message: 'OK' });
 
   (async () => {
@@ -754,12 +822,17 @@ async function cjWebhookHandler(req, res) {
 //  والتوقيع إجباري عليه الآن — يُسجل بعد بناء معالجه)
 // ==========================================
 async function registerWebhooks(callbackUrl) {
+  // 🩹 P0-26 — حقن السرّ فالـ callback URL (كيفّعل بوّاجة P0-26 على PRODUCT/VARIANT/STOCK)
+  const whSecret = process.env.CJ_WEBHOOK_SECRET || '';
+  const finalUrl = whSecret
+    ? callbackUrl + (callbackUrl.includes('?') ? '&' : '?') + 'k=' + encodeURIComponent(whSecret)
+    : callbackUrl;
   return cjRequest((token) => axios.post(`${CJ_BASE}/webhook/set`, {
-    product:   { type: 'ENABLE', callbackUrls: [callbackUrl] },
-    stock:     { type: 'ENABLE', callbackUrls: [callbackUrl] },
-    order:     { type: 'ENABLE', callbackUrls: [callbackUrl] },
-    logistics: { type: 'ENABLE', callbackUrls: [callbackUrl] },
-    makeup:    { type: 'ENABLE', callbackUrls: [callbackUrl] },
+    product:   { type: 'ENABLE', callbackUrls: [finalUrl] },
+    stock:     { type: 'ENABLE', callbackUrls: [finalUrl] },
+    order:     { type: 'ENABLE', callbackUrls: [finalUrl] },
+    logistics: { type: 'ENABLE', callbackUrls: [finalUrl] },
+    makeup:    { type: 'ENABLE', callbackUrls: [finalUrl] },
   }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
 }
 

@@ -1,0 +1,190 @@
+diff --git a/migrations/003_pg_trgm_search_indexes.sql b/migrations/003_pg_trgm_search_indexes.sql
+new file mode 100644
+index 0000000..881cf58
+--- /dev/null
++++ b/migrations/003_pg_trgm_search_indexes.sql
+@@ -0,0 +1,30 @@
++-- ============================================================
++-- 003_pg_trgm_search_indexes.sql — Task 19-D (P1: بحث سريع على 73k+ منتج)
++-- ============================================================
++-- المشكل: كل بحث ILIKE '%q%' على title/description = Sequential Scan كامل
++--         على 73,597 منتج فكل ضغطة بحث (P95 باهظ مع النمو).
++-- الحل: pg_trgm + فهارس GIN — ILIKE '%...%' كيولّي Bitmap Index Scan.
++-- التنفيذ (مرة واحدة فقط):
++--   psql "$DATABASE_URL" -f migrations/003_pg_trgm_search_indexes.sql
++-- ملاحظات:
++--   • CONCURRENTLY = بلا قفل على الجدول (آمن على الإنتاج) — ماكيخدمش داخل
++--     transaction، وpsel/psql بلا BEGIN كينفذ كل سطر بوحدو. إلا استعملت
++--     أداة كتلف كلشي فـ transaction، حيّد CONCURRENTLY.
++--   • Neon/Supabase: pg_trgm مدعوم رسمياً (CREATE EXTENSION كيدوز).
++--   • category: البحث الحالي كيستعمل prefix (ILIKE 'x%') — trgm كيسرّع
++--     حتى هاد النمط + كيغطي '%x%' إلا تبدل مستقبلاً.
++-- التحقق من بعد:
++--   EXPLAIN ANALYZE SELECT id FROM products WHERE title ILIKE '%phone%';
++--   خاصك تشوف Bitmap Index Scan على idx_products_title_trgm.
++-- ============================================================
++
++CREATE EXTENSION IF NOT EXISTS pg_trgm;
++
++CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_products_title_trgm
++  ON products USING gin (title gin_trgm_ops);
++
++CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_products_description_trgm
++  ON products USING gin (description gin_trgm_ops);
++
++CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_products_category_trgm
++  ON products USING gin (category gin_trgm_ops);
+diff --git a/server.js b/server.js
+index 4ea0f93..0db49f3 100644
+--- a/server.js
++++ b/server.js
+@@ -113,6 +113,10 @@ const checkoutLimiter = rateLimit({
+ const trackLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, message: { error: 'Too many tracking requests.' } });
+ // 🩹 FIX#6 — second-shot amplification shield (dedup يحمي عدّ Meta، لا يحمي DB من النداءات)
+ const secondShotLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, message: { error: 'Too many verification requests.' } });
++// 🩹 P1 (Task 19-D) — wheel/claim كان بلا limiter: سكريبت كيولّد كوبونات 15% بلا حدود
++//   (jwt.sign بلا حتى مصادقة). الـ limiter يشدّ السُحب الآلي — التحقق الجانبي للسحبة
++//   (سجل spin) راه فالمرحلة 2 (خارطة الطريق).
++const wheelLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { error: 'Too many wheel claims, please try again later.' } });
+ 
+ const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
+ 
+@@ -2026,7 +2030,7 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
+ 
+ // 2) قبل التعليق "🩹 FIX-SM — allowed_countries" — لصق هادا:
+ // ═══ 🎡 WHEEL_V1 — Spin Wheel claim → JWT-signed token (server = only truth) ═══
+-app.post('/api/wheel/claim', async (req, res) => {
++app.post('/api/wheel/claim', wheelLimiter, async (req, res) => {
+   try {
+     const pct = Math.min(15, Math.max(1, Math.round(Number(req.body?.pct) || 0)));
+     if (!pct) return res.status(400).json({ error: 'Invalid wheel result' });
+diff --git a/services/cjWebhookService.js b/services/cjWebhookService.js
+index 648bf8c..d1fdfa9 100644
+--- a/services/cjWebhookService.js
++++ b/services/cjWebhookService.js
+@@ -641,23 +641,91 @@ async function handleMakeup(params = {}) {
+   console.warn(`💳 [CJ Webhook] MAKEUP BILL ${params.status}: ${params.orderId} — $${params.amount} (${params.reason})`);
+ 
+   if (params.status === 'CREATED') {
+-    // 🩹 FIX#25 — النداء صُحح (كان { to: ... } على توقيع لا يستقبله)
+-    await sendAdminEmail({
+-      subject: `💳 CJ Makeup Bill Created — $${params.amount} for ${params.relationOrderId}`,
+-      html: `<h2>CJ Postage Makeup Bill</h2>
+-             <p><strong>Original Order:</strong> ${params.relationOrderId}</p>
+-             <p><strong>CJ Order:</strong> ${params.orderId}</p>
+-             <p><strong>Amount:</strong> $${params.amount}</p>
+-             <p><strong>Reason:</strong> ${params.reason || 'N/A'}</p>
+-             <p>Pay it from CJ wallet to avoid fulfillment delays.</p>
+-             <p style="color:#FF6B9D;font-size:12px;">⚠️ تأكد أن الفاتورة حقيقية من CJ Dashboard قبل الدفع — فاتورة Makeup كانت هدفاً للتصيّد.</p>`
+-    }).catch(err => logger.logError('Makeup Alert Email', err));
++    // 🩹 P0-27 — probe-before-trust: التوقيع راه قابل للتزوير نظرياً (المفتاح يمكن يكون
++    //   openId الظاهر فجسم الحدث نفسو). الفاتورة المالية ما كنثيقش فيها من الويب هوك —
++    //   كنأكّدوها من CJ API مباشرة (نفس endpoint ديال /api/admin/makeup/list) قبل
++    //   ما نصيفطو إيميل "خلّص من المحفظة" — هادا هو قالب التصيّد نفسو إلا كان مزوّر.
++    //   fail-closed: probe فاشل = إيميل UNVERIFIED بلا تعليمات دفع.
++    let verified = false, probeFailed = false;
++    try {
++      for (let pageNum = 1; pageNum <= 3 && !verified; pageNum++) {
++        const listRes = await cjRequest((token) => axios.post(
++          `${CJ_BASE}/shopping/makeup/list`,
++          { pageNum, pageSize: 50, type: 0 },
++          { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' }, timeout: 45000 }
++        ));
++        const list = listRes?.data?.data?.list || listRes?.data?.list || [];
++        if (!Array.isArray(list) || list.length === 0) break;
++        // مطابقة schema-agnostic: معرّف الطلب (BT...) فأي حقل ديال الفاتورة
++        verified = list.some(item => {
++          try { return JSON.stringify(item).includes(String(params.orderId)); } catch { return false; }
++        });
++      }
++    } catch (probeErr) {
++      probeFailed = true;
++      logger.logError('Makeup probe failed', probeErr);
++    }
++
++    if (verified) {
++      // 🩹 FIX#25 — النداء صُحح (كان { to: ... } على توقيع لا يستقبله)
++      await sendAdminEmail({
++        subject: `✅ CJ Makeup Bill VERIFIED — $${params.amount} for ${params.relationOrderId}`,
++        html: `<h2>CJ Postage Makeup Bill</h2>
++               <p style="color:#0a7d33;"><strong>✅ مُتحقّق منها من CJ API (P0-27) — يمكن الخلاص من المحفظة.</strong></p>
++               <p><strong>Original Order:</strong> ${params.relationOrderId}</p>
++               <p><strong>CJ Order:</strong> ${params.orderId}</p>
++               <p><strong>Amount:</strong> $${params.amount}</p>
++               <p><strong>Reason:</strong> ${params.reason || 'N/A'}</p>`
++      }).catch(err => logger.logError('Makeup Alert Email', err));
++    } else {
++      await sendAdminEmail({
++        subject: probeFailed
++          ? `⚠️ Makeup event UNVERIFIED (probe failed) — تحقق يدوياً من CJ Dashboard — ${params.orderId}`
++          : `🚨 FORGED MAKEUP event — الفاتورة ماكايناش فـ CJ! ${params.orderId}`,
++        html: `<h2>${probeFailed ? '⚠️ فاتورة غير مُتحقق منها' : '🚨 حدث MAKEUP مزوّر (تصيّد؟)'}</h2>
++               <p><strong>CJ Order:</strong> ${params.orderId}</p>
++               <p><strong>Amount:</strong> $${params.amount}</p>
++               <p style="color:#b00020;font-size:14px;"><strong>${probeFailed
++                 ? 'الاستجواب فشل (شبكة/CJ طايح) — ما تخلّصش حتى تتحقق يدوياً من CJ Dashboard.'
++                 : 'الويب هوك قال بوجود فاتورة، ولكن CJ API ماكيعرفش عليها = مزوّرة. ما تخلّصش!'}</strong></p>`
++      }).catch(err => logger.logError('Makeup Alert Email', err));
++      if (!probeFailed) {
++        logger.logError('CJ Webhook: forged MAKEUP suspected', new Error(`orderId=${params.orderId} amount=${params.amount} — not found in CJ makeup/list`));
++      }
++    }
+   }
+ }
+ // ==========================================
+ // 🎯 المعالج الرئيسي — 200 فوري (< 3s إجباري) + معالجة خلفية كاملة
+ // ==========================================
+ async function cjWebhookHandler(req, res) {
++  // 🩹 P0-26 — توثيق أحداث الكاتالوغ (PRODUCT/VARIANT/STOCK) بسرّ فالـ URL
++  //   هادو التلاتة كانو كيدخلو DB بلا حتى مصادقة (فقط MAKEUP موقّع):
++  //   VARIANT = مصدر الأسعار (تلاعب بالهوامش!) · PRODUCT DELETE = إخفاء الكاتالوغ
++  //   · STOCK = نفاد مزيف. CJ ماكيوقعش هاد المواضيع → الحل القياسي: سرّ فالـ callback.
++  //   التفعيل اختياري (صفر downtime): زيد CJ_WEBHOOK_SECRET فـ Render → restart
++  //   → POST /api/admin/webhook/register (كيحقن ?k= أوتوماتيكياً — انظر registerWebhooks).
++  const catalogTopic = (() => {
++    try {
++      const t = JSON.parse(req.body.toString('utf8') || '{}').type;
++      return t === 'PRODUCT' || t === 'VARIANT' || t === 'STOCK';
++    } catch { return false; }
++  })();
++  if (catalogTopic) {
++    const secret = process.env.CJ_WEBHOOK_SECRET || '';
++    if (secret) {
++      const provided = String(req.query.k || req.headers['x-cj-secret'] || '');
++      const ok = provided.length === secret.length
++        && crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(secret));
++      if (!ok) {
++        logger.logError('CJ Webhook: catalog event rejected (bad/missing secret)', new Error(`IP: ${req.ip}`));
++        return res.status(403).json({ code: 403, message: 'Forbidden' });
++      }
++    } else {
++      console.warn('⚠️ [CJ Webhook P0-26] CJ_WEBHOOK_SECRET ما مُعدّش — أحداث الكاتالوغ بلا توثيق! زيد السرّ فالـ env وعاود register.');
++    }
++  }
++
+   res.status(200).json({ code: 200, message: 'OK' });
+ 
+   (async () => {
+@@ -754,12 +822,17 @@ async function cjWebhookHandler(req, res) {
+ //  والتوقيع إجباري عليه الآن — يُسجل بعد بناء معالجه)
+ // ==========================================
+ async function registerWebhooks(callbackUrl) {
++  // 🩹 P0-26 — حقن السرّ فالـ callback URL (كيفّعل بوّاجة P0-26 على PRODUCT/VARIANT/STOCK)
++  const whSecret = process.env.CJ_WEBHOOK_SECRET || '';
++  const finalUrl = whSecret
++    ? callbackUrl + (callbackUrl.includes('?') ? '&' : '?') + 'k=' + encodeURIComponent(whSecret)
++    : callbackUrl;
+   return cjRequest((token) => axios.post(`${CJ_BASE}/webhook/set`, {
+-    product:   { type: 'ENABLE', callbackUrls: [callbackUrl] },
+-    stock:     { type: 'ENABLE', callbackUrls: [callbackUrl] },
+-    order:     { type: 'ENABLE', callbackUrls: [callbackUrl] },
+-    logistics: { type: 'ENABLE', callbackUrls: [callbackUrl] },
+-    makeup:    { type: 'ENABLE', callbackUrls: [callbackUrl] },
++    product:   { type: 'ENABLE', callbackUrls: [finalUrl] },
++    stock:     { type: 'ENABLE', callbackUrls: [finalUrl] },
++    order:     { type: 'ENABLE', callbackUrls: [finalUrl] },
++    logistics: { type: 'ENABLE', callbackUrls: [finalUrl] },
++    makeup:    { type: 'ENABLE', callbackUrls: [finalUrl] },
+   }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
+ }
+ 
