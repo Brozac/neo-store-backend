@@ -1060,6 +1060,111 @@ app.get('/api/categories/seo', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// S4 — CATEGORIES HUB ENDPOINT (Section 4 — /categories hub)
+// GET /api/categories/hub
+//  • الشجرة الكاملة + slugPath كامل لكل عقدة (l1/l2/l3)
+//  • counts حقيقية من DB — نفس سيمانتيك العدّاد الحي (prefix match على category)
+//    استعلام واحد GROUP BY على distinct categories ثم prefix-sum فالذاكرة
+//  • صور تمثيلية للجذور (L1) — نفس نمط /api/categories (LATERAL)
+//  • كاش ذاكرة 6 سوايع + s-maxage=21600, SWR 86400
+//  • فشل counts/images = غير fatal — الشجرة كترجع ديما (counts:false)
+// ═══════════════════════════════════════════════════════════════════
+let hubS4Cache = null;
+let hubS4CacheTime = 0;
+const HUB_S4_CACHE_TTL = 6 * 60 * 60 * 1000;
+
+app.get('/api/categories/hub', async (req, res) => {
+  try {
+    res.set('Cache-Control', 'public, s-maxage=21600, stale-while-revalidate=86400');
+    if (hubS4Cache && (Date.now() - hubS4CacheTime < HUB_S4_CACHE_TTL)) {
+      return res.json(hubS4Cache);
+    }
+
+    const tree = await getCategoryTree();
+
+    // 1) counts — استعلام واحد: distinct category + عدد المنتجات لكل واحد
+    //    (lower() على الجنبين = نفس معنى ILIKE الحي)
+    let countsMap = null;
+    let totalProducts = 0;
+    try {
+      const { rows } = await pool.query(
+        "SELECT lower(category) AS cat, COUNT(*)::int AS n " +
+        "FROM products " +
+        "WHERE stock_status = true AND category IS NOT NULL AND category <> '' " +
+        "GROUP BY lower(category)"
+      );
+      countsMap = new Map();
+      for (const r of rows) countsMap.set(r.cat, r.n);
+      totalProducts = rows.reduce((s, r) => s + r.n, 0);
+    } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
+      console.warn('hub counts query failed (non-fatal):', e.message);
+      countsMap = null;
+    }
+
+    // 2) صور تمثيلية للجذور فقط (L1) — نفس نمط /api/categories
+    const imgMap = new Map();
+    try {
+      const { rows: imgs } = await pool.query(
+        "SELECT c.slug, img.image_url " +
+        "FROM categories c " +
+        "LEFT JOIN LATERAL ( " +
+        "  SELECT p.image_url FROM products p " +
+        "  WHERE p.stock_status = true " +
+        "    AND p.image_url IS NOT NULL AND p.image_url <> '' " +
+        "    AND (p.category = c.slug OR p.category LIKE c.slug || '-%' OR p.category LIKE c.slug || '/%') " +
+        "  ORDER BY p.sort_order DESC NULLS LAST, p.is_sourced DESC, " +
+        "    (p.video_url IS NOT NULL AND p.video_url <> '') DESC, " +
+        "    COALESCE(array_length(p.images, 1), 0) DESC, p.id DESC " +
+        "  LIMIT 1 " +
+        ") img ON true " +
+        "WHERE c.level = 1"
+      );
+      for (const r of imgs) imgMap.set(r.slug, r.image_url);
+    } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
+      console.warn('hub images query failed (non-fatal):', e.message);
+    }
+
+    // 3) بناء الشجرة: slugPath كامل + count لكل عقدة
+    //    prefix raw (بلا boundary) — مطابق 1:1 للعدّاد الحي ILIKE 'path%'
+    let totalCategories = 0;
+    const attachS4 = (nodes, prefix) => {
+      for (const n of nodes || []) {
+        if (!n || !n.slug) continue;
+        totalCategories++;
+        n.slugPath = prefix ? (prefix + '/' + n.slug) : n.slug;
+        if (countsMap) {
+          let c = 0;
+          const p = n.slugPath.toLowerCase();
+          for (const [cat, cnt] of countsMap) {
+            if (cat.startsWith(p)) c += cnt;
+          }
+          n.count = c;
+        } else {
+          n.count = null;
+        }
+        if (imgMap.has(n.slug)) n.image_url = imgMap.get(n.slug);
+        if (Array.isArray(n.children) && n.children.length) {
+          attachS4(n.children, n.slugPath);
+        }
+      }
+    };
+    attachS4(Array.isArray(tree) ? tree : [], '');
+
+    hubS4Cache = {
+      nodes: Array.isArray(tree) ? tree : [],
+      counts: !!countsMap,
+      totals: countsMap ? { categories: totalCategories, products: totalProducts } : null,
+    };
+    hubS4CacheTime = Date.now();
+    return res.json(hubS4Cache);
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
+    logger.logError('Route Handler', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ═══════════════ END S4 CATEGORIES HUB ═══════════════
 app.post('/api/admin/backfill-categories', async (req, res) => {
   res.json({ message: 'Backfill started in background. Check server logs for progress.' });
   (async () => {
