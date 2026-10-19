@@ -118,6 +118,18 @@ router.get('/search', async (req, res) => {
       })
     );
 
+    // 🔍 فحص envelope ديال CJ — listV2 (ES-backed) كيرجع 200 أو 0؛ أي كود آخر = خطأ حقيقي
+    //    (نقاط 16900500 / أوث 1600001 / باراميتر) — كنظهرو كود CJ بدل ما نبلعوه بصمت
+    const envCode = r?.data?.code;
+    if (envCode !== 200 && envCode !== 0) {
+      console.error('[cj-live/search][cj-envelope]', envCode, r?.data?.message || '');
+      return res.status(502).json({
+        error: 'CJ unavailable',
+        cjCode: envCode ?? null,
+        cjMessage: String(r?.data?.message || '') || null,
+      });
+    }
+
     const d = r?.data?.data || {};
     const list = Array.isArray(d.content) ? d.content : [];
     const totalRecords = parseInt(d.totalRecords, 10) || 0;
@@ -173,6 +185,16 @@ router.get('/product/:pid', async (req, res) => {
       })
     );
 
+    // 🔍 فحص envelope ديال CJ — product/query
+    const envCodeQ = r?.data?.code;
+    if (envCodeQ !== 200 && envCodeQ !== 0) {
+      console.error('[cj-live/product][cj-envelope]', envCodeQ, r?.data?.message || '');
+      return res.status(502).json({
+        error: 'CJ unavailable',
+        cjCode: envCodeQ ?? null,
+        cjMessage: String(r?.data?.message || '') || null,
+      });
+    }
     const d = r?.data?.data;
     if (!d || !d.pid) return res.status(404).json({ error: 'Product not found' });
 
@@ -235,9 +257,16 @@ router.get('/product/:pid', async (req, res) => {
               { ...config, headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' }, timeout: 15000 }
             )
           );
-          const fd = fr?.data?.data;
-          channels = Array.isArray(fd) ? fd : (fd?.list || fd?.channels || fd?.content || []);
-          if (channels.length) cacheSet(freightCache, fkey, channels);
+          const fenv = fr?.data;
+          if (!fenv || (fenv.code !== 200 && fenv.code !== 0)) {
+            // خطأ envelope ديال CJ (نقاط/أوث) — نسجلو بالعلم، الفريت غادي يرجع للتقدير
+            console.error('[cj-live/product][freight][cj-envelope]', fenv?.code, fenv?.message || '');
+            shipping = { source: 'cj-error', cjCode: fenv?.code ?? null, cjMessage: String(fenv?.message || '') || null };
+          } else {
+            const fd = fenv.data;
+            channels = Array.isArray(fd) ? fd : (fd?.list || fd?.channels || fd?.content || []);
+            if (channels.length) cacheSet(freightCache, fkey, channels);
+          }
         } catch (fe) {
           console.error('[cj-live/product][freight]', fe.message);
         }
@@ -271,10 +300,14 @@ router.get('/product/:pid', async (req, res) => {
 
     if (shipping.source !== 'cj-live') {
       // 🛟 fallback — تقدير v3.1 القديم (نفس المعادلة) مع علامة المصدر
+      //    إلا كان الخطأ من CJ envelope كنحفظو التشخيص ف cjError (تشخيصي فقط)
+      const cjErr = shipping.source === 'cj-error'
+        ? { cjCode: shipping.cjCode ?? null, cjMessage: shipping.cjMessage ?? null } : null;
       shipping = {
         source: 'estimate',
         amount: +(5 + Math.max(weight, 50) / 1000 * 4).toFixed(2),
         currency: 'USD',
+        ...(cjErr ? { cjError: cjErr } : {}),
       };
     }
 
