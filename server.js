@@ -907,6 +907,101 @@ app.get('/api/admin/track/:trackNumber', async (req, res) => {
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
+// ════════════════════════════════════════════
+// 🚚 Kit 27 — CJ Live Shipping Estimate (freightCalculate حقيقي)
+// GET /api/shipping/estimate?pid=123&country=MA
+//   · cache 6 ساعات على (pid|country) — 10 نقاط فقط على cache-miss
+//   · pre-filter بـ shipping_matrix (دولة غير مدعومة = 0 نقطة)
+//   · محدد IP بسيط: 30 طلب / 10 دقايق / IP
+// ════════════════════════════════════════════
+const shippingEstimateCache = new Map();
+const SHIPPING_ESTIMATE_TTL_MS = 6 * 60 * 60 * 1000;
+const shipIpHits = new Map();
+
+app.get('/api/shipping/estimate', async (req, res) => {
+  try {
+    const pid = parseInt(String(req.query.pid || ''), 10);
+    const country = String(req.query.country || '').trim().toUpperCase().slice(0, 2);
+    if (!Number.isFinite(pid) || pid <= 0 || !/^[A-Z]{2}$/.test(country)) {
+      return res.status(400).json({ error: 'pid (numeric) and country (ISO-2) required' });
+    }
+
+    const ip = req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
+    const nowMs = Date.now();
+    const hits = (shipIpHits.get(ip) || []).filter(ts => nowMs - ts < 10 * 60 * 1000);
+    if (hits.length >= 30) return res.status(429).json({ supported: false, error: 'Too many requests' });
+    hits.push(nowMs);
+    shipIpHits.set(ip, hits);
+    if (shipIpHits.size > 5000) shipIpHits.clear();
+
+    const cacheKey = pid + '|' + country;
+    const cached = shippingEstimateCache.get(cacheKey);
+    if (cached && nowMs - cached.t < SHIPPING_ESTIMATE_TTL_MS) return res.json(cached.data);
+
+    const { rows } = await pool.query(
+      "SELECT id, cj_product_id, variants FROM products WHERE id = $1 AND cj_product_id IS NOT NULL AND cj_product_id NOT LIKE 'MANUAL_%' LIMIT 1",
+      [pid]
+    );
+    if (!rows.length) return res.status(404).json({ supported: false, error: 'product not found or not CJ-linked' });
+
+    let variants = rows[0].variants;
+    if (typeof variants === 'string') { try { variants = JSON.parse(variants); } catch (e) { variants = []; } }
+    const vid = Array.isArray(variants) && variants[0] && variants[0].vid;
+    if (!vid) return res.status(404).json({ supported: false, error: 'no CJ variant (vid) on product' });
+
+    try {
+      const sm = await pool.query('SELECT is_supported FROM shipping_matrix WHERE country_code = $1', [country]);
+      if (sm.rows.length && sm.rows[0].is_supported === false) {
+        const data = { supported: false, reason: 'country unsupported (matrix)', country, source: 'shipping_matrix' };
+        shippingEstimateCache.set(cacheKey, { t: nowMs, data });
+        return res.json(data);
+      }
+    } catch (smErr) { console.warn('⚠️ [ShipEstimate] matrix prefilter skipped:', smErr.message); }
+
+    const cjRes = await cjRequest((token, config) =>
+      axios.post('https://developers.cjdropshipping.com/api2.0/v1/logistic/freightCalculate', {
+        startCountryCode: 'CN',
+        endCountryCode: country,
+        products: [{ vid, quantity: 1 }]
+      }, { ...config, headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } })
+    );
+
+    const list = Array.isArray(cjRes.data && cjRes.data.data) ? cjRes.data.data : [];
+    if (!list.length) {
+      const data = { supported: false, reason: 'no carriers returned', country, source: 'cj-live' };
+      shippingEstimateCache.set(cacheKey, { t: nowMs, data });
+      return res.json(data);
+    }
+
+    const byPrice = list.slice().sort((a, b) => (Number(a.logisticPrice) || 1e12) - (Number(b.logisticPrice) || 1e12));
+    const byDays  = list.slice().sort((a, b) => (parseInt(a.logisticAging, 10) || 9999) - (parseInt(b.logisticAging, 10) || 9999));
+    const cheapest = byPrice[0];
+    const fastest = byDays[0];
+    const agingNums = String(cheapest.logisticAging || '').match(/\d+/g);
+    const agingDays = (agingNums && agingNums.length)
+      ? { min: parseInt(agingNums[0], 10), max: parseInt(agingNums[agingNums.length - 1], 10) }
+      : null;
+
+    const data = {
+      supported: true,
+      country,
+      cheapest: { price: cheapest.logisticPrice, carrier: cheapest.logisticName, aging: cheapest.logisticAging || null },
+      fastest: { days: fastest.logisticAging || null, price: fastest.logisticPrice, carrier: fastest.logisticName },
+      agingDays,
+      carriersCount: list.length,
+      source: 'cj-live',
+      cached: false
+    };
+    shippingEstimateCache.set(cacheKey, { t: nowMs, data });
+    if (shippingEstimateCache.size > 20000) shippingEstimateCache.clear();
+    return res.json(data);
+  } catch (err) {
+    try { Sentry.captureException(err); } catch (__laclarcGuard) {}
+    logger.logError('ShippingEstimate', err);
+    return res.status(502).json({ supported: false, error: 'upstream CJ error' });
+  }
+});
+
 // ==========================================
 // فئات CJ والـ Backfill
 // ==========================================

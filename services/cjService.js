@@ -99,12 +99,34 @@ function cjPace() {
   return job;
 }
 
+// ==========================================
+// 📊 Kit 27 — CJ Points monitor (نظام النقاط فعال من يوليوز 2026)
+// كل response ديال CJ فيه pointsInfo — نسجلو مرة فالساعة،
+// أو فوراً إلا نقص الأيقونة لأقل من 15% — المراقبة عمرها ما كتوقف طلب.
+// ==========================================
+let cjPointsLastLog = 0;
+function logCjPointsInfo(resp) {
+  try {
+    const pi = resp && resp.data && resp.data.pointsInfo;
+    if (!pi || typeof pi.remaining !== 'number') return;
+    const ratio = pi.total > 0 ? pi.remaining / pi.total : 1;
+    const now = Date.now();
+    if (ratio < 0.15 || now - cjPointsLastLog > 60 * 60 * 1000) {
+      cjPointsLastLog = now;
+      const tag = ratio < 0.15 ? '⚠️ [CJ Points LOW]' : '📊 [CJ Points]';
+      console.log(tag + ' used=' + pi.usedToday + '/' + pi.total + ' remaining=' + pi.remaining);
+    }
+  } catch (e) { /* monitoring never breaks requests */ }
+}
+
 async function cjRequest(requestFn, retryCount = 0) {
   try {
     const token = await getCJToken();
     const config = { timeout: 45000 };
     await cjPace();
-    return await requestFn(token, config);
+    const __cjResp27 = await requestFn(token, config);
+    logCjPointsInfo(__cjResp27);
+    return __cjResp27;
   } catch (err) {
     const status = err.response?.status;
     const cjCode = err.response?.data?.code;

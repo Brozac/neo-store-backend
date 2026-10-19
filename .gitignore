@@ -14,19 +14,7 @@
 !.env.example
 .env.oauth_template
 
-# Python Testing & Linters cache
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.tox/
-.nox/
-.coverage
-.coverage.*
-htmlcov/
-.hypothesis/
 
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
 
 # ─── 🔐 Security keys / secrets (حتى باسم مختلف) ───
 *.pem
