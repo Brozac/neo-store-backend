@@ -125,11 +125,14 @@ function isProductEligible(details, opts = {}) {
 // ==========================================
 // landed = cost + ship → + fees → ÷ (1 - margin) → floor psychological
 // الخفيف يلتقي مع المضاعفات القديمة تقريباً · الغارق (خفيف الرخيص لا، الثقيل الرخيص) يتصلح
-function calculateSellingPrice(cjPrice, weightGrams = 0) {
+// 🆕 Geo Flow v3.0 — shipOverrideUsd (اختياري): الشحن الحقيقي من freightCalculateTip.
+// null/0 → التقدير القديم (estimateShipUsd) — التوافقية الخلفية 100% مع كل المستدعين.
+function calculateSellingPrice(cjPrice, weightGrams = 0, shipOverrideUsd = null) {
   const cost = parseMaxNumber(cjPrice);
   if (cost <= 0) return { safePrice: PRICE_FLOOR(), safeOriginalPrice: null };
 
-  const ship = estimateShipUsd(weightGrams);
+  const override = Number(shipOverrideUsd);
+  const ship = (override > 0 && isFinite(override)) ? override : estimateShipUsd(weightGrams);
   const landed = cost + ship;
   const fees = landed * 0.05 + 0.45; // دفع (~2.9%+$0.30) + طوارئ
 

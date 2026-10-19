@@ -1,10 +1,17 @@
-// routes/cjLiveBridge.js - Laclarc Live Bridge (v1 rebuild)
+// routes/cjLiveBridge.js - Laclarc Live Bridge (v3.0 GEO FLOW)
 // ============================================================
-// M#25 rebuild — CJ live sourcing with v3.1 pricing law:
-//   • search  : CJ global search → laclarcPrice (est. 500g) per result
-//   • product : CJ details → laclarcPrice (real weight) + XSS-shielded desc
-//   • الـ variants كتمرر خام — الإضافة للسلة كتدير أول variant vid
-// نقاط CJ: كتخصم من الحساب — محمي بـ rate limiter (R2)
+// 🌍 Geo Flow — Integration layer على CJ API V2.0:
+//   البلد ديال الزائر (GeoIP) → التحقق من الـ 250 → listV2 بـ countryCode
+//   → freightCalculateTip للثمن المباشر (الشحن الحقيقي، ماشي التقدير)
+//
+//   GET /geo            — كشف البلد + التحقق من سجل CJ الـ 250 دولة
+//   GET /search         — /product/listV2 (V1 متقادمة!) + countryCode + كاش نقاط
+//   GET /product/:pid   — /product/query + /logistic/freightCalculateTip
+//
+// 💰 v3.1 pricing law — الشحن الحقيقي يدخل التسعير عبر shipOverrideUsd
+// 🛡️ النقاط (Points): listV2 = 50pt · freightCalculateTip = 10pt
+//    → كاش بحث 5 دقائق + كاش فريت 10 دقائق + limiter 20 بحث/10 دقائق/IP
+// 🔁 التوافقية الخلفية: نفس عقود الاستجابة ديال v1 (products/pid/laclarcPrice/...)
 // ============================================================
 const express = require('express');
 const router = express.Router();
@@ -12,67 +19,146 @@ const axios = require('axios');
 const { cjRequest } = require('../services/cjService');
 const { calculateSellingPrice, sanitizeDescription } = require('../services/productImportService');
 const { parseMaxNumber, parseWeightGrams, parseJsonArray, parseImageList } = require('../utils/cjNormalize');
+const geo = require('../lib/geoCountry');
 
 const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
 
-// ── Rate limiter مبني — 20 بحث/10 دقائق/IP (نفس عائلة second-shot) ──
-const buckets = new Map();
-function limiter(req, res, next) {
-  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
-  const now = Date.now();
-  const b = buckets.get(ip) || [];
-  const fresh = b.filter(t => now - t < 10 * 60 * 1000);
-  if (fresh.length >= 20) {
-    return res.status(429).json({ error: 'Too many searches. Try again later.' });
+// ════════════════════════════════════════════════════════════
+// كاشات الذاكرة — حماية نقاط CJ (كل 50pt بحث = مبلغ من الرصيد اليومي)
+// ════════════════════════════════════════════════════════════
+const SEARCH_TTL = 5 * 60 * 1000;     // 5 دقائق — نتائج البحث
+const FREIGHT_TTL = 10 * 60 * 1000;   // 10 دقائق — عروض الشحن
+const searchCache = new Map();        // "q|page|country" → { data, ts }
+const freightCache = new Map();       // "pid|vid|src|dest" → { data, ts }
+
+function cacheGet(map, key, ttl) {
+  const hit = map.get(key);
+  if (hit && Date.now() - hit.ts < ttl) return hit.data;
+  if (hit) map.delete(key);
+  return null;
+}
+function cacheSet(map, key, data) {
+  map.set(key, { data, ts: Date.now() });
+  if (map.size > 2000) { // GC خفيف — قصّ القديم
+    const cut = Date.now() - Math.max(SEARCH_TTL, FREIGHT_TTL);
+    for (const [k, v] of map) if (v.ts < cut) map.delete(k);
   }
-  fresh.push(now);
-  buckets.set(ip, fresh);
-  // GC خفيف — ما كينموش الذاكرة
-  if (buckets.size > 5000) {
-    for (const [k, v] of buckets) if (v.every(t => now - t > 10 * 60 * 1000)) buckets.delete(k);
-  }
-  next();
 }
 
-// ═══ GET /api/cj-live/search?q=&page= ═══
-router.get('/search', limiter, async (req, res) => {
+// ── Rate limiter مبني — 20 بحث/10 دقائق/IP — كيتطبق غير على MISS (الكاش حر)
+//    التطبيق داخل /search بعد فحص الكاش — شوف الكتلة "limiter — فقط على MISS" ──
+const buckets = new Map();
+
+// ════════════════════════════════════════════════════════════
+// 🌍 GET /api/cj-live/geo — كشف البلد + باب الـ 250
+// الاستجابة: { country, name, supported, source, registryCount, freightReady }
+// ════════════════════════════════════════════════════════════
+router.get('/geo', async (req, res) => {
+  try {
+    const g = await geo.resolveVisitorCountry(req);
+    return res.json({
+      country: g.code,
+      name: geo.countryName(g.code),
+      supported: g.supported,
+      source: g.source,
+      registryCount: geo.registryCount(),
+      freightReady: g.supported, // الشحن الحقيقي ممكن فقط للدول المدعومة
+      ip: g.ip,
+    });
+  } catch (e) {
+    console.error('[cj-live/geo]', e.message);
+    const def = geo.normalize(process.env.DEFAULT_COUNTRY) || 'US';
+    return res.json({ country: def, name: geo.countryName(def), supported: true, source: 'default', registryCount: geo.registryCount(), freightReady: true });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+// 🔍 GET /api/cj-live/search?q=&page=&country=
+// v3: /product/listV2 (50pt) + countryCode=بلد الزائر
+// ════════════════════════════════════════════════════════════
+router.get('/search', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    if (q.length < 2) return res.json({ products: [] });
+    if (q.length < 2) return res.json({ geo: {}, products: [], page, hasMore: false });
+
+    // 🌍 البلد: override → CDN → IP lookup → default (كاش IP داخلي 24h)
+    const g = await geo.resolveVisitorCountry(req);
+    const country = g.supported ? g.code : null; // غير مدعوم → وضع عالمي بلا فلتر
+    const geoInfo = { country: g.code, name: geo.countryName(g.code), supported: g.supported, source: g.source };
+
+    // 💰 الكاش قبل الـ limiter — الضربة المدفوعة (50pt) غير على MISS
+    const ckey = `${q.toLowerCase()}|${page}|${country || '*'}`;
+    const cached = cacheGet(searchCache, ckey, SEARCH_TTL);
+    if (cached) return res.json({ ...cached, geo: geoInfo, cached: true });
+
+    // 🛡️ limiter — فقط على الطلبات اللي غادي تضرب CJ فعلاً
+    const limited = new Promise((resolve) => {
+      const ip = geo.clientIp(req) || 'unknown';
+      const now = Date.now();
+      const b = (buckets.get(ip) || []).filter(t => now - t < 10 * 60 * 1000);
+      if (b.length >= 20) return resolve(false);
+      b.push(now); buckets.set(ip, b);
+      if (buckets.size > 5000) for (const [k, v] of buckets) if (v.every(t => now - t > 10 * 60 * 1000)) buckets.delete(k);
+      resolve(true);
+    });
+    if (!(await limited)) {
+      return res.status(429).json({ error: 'Too many searches. Try again later.' });
+    }
+
+    const params = { keyWord: q, page, size: 20 }; // listV2: keyWord (ماشي keyword ديال V1!)
+    if (country) params.countryCode = country;      // فلتر المخزون فبلد الزائر
 
     const r = await cjRequest((token, config) =>
-      axios.get(`${CJ_API}/product/list`, {
+      axios.get(`${CJ_API}/product/listV2`, {
         ...config,
         headers: { 'CJ-Access-Token': token },
-        params: { keyword: q, pageNum: page, pageSize: 20 },
+        params,
         timeout: 15000,
       })
     );
 
-    const list = r?.data?.data?.list || [];
+    const d = r?.data?.data || {};
+    const list = Array.isArray(d.content) ? d.content : [];
+    const totalRecords = parseInt(d.totalRecords, 10) || 0;
+
     const products = list.map(p => {
-      // 💰 v3.1 — التسعير المقدر (بلا وزن في الـ list — التفاصيل كتجيب الحقيقي)
-      const cost = parseMaxNumber(p.sellPrice);
+      // 💰 v3.1 — التسعير المقدر فاللائحة (500g) — التفاصيل كتجيب الفريت الحقيقي
+      const cost = Math.min(
+        ...[p.discountPrice, p.nowPrice, p.sellPrice]
+          .map(v => parseMaxNumber(v))
+          .filter(v => v > 0)
+      ) || parseMaxNumber(p.sellPrice) || 0;
       const { safePrice } = calculateSellingPrice(cost, 500);
       return {
-        pid: String(p.pid || ''),
-        title: p.productNameEn || '',
-        price: parseMaxNumber(p.sellPrice),        // كلفة CJ (للعرض الداخلي فقط)
-        laclarcPrice: safePrice,                    // 💰 السعر اللي كيشوفه الزبون
-        image: p.productImage || p.bigImage || '',
-        ordersCount: parseInt(p.ordersCount, 10) || 0,
+        pid: String(p.id || p.pid || ''),
+        title: p.nameEn || p.productNameEn || '',
+        price: cost,                                // كلفة CJ (داخلي)
+        laclarcPrice: safePrice,                    // 💰 السعر المعروض
+        image: p.bigImage || p.productImage || '',
+        ordersCount: parseInt(p.listedNum ?? p.ordersCount, 10) || 0,
+        deliveryCycle: p.deliveryCycle || '',       // 🆕 "3-5" أيام — من listV2 مباشرة
+        isVideo: !!p.isVideo,
       };
     }).filter(p => p.pid);
 
-    return res.json({ products, page, hasMore: list.length >= 20 });
+    const payload = {
+      products, page,
+      hasMore: list.length >= 20 && page < Math.min(parseInt(d.totalPages, 10) || 1000, 300),
+      totalRecords,
+    };
+    cacheSet(searchCache, ckey, payload);
+    return res.json({ ...payload, geo: geoInfo });
   } catch (e) {
     console.error('[cj-live/search]', e.message);
     return res.status(502).json({ error: 'CJ unavailable' });
   }
 });
 
-// ═══ GET /api/cj-live/product/:pid ═══
+// ════════════════════════════════════════════════════════════
+// 📦 GET /api/cj-live/product/:pid?country=&vid=
+// v3: /product/query + 🚚 freightCalculateTip — الثمن المباشر
+// ════════════════════════════════════════════════════════════
 router.get('/product/:pid', async (req, res) => {
   try {
     const pid = String(req.params.pid || '').trim();
@@ -90,11 +176,127 @@ router.get('/product/:pid', async (req, res) => {
     const d = r?.data?.data;
     if (!d || !d.pid) return res.status(404).json({ error: 'Product not found' });
 
-    // 💰 v3.1 — الوزن الحقيقي + أول variant = السعر المعروض
+    // 🌍 البلد — للفريت الحقيقي
+    const g = await geo.resolveVisitorCountry(req);
+    const dest = g.supported ? g.code : null;
+    const geoInfo = { country: g.code, name: geo.countryName(g.code), supported: g.supported, source: g.source };
+
+    // ⚖️ الوزن الحقيقي (المستوى المنتج)
     const weight = Math.max(parseWeightGrams(d.productWeight), parseWeightGrams(d.packingWeight));
+
+    // 🏷️ productProp — من productProEnSet (Appendix D) — شرط صلب للفريت
+    const proList = parseJsonArray(d.productProEnSet) || parseJsonArray(d.productProSet) || [];
+    const rawProp = proList.find(x => typeof x === 'string' && x.trim());
+    const productProp = (rawProp && rawProp.trim() && !/^PROOERTY$/i.test(rawProp.trim()))
+      ? String(rawProp.trim()).slice(0, 40) : 'COMMON';
+
+    // 📐 الحجم — L/W/H (mm) من أول variant → cm³
     const v0 = (Array.isArray(d.variants) && d.variants[0]) || {};
-    const cost = parseMaxNumber(v0.variantSellPrice) || parseMaxNumber(d.sellPrice) || 0;
-    const { safePrice } = calculateSellingPrice(cost, weight);
+    const numF = (o, keys) => { for (const k of keys) { const n = parseFloat(o?.[k]); if (n > 0 && isFinite(n)) return n; } return 0; };
+    const L = numF(v0, ['length', 'variantLength', 'productLength', 'long']);
+    const W = numF(v0, ['width', 'variantWidth', 'productWidth']);
+    const H = numF(v0, ['height', 'variantHeight', 'productHeight']);
+    const volumeCm3 = L && W && H ? Math.round((L * W * H) / 1000) : 0;
+
+    // 🏭 srcAreaCode — من مخزون أول variant: المخزن المحلي إن وجد، وإلا CN
+    const invCountries = (Array.isArray(v0.inventories) ? v0.inventories : [])
+      .filter(i => (parseInt(i.totalInventory, 10) || parseInt(i.cjInventory, 10) || 0) > 0)
+      .map(i => geo.normalize(i.countryCode)).filter(Boolean);
+    const srcAreaCode = dest && invCountries.includes(dest) ? dest
+      : (invCountries.includes('CN') ? 'CN' : (invCountries[0] || 'CN'));
+
+    // 🚚 freightCalculateTip — الثمن المباشر (10pt) — كاش 10 دقائق
+    // (قبل mapping الـ variants باش v0 ياخد الفريت الحقيقي فالتسعير —
+    //  Add-to-Cart كيستعمل laclarcVariantPrice → خاصو يطابق laclarcPrice المعروض)
+    const cost0 = parseMaxNumber(v0.variantSellPrice) || parseMaxNumber(d.sellPrice) || 0;
+    let shipping = { source: 'unavailable', amount: 0, currency: 'USD' };
+    let freightUsd = 0;
+
+    if (dest) {
+      const fkey = `${pid}|${v0.vid || 'x'}|${srcAreaCode}|${dest}`;
+      const cachedF = cacheGet(freightCache, fkey, FREIGHT_TTL);
+      let channels = cachedF;
+
+      if (!channels) {
+        const row = {
+          srcAreaCode,
+          destAreaCode: dest,
+          weight: Math.max(weight, 1),       // شرط صلب: weight > 0
+          productProp,                        // شرط صلب
+          productTypes: [0],
+        };
+        if (volumeCm3 > 0) row.volume = volumeCm3;
+        if (v0.variantSku) row.skuList = [String(v0.variantSku)];
+
+        try {
+          const fr = await cjRequest((token, config) =>
+            axios.post(`${CJ_API}/logistic/freightCalculateTip`,
+              { reqDTOS: [row] },
+              { ...config, headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' }, timeout: 15000 }
+            )
+          );
+          const fd = fr?.data?.data;
+          channels = Array.isArray(fd) ? fd : (fd?.list || fd?.channels || fd?.content || []);
+          if (channels.length) cacheSet(freightCache, fkey, channels);
+        } catch (fe) {
+          console.error('[cj-live/product][freight]', fe.message);
+        }
+      }
+
+      // أرخص قناة صالحة → totalPostageFee = الثمن المباشر المعروض
+      const valid = (channels || [])
+        .map(c => ({
+          amount: parseMaxNumber(c.totalPostageFee) || (parseMaxNumber(c.wrapPostage) || parseMaxNumber(c.postage) || 0) + (parseMaxNumber(c.taxesFee) || 0) + (parseMaxNumber(c.tariff) || 0),
+          name: c.channel?.enName || c.enName || c.logisticName || '',
+          id: c.channel?.id ?? c.option?.id ?? null,
+          arrivalTime: c.arrivalTime || c.option?.arrivalTime || '',
+        }))
+        .filter(c => c.amount > 0)
+        .sort((a, b) => a.amount - b.amount);
+
+      if (valid.length) {
+        freightUsd = valid[0].amount;
+        shipping = {
+          source: 'cj-live',
+          amount: freightUsd,
+          currency: 'USD',
+          channelName: valid[0].name,
+          channelId: valid[0].id,
+          arrivalTime: valid[0].arrivalTime,
+          srcAreaCode,
+          options: valid.slice(0, 3), // أفضل 3 قنوات للعرض
+        };
+      }
+    }
+
+    if (shipping.source !== 'cj-live') {
+      // 🛟 fallback — تقدير v3.1 القديم (نفس المعادلة) مع علامة المصدر
+      shipping = {
+        source: 'estimate',
+        amount: +(5 + Math.max(weight, 50) / 1000 * 4).toFixed(2),
+        currency: 'USD',
+      };
+    }
+
+    // 💰 أسعار الـ variants — وزن الـ variant نفسه
+    //    v0 كياخد الفريت الحقيقي (shipOverride) — الباقي تقدير (بلا حرق نقاط إضافية)
+    const variants = (d.variants || []).map((v, idx) => {
+      const vWeight = Math.max(parseWeightGrams(v.weight), 0) || weight;
+      const vCost = parseMaxNumber(v.variantSellPrice) || parseMaxNumber(d.sellPrice) || 0;
+      const vFreight = idx === 0 && freightUsd > 0 ? freightUsd : null;
+      return {
+        vid: v.vid,
+        variantKey: v.variantKey || '',
+        variantSellPrice: vCost, // كلفة CJ للـ variant
+        laclarcVariantPrice: calculateSellingPrice(vCost, vWeight, vFreight).safePrice,
+        inventoryCountries: (Array.isArray(v.inventories) ? v.inventories : [])
+          .filter(i => (parseInt(i.totalInventory, 10) || 0) > 0)
+          .map(i => geo.normalize(i.countryCode)).filter(Boolean),
+      };
+    });
+
+    // 💰 v3.0 — السعر الرسمي: قانون v3.1 بالفريت الحقيقي (shipOverrideUsd)
+    const { safePrice } = calculateSellingPrice(cost0, weight, freightUsd > 0 ? freightUsd : null);
 
     return res.json({
       pid: String(d.pid),
@@ -102,18 +304,15 @@ router.get('/product/:pid', async (req, res) => {
       description: sanitizeDescription(d.description || ''), // 🔒 XSS shield
       bigImage: d.bigImage || '',
       images: parseImageList(d, { includeVariantImages: false, max: 12 }),
-      variants: (d.variants || []).map(v => ({
-        vid: v.vid,
-        variantKey: v.variantKey || '',
-        variantSellPrice: parseMaxNumber(v.variantSellPrice), // كلفة CJ للـ variant
-        // 💰 سعر البيع لكل variant — نستعملو في Add-to-Cart
-        laclarcVariantPrice: calculateSellingPrice(parseMaxNumber(v.variantSellPrice), weight).safePrice,
-      })),
+      variants,
       sellPrice: parseMaxNumber(d.sellPrice),
-      laclarcPrice: safePrice,     // 💰 السعر الرسمي المعروض — هامش 35% محمي
+      laclarcPrice: safePrice,     // 💰 السعر الرسمي — فريت حقيقي إن توفر، وإلا تقدير
       original_price: null,        // قرار 1 — بلا strikethrough مولّد
-      estimatedShipUsd: +(5 + Math.max(weight, 50) / 1000 * 4).toFixed(2),
+      estimatedShipUsd: shipping.amount, // توافقية خلفية + القيمة الحقيقية إن توفرت
+      shipping,                    // 🆕 الثمن المباشر الكامل
+      geo: geoInfo,                // 🆕 بلد الزائر المستعملة
       weightGrams: weight,
+      productProp,
     });
   } catch (e) {
     console.error('[cj-live/product]', e.message);
