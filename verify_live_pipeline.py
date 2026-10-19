@@ -10,7 +10,7 @@ verify_live_pipeline.py — التحقق اللايف الكامل ديال Inte
   دورة كاملة ≈ 70..120pt (من 50,000/يوم)
 
   python verify_live_pipeline.py [BASE_URL] [--country MA]
-  v2 — كيعرض cjCode/cjMessage من أخطاء envelope ديال CJ (البريدج ≥ kit29b)
+  v3 — كيعرض cjCode + totalRecords + filterMode (فلتر المخازن — kit 29c)
 """
 import json, sys, time, urllib.request, urllib.error
 
@@ -110,7 +110,7 @@ for ti, term in enumerate(terms):
     prods = s.get("products") or []
     geo_s = (s.get("geo") or {})
     check(f"/search '{term}' جواب سليم", isinstance(prods, list),
-          f"{len(prods)} منتج · geo={geo_s.get('country')}/{geo_s.get('source')} · {ms:.0f}ms · cached={s.get('cached')}")
+          f"{len(prods)} منتج · total={s.get('totalRecords')} · mode={geo_s.get('filterMode')} · geo={geo_s.get('country')}/{geo_s.get('source')} · {ms:.0f}ms · cached={s.get('cached')}")
     if prods:
         search = s
         p0 = prods[0]
@@ -127,7 +127,8 @@ for ti, term in enumerate(terms):
 if not pid:
     print(f"\n== {ok} PASS / {bad} FAIL / {warn} WARN ==  (ما كانش pid — التحقق توقف هنا)")
     if not search:
-        print("   💡 إذا /search رجع 0 منتجات بجواب سليم: شوف cjCode فالـ 502 ولا logs Render [cj-live/search]")
+        print("   💡 0 منتجات بجواب سليم = kit29c (فلتر المخازن + فكّك productList) مازال ما تدپلويش")
+        print("      (v3.2: countryCode = فلتر المخازن — MA كتخدا كاطالوغ عالمي، والمنتجات كتفك من content[].productList)")
     sys.exit(1)
 
 # ────────────────────────────────────────────────────────────

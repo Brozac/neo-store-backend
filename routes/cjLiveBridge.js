@@ -1,11 +1,12 @@
-// routes/cjLiveBridge.js - Laclarc Live Bridge (v3.0 GEO FLOW)
+// routes/cjLiveBridge.js - Laclarc Live Bridge (v3.2 GEO FLOW)
 // ============================================================
 // 🌍 Geo Flow — Integration layer على CJ API V2.0:
-//   البلد ديال الزائر (GeoIP) → التحقق من الـ 250 → listV2 بـ countryCode
+//   البلد ديال الزائر (GeoIP) → التحقق من الـ 250 → listV2
+//   (countryCode = فلتر المخازن فقط — بلد بلا مخزن CJ = كاطالوغ عالمي)
 //   → freightCalculateTip للثمن المباشر (الشحن الحقيقي، ماشي التقدير)
 //
 //   GET /geo            — كشف البلد + التحقق من سجل CJ الـ 250 دولة
-//   GET /search         — /product/listV2 (V1 متقادمة!) + countryCode + كاش نقاط
+//   GET /search         — /product/listV2 (V1 متقادمة!) + فلتر مخازن + كاش نقاط
 //   GET /product/:pid   — /product/query + /logistic/freightCalculateTip
 //
 // 💰 v3.1 pricing law — الشحن الحقيقي يدخل التسعير عبر shipOverrideUsd
@@ -22,6 +23,50 @@ const { parseMaxNumber, parseWeightGrams, parseJsonArray, parseImageList } = req
 const geo = require('../lib/geoCountry');
 
 const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
+
+// ════════════════════════════════════════════════════════════
+// 🏭 مخازن CJ [geo-warehouse] — listV2.countryCode = "فلتر المخزون فالبلاد المحددة"
+//    (توثيق listV2 الرسمي) — يعني بلد المخزن، ماشي بلد التوصيل!
+//    البلدان اللي عندها مخازن CJ فقط كيتصيفط ليهم countryCode،
+//    والباقي = كاطالوغ عالمي (اللّائي “واش كيوصل لبلادي”
+//    كيجاوب عليه freightCalculateTip فالـ PDP — ماشي فلتر listV2)
+// ════════════════════════════════════════════════════════════
+const WAREHOUSE_SEED = new Set(['CN', 'US']); // الموثقين — globalWarehouseList كيوسعهم
+let warehouseCountries = null;                // Set — كاش 24h
+let whInflight = null;
+
+function getWarehouseCountries() {
+  if (warehouseCountries) return Promise.resolve(warehouseCountries);
+  if (whInflight) return whInflight;
+  whInflight = (async () => {
+    try {
+      const r = await cjRequest((token, config) =>
+        axios.get(`${CJ_API}/product/globalWarehouseList`, {
+          ...config,
+          headers: { 'CJ-Access-Token': token },
+          timeout: 8000,
+        })
+      );
+      const arr = r?.data?.data;
+      const set = new Set(WAREHOUSE_SEED);
+      if (Array.isArray(arr)) {
+        for (const w of arr) {
+          const c = geo.normalize(w.countryCode);
+          if (c && !w.disabled) set.add(c);
+        }
+      }
+      warehouseCountries = set;
+      console.log('[cj-live/search][warehouses]', [...set].join(','));
+    } catch (e) {
+      console.error('[cj-live/search][warehouses]', e.message);
+      warehouseCountries = new Set(WAREHOUSE_SEED); // fallback موثق — ما كيوقفش البحث
+    } finally {
+      whInflight = null;
+    }
+    return warehouseCountries;
+  })();
+  return whInflight;
+}
 
 // ════════════════════════════════════════════════════════════
 // كاشات الذاكرة — حماية نقاط CJ (كل 50pt بحث = مبلغ من الرصيد اليومي)
@@ -74,7 +119,8 @@ router.get('/geo', async (req, res) => {
 
 // ════════════════════════════════════════════════════════════
 // 🔍 GET /api/cj-live/search?q=&page=&country=
-// v3: /product/listV2 (50pt) + countryCode=بلد الزائر
+// v3.2: /product/listV2 (50pt) — countryCode = فلتر المخازن فقط (ماشي بلد التوصيل!)
+//       البلدان بلا مخزن CJ → كاطالوغ عالمي + الفريت الحقيقي فالـ PDP
 // ════════════════════════════════════════════════════════════
 router.get('/search', async (req, res) => {
   try {
@@ -85,12 +131,12 @@ router.get('/search', async (req, res) => {
     // 🌍 البلد: override → CDN → IP lookup → default (كاش IP داخلي 24h)
     const g = await geo.resolveVisitorCountry(req);
     const country = g.supported ? g.code : null; // غير مدعوم → وضع عالمي بلا فلتر
-    const geoInfo = { country: g.code, name: geo.countryName(g.code), supported: g.supported, source: g.source };
 
     // 💰 الكاش قبل الـ limiter — الضربة المدفوعة (50pt) غير على MISS
+    //    (cached.geo فيه filterMode من الـ MISS الأصلي)
     const ckey = `${q.toLowerCase()}|${page}|${country || '*'}`;
     const cached = cacheGet(searchCache, ckey, SEARCH_TTL);
-    if (cached) return res.json({ ...cached, geo: geoInfo, cached: true });
+    if (cached) return res.json({ ...cached, cached: true });
 
     // 🛡️ limiter — فقط على الطلبات اللي غادي تضرب CJ فعلاً
     const limited = new Promise((resolve) => {
@@ -107,7 +153,17 @@ router.get('/search', async (req, res) => {
     }
 
     const params = { keyWord: q, page, size: 20 }; // listV2: keyWord (ماشي keyword ديال V1!)
-    if (country) params.countryCode = country;      // فلتر المخزون فبلد الزائر
+
+    // 🏭 countryCode = فلتر المخازن (توثيق listV2: "filter products with inventory
+    //    in specified countries") — بلد المخزن، ماشي بلد التوصيل!
+    //    عند البلد مخزن CJ → فلتر محلي (شحن أسرع). بلا مخزن (بحال MA) →
+    //    كاطالوغ عالمي بلا فلتر — التوصيل كيتأكد بالفريت الحقيقي فالـ PDP.
+    let filterMode = 'worldwide';
+    if (country) {
+      const wh = await getWarehouseCountries();
+      if (wh.has(country)) { params.countryCode = country; filterMode = 'warehouse'; }
+    }
+    const geoInfo = { country: g.code, name: geo.countryName(g.code), supported: g.supported, source: g.source, filterMode };
 
     const r = await cjRequest((token, config) =>
       axios.get(`${CJ_API}/product/listV2`, {
@@ -131,7 +187,14 @@ router.get('/search', async (req, res) => {
     }
 
     const d = r?.data?.data || {};
-    const list = Array.isArray(d.content) ? d.content : [];
+    const rawContent = Array.isArray(d.content) ? d.content : [];
+    // ⚠️ الشكل الحقيقي ديال listV2 (توثيق Return الرسمي):
+    //    content[i] = مجموعة { productList: [...], keyWord, relatedCategoryList }
+    //    كنفككو productList مع حماية للشكل المسطح (توافقية إلا تبدل CJ)
+    const list = rawContent.flatMap(g =>
+      Array.isArray(g?.productList) ? g.productList
+        : (g && (g.id || g.pid || g.nameEn) ? [g] : [])
+    );
     const totalRecords = parseInt(d.totalRecords, 10) || 0;
 
     const products = list.map(p => {
@@ -158,9 +221,10 @@ router.get('/search', async (req, res) => {
       products, page,
       hasMore: list.length >= 20 && page < Math.min(parseInt(d.totalPages, 10) || 1000, 300),
       totalRecords,
+      geo: geoInfo, // 🌍 داخل الكاش — hits كيرجعو بالـ geo كاملة (فيها filterMode)
     };
     cacheSet(searchCache, ckey, payload);
-    return res.json({ ...payload, geo: geoInfo });
+    return res.json({ ...payload, cached: true });
   } catch (e) {
     console.error('[cj-live/search]', e.message);
     return res.status(502).json({ error: 'CJ unavailable' });
