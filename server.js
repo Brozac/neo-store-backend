@@ -2000,6 +2000,65 @@ app.get('/', (req, res) => res.send('Laclarc Dropshipping API is running on poin
 // ==========================================
 // مسار جلب المنتجات المحصن ضد ضغط ملايين الزوار (High-Concurrency Edge Shield)
 // ==========================================
+// ═══ [card-swatches] Kit 30 — سواتشات الصور لكارت المنتج (بداية) ═══
+// المصدر: variants JSONB (CJ product/query) — variantKey بصيغة CJ الرسمية "Color-Size"
+// (توثيق CJ: variants[].variantKey مثال "Black-XXL" · variants[].variantImage · vid)
+// SW_SQL كيستخرج: لون واحد (قبل آخر -) + أول صورة + أول vid لكل لون (بترتيب أول ظهور)
+// withSwatches كيفلتر: المقاسات-فقط (XL/42...) + الصور المكررة · سقف 5 · swMore = الباقي
+// ⚡ صفر نقاط CJ — عملية DB محلية بحتة · الفرع الكامل (FULL_CAP=5000) بلا سواتشات عمداً (الأداء)
+const SW_SIZE_ONLY_RX = /^(?:xxs|xs|s|m|l|xl|xxl|2xl|3xl|4xl|5xl|6xl|7xl|8xl|\d{1,4})$/i;
+const SW_MAX = 5;
+const SW_SQL = `, COALESCE((
+  SELECT json_agg(json_build_object('c', t.c, 'i', t.i, 'v', t.v) ORDER BY t.ord)
+  FROM (
+    SELECT regexp_replace(v.val->>'variantKey', '-[^-]+$', '') AS c,
+           (array_agg(v.val->>'variantImage' ORDER BY v.ord))[1] AS i,
+           (array_agg(v.val->>'vid' ORDER BY v.ord))[1] AS v,
+           min(v.ord) AS ord
+    FROM jsonb_array_elements(CASE WHEN jsonb_typeof(variants) = 'array' THEN variants ELSE '[]'::jsonb END) WITH ORDINALITY AS v(val, ord)
+    WHERE COALESCE(v.val->>'variantImage', '') <> '' AND COALESCE(v.val->>'variantKey', '') <> ''
+    GROUP BY 1
+  ) t
+), '[]'::json) AS swatches`;
+
+function withSwatches(rows) {
+  try {
+    if (!Array.isArray(rows)) return rows;
+    for (const r of rows) {
+      if (!r || typeof r !== 'object') continue;
+      if (!('swatches' in r)) continue; // صفوف بلا الحقل (فروع غير مرقعة) → بلا لمس
+      let arr = r.swatches;
+      if (typeof arr === 'string') {
+        try { arr = JSON.parse(arr || '[]'); } catch (e) {
+          console.error('[card-swatches] swatches JSON parse failed (product ' + (r.id ?? '?') + '):', e.message);
+          arr = [];
+        }
+      }
+      if (!Array.isArray(arr)) { r.swatches = []; continue; }
+      const out = [];
+      const seenImg = new Set();
+      let total = 0;
+      for (const s of arr) {
+        const c = (s && typeof s.c === 'string') ? s.c.trim() : '';
+        const i = (s && typeof s.i === 'string') ? s.i.trim() : '';
+        if (!c || !i) continue;
+        if (SW_SIZE_ONLY_RX.test(c)) continue; // مقاس-فقط (XL/42) ماشي لون
+        total++;
+        if (seenImg.has(i)) continue; // جوج أسماء لنفس الصورة → سواتش واحد
+        seenImg.add(i);
+        if (out.length < SW_MAX) out.push({ c: c.slice(0, 40), i, v: (s && typeof s.v === 'string' && s.v) ? s.v : undefined });
+      }
+      r.swatches = out;
+      const more = total - out.length;
+      if (more > 0) r.swMore = more;
+    }
+  } catch (e) {
+    console.error('[card-swatches] withSwatches failed:', e.message); // Tenet — بلا صمت
+  }
+  return rows;
+}
+// ═══ [card-swatches] Kit 30 — نهاية ═══
+
 app.get('/api/products', async (req, res) => {
   try {
     const search = req.query.search || '';
@@ -2036,13 +2095,13 @@ app.get('/api/products', async (req, res) => {
       // 🆕 category mode — فئات كبار بلا سقف (BL-CAT-SCROLL)
       if (cat && cat !== 'All') {
         const { rows } = await pool.query(
-          `SELECT id, title, price, original_price, image_url, category, video_url
+          `SELECT id, title, price, original_price, image_url, category, video_url${SW_SQL}
            FROM products WHERE stock_status = true AND category ILIKE $1
            ORDER BY sort_order ASC, id DESC LIMIT $2 OFFSET $3`,
           [`${escapeLikeSafe(cat)}%`, PER, (pageNum - 1) * PER]  // 🩹 FIX-LIKE
         );
         res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
-        return res.json(rows);
+        return res.json(withSwatches(rows));
       }
 
       // 🆕 Temu-mosaic: homepage feed متنوع من جميع الفئات — deterministic hash shuffle
@@ -2051,14 +2110,14 @@ app.get('/api/products', async (req, res) => {
       // 📌 تكلفة موثقة: hash+sort كامل فوق الجدول في كل cache miss — البديل المستقبلي:
       //    عمود shuffle bucket يُحفظ عند massSync (يقتل الحساب الكامل)
       const { rows } = await pool.query(
-        `SELECT id, title, price, original_price, image_url, category, video_url
+        `SELECT id, title, price, original_price, image_url, category, video_url${SW_SQL}
          FROM products WHERE stock_status = true
          ORDER BY md5(category || id::text), id DESC
          LIMIT $1 OFFSET $2`,
         [PER, (pageNum - 1) * PER]
       );
       res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
-      return res.json(rows);
+      return res.json(withSwatches(rows));
     }
 
     // 🆕 عدّاد الفئة — للـ header ("3,528 products")
@@ -2077,10 +2136,10 @@ app.get('/api/products', async (req, res) => {
       const limitParam = parseInt(req.query.limit, 10);
       if (Number.isFinite(limitParam) && limitParam > 0) {
         const q = await pool.query(
-          'SELECT id, title, price, original_price, image_url, category, video_url, created_at FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC LIMIT $1',
+          `SELECT id, title, price, original_price, image_url, category, video_url${SW_SQL}, created_at FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC LIMIT $1`,
           [Math.min(limitParam, 200)]
         );
-        return res.json(q.rows);
+        return res.json(withSwatches(q.rows));
       }
       if (productsCache && (Date.now() - cacheTime < CACHE_TTL)) {
         return res.json(productsCache);
@@ -2099,7 +2158,7 @@ app.get('/api/products', async (req, res) => {
     }
 
     // 2. استعلام البحث والتصنيف (سريع جداً بفضل فهارس GIN و B-Tree)
-    let query = 'SELECT id, title, price, original_price, image_url, category, video_url FROM products WHERE stock_status = true';
+    let query = `SELECT id, title, price, original_price, image_url, category, video_url${SW_SQL} FROM products WHERE stock_status = true`;
     let params = [];
     let paramIndex = 1;
 
@@ -2121,7 +2180,7 @@ app.get('/api/products', async (req, res) => {
     query += ` ORDER BY sort_order ASC, id DESC LIMIT 200`;
 
     const result = await pool.query(query, params);
-    res.json(result.rows);
+    res.json(withSwatches(result.rows));
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     // 🩹 FIX-ERRCACHE — الخطأ ما يرثش public cache من الأعلى
     console.error('❌ Error fetching products:', err);
@@ -2139,7 +2198,7 @@ app.get('/api/products/by-ids', async (req, res) => {
       .filter(n => Number.isInteger(n) && n > 0 && n <= 2147483647).slice(0, 100);
     if (ids.length === 0) return res.json([]);
     const { rows } = await pool.query(
-      `SELECT id, title, price, original_price, image_url, category, video_url
+      `SELECT id, title, price, original_price, image_url, category, video_url${SW_SQL}
          FROM products
         WHERE stock_status = true AND id = ANY($1::int[])
         ORDER BY sort_order ASC, id DESC
@@ -2147,7 +2206,7 @@ app.get('/api/products/by-ids', async (req, res) => {
       [ids]
     );
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
-    res.json(rows);
+    res.json(withSwatches(rows));
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ /api/products/by-ids:', err.message);
     res.set('Cache-Control', 'no-store');  // 🩹 FIX-ERRCACHE

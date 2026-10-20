@@ -1,17 +1,15 @@
 @echo off
 chcp 65001 >nul
-echo ============================================
-echo  LaClarc Kit 29d — Freight Row Fix (BACKEND)
-echo ============================================
-echo.
-python patch_freight_row.py
+echo ═══════════════════════════════════════════════
+echo  LaClarc كيت 30 [card-swatches] — backend
+echo ═══════════════════════════════════════════════
+python patch_card_swatches.py --backend .
 if errorlevel 1 (
   echo.
-  echo [X] الرقعة ما كملتش — قارن الرسائل فوق
+  echo ❌ التركيب فشل — شوف kit30-diag/ والـ README-CARD-SWATCHES.txt
   pause
   exit /b 1
 )
 echo.
-echo [OK] كمل: commit + push → Render redeploy
-echo      من بعد شغل: python verify_live_pipeline.py
+echo ✅ مكتمل. خدم verify_card_swatches.py باش تتأكد، من بعد push.
 pause
