@@ -10,7 +10,7 @@ verify_live_pipeline.py — التحقق اللايف الكامل ديال Inte
   دورة كاملة ≈ 70..120pt (من 50,000/يوم)
 
   python verify_live_pipeline.py [BASE_URL] [--country MA]
-  v3 — كيعرض cjCode + totalRecords + filterMode (فلتر المخازن — kit 29c)
+  v4 — كيعرض cjCode + أسباب 1.3 unavailable + totalRecords + filterMode (kit 29d [freight-row])
 """
 import json, sys, time, urllib.request, urllib.error
 
@@ -188,7 +188,18 @@ for i, try_pid in enumerate(c for c in candidates if c):
         break
     else:
         cjx = (ship.get("cjError") or {})
-        msg = f"source={ship.get('source')} {('cjCode=' + str(cjx.get('cjCode')) + ' ' + str(cjx.get('cjMessage'))) if cjx else 'CJ ما رجعاتش قناة نحو ' + COUNTRY}"
+        un = (ship.get("unavailable") or [])
+        if cjx:
+            # خطأ envelope ديال CJ (نقاط/أوث/باراميتر)
+            detail = f"cjCode={cjx.get('cjCode')} \"{cjx.get('cjMessage')}\""
+        elif un:
+            # 🫥 200 بقنوات خاوية — 1.3 unavailableShippingMethods قال علاش
+            detail = "CJ خاوي — أسباب 1.3: " + " · ".join(
+                f"{u.get('optionName')}:{u.get('errorCode')}({str(u.get('errorEn') or '')[:36]})"
+                for u in un[:3])
+        else:
+            detail = f"CJ ما رجعاتش قناة نحو {COUNTRY} (جرّب /product/<pid>?country={COUNTRY}&debug=1)"
+        msg = f"source={ship.get('source')} {detail}"
         check("/product shipping cj-live", False, msg, is_warn=(i == 0))
         continue
 

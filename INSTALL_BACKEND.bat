@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
 echo ============================================
-echo  LaClarc Kit 29c — Geo Warehouse Fix (BACKEND)
+echo  LaClarc Kit 29d — Freight Row Fix (BACKEND)
 echo ============================================
 echo.
-python patch_geo_warehouse.py
+python patch_freight_row.py
 if errorlevel 1 (
   echo.
   echo [X] الرقعة ما كملتش — قارن الرسائل فوق

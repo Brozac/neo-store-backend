@@ -1,4 +1,4 @@
-// routes/cjLiveBridge.js - Laclarc Live Bridge (v3.2 GEO FLOW)
+// routes/cjLiveBridge.js - Laclarc Live Bridge (v3.3 GEO FLOW) [freight-row]
 // ============================================================
 // 🌍 Geo Flow — Integration layer على CJ API V2.0:
 //   البلد ديال الزائر (GeoIP) → التحقق من الـ 250 → listV2
@@ -10,6 +10,10 @@
 //   GET /product/:pid   — /product/query + /logistic/freightCalculateTip
 //
 // 💰 v3.1 pricing law — الشحن الحقيقي يدخل التسعير عبر shipOverrideUsd
+// 🚚 v3.3 freight row — صف الطلب ديال freightCalculateTip طبق الأصل من CURL الرسمي:
+//    productProp = مصفوفة · freightTrialSkuList + skuList (Y) · volume (Y) —
+//    بلاهم CJ كيرجع 200 بقنوات خاوية (بلا سبب) — و 1.3 unavailableShippingMethods
+//    كيشرح علاش (تشخيصي) + ?debug=1 كيفثّح row/env/channels
 // 🛡️ النقاط (Points): listV2 = 50pt · freightCalculateTip = 10pt
 //    → كاش بحث 5 دقائق + كاش فريت 10 دقائق + limiter 20 بحث/10 دقائق/IP
 // 🔁 التوافقية الخلفية: نفس عقود الاستجابة ديال v1 (products/pid/laclarcPrice/...)
@@ -66,6 +70,39 @@ function getWarehouseCountries() {
     return warehouseCountries;
   })();
   return whInflight;
+}
+
+// 🔬 1.3 Unavailable Shipping Methods — التشخيص الرسمي ديال freightCalculateTip:
+//    "When 1.2 returns fewer methods than expected (or an empty list), send the
+//    exact same payload here" — كيرجع availableList + unavailableList{errorCode,errorEn}
+//    (10pt — كيتعيط فقط ملي 1.2 كيرجع قنوات خاوية — مسار الفشل بوحدو)
+async function freightDiagnose(row) {
+  try {
+    const dr = await cjRequest((token, config) =>
+      axios.post(`${CJ_API}/logistic/unavailableShippingMethods`,
+        { reqDTOS: [row] },
+        { ...config, headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' }, timeout: 15000 }
+      )
+    );
+    const denv = dr?.data;
+    if (!denv || (denv.code !== 200 && denv.code !== 0)) {
+      console.error('[cj-live/product][freight][diag][cj-envelope]', denv?.code, denv?.message || '');
+      return [{ optionName: 'diagnostic', errorCode: denv?.code ?? null, errorEn: String(denv?.message || '') }];
+    }
+    const dd = denv.data || {};
+    const un = Array.isArray(dd.unavailableList) ? dd.unavailableList : [];
+    const av = Array.isArray(dd.availableList) ? dd.availableList : [];
+    const reasons = un.slice(0, 5).map(u => ({
+      optionName: u.optionName || '',
+      errorCode: u.errorCode ?? null,
+      errorEn: String(u.errorEn || u.error || ''),
+    }));
+    console.error('[cj-live/product][freight][diag]', `available=${av.length} unavailable=${un.length}`, JSON.stringify(reasons).slice(0, 400));
+    return reasons.length ? reasons : [{ optionName: 'diagnostic', errorCode: null, errorEn: `no reasons returned (available=${av.length})` }];
+  } catch (de) {
+    console.error('[cj-live/product][freight][diag]', de.message);
+    return [{ optionName: 'diagnostic', errorCode: null, errorEn: String(de.message || '') }];
+  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -291,28 +328,46 @@ router.get('/product/:pid', async (req, res) => {
     const srcAreaCode = dest && invCountries.includes(dest) ? dest
       : (invCountries.includes('CN') ? 'CN' : (invCountries[0] || 'CN'));
 
-    // 🚚 freightCalculateTip — الثمن المباشر (10pt) — كاش 10 دقائق
+    // 🚚 freightCalculateTip — الثمن المباشر (10pt) — كاش 10 دقائق [freight-row]
     // (قبل mapping الـ variants باش v0 ياخد الفريت الحقيقي فالتسعير —
     //  Add-to-Cart كيستعمل laclarcVariantPrice → خاصو يطابق laclarcPrice المعروض)
     const cost0 = parseMaxNumber(v0.variantSellPrice) || parseMaxNumber(d.sellPrice) || 0;
     let shipping = { source: 'unavailable', amount: 0, currency: 'USD' };
     let freightUsd = 0;
+    let emptyDiag = null; // أسباب 1.3 ملي CJ كيرجع 200 بقنوات خاوية
+    const wantDebug = String(req.query.debug || '') === '1';
+    const dbg = { dest: dest || null, srcAreaCode: null, weight: null, volumeCm3: null, productProp: null, row: null, envCode: null, rawType: null, channelCount: null, validCount: 0, fromCache: false, diag: null };
 
     if (dest) {
+      dbg.srcAreaCode = srcAreaCode; dbg.weight = Math.max(weight, 1); dbg.volumeCm3 = volumeCm3; dbg.productProp = productProp;
       const fkey = `${pid}|${v0.vid || 'x'}|${srcAreaCode}|${dest}`;
       const cachedF = cacheGet(freightCache, fkey, FREIGHT_TTL);
-      let channels = cachedF;
+      let channels = Array.isArray(cachedF) ? cachedF : null; // {__empty} = كاش سلبي تشخيصي
+      if (cachedF) {
+        dbg.fromCache = true;
+        if (cachedF.__empty) emptyDiag = cachedF.unavailable || [];
+      }
 
-      if (!channels) {
+      if (!cachedF) {
+        // 🚚 صف الطلب [freight-row] — نسخة طبق الأصل من CURL الرسمي ديال freightCalculateTip:
+        //   · productProp = مصفوفة ["…"] (الشكل الرسمي — ماشي String!)
+        //   · freightTrialSkuList + skuList = Y فالتوثيق — بلاتهم CJ كيرجع 200 بقنوات خاوية
+        //   · volume (Y) + totalGoodsAmount كيما فالمثال الرسمي
+        const vSku = v0.variantSku ? String(v0.variantSku) : '';
         const row = {
           srcAreaCode,
           destAreaCode: dest,
           weight: Math.max(weight, 1),       // شرط صلب: weight > 0
-          productProp,                        // شرط صلب
+          productProp: [productProp],         // شرط صلب — مصفوفة (CURL الرسمي)
           productTypes: [0],
         };
         if (volumeCm3 > 0) row.volume = volumeCm3;
-        if (v0.variantSku) row.skuList = [String(v0.variantSku)];
+        if (cost0 > 0) row.totalGoodsAmount = +cost0.toFixed(2);
+        if (vSku) {
+          row.skuList = [vSku];
+          row.freightTrialSkuList = [{ skuQuantity: 1, sku: vSku }];
+        }
+        dbg.row = row;
 
         try {
           const fr = await cjRequest((token, config) =>
@@ -322,19 +377,33 @@ router.get('/product/:pid', async (req, res) => {
             )
           );
           const fenv = fr?.data;
+          dbg.envCode = fenv?.code ?? null;
           if (!fenv || (fenv.code !== 200 && fenv.code !== 0)) {
             // خطأ envelope ديال CJ (نقاط/أوث) — نسجلو بالعلم، الفريت غادي يرجع للتقدير
             console.error('[cj-live/product][freight][cj-envelope]', fenv?.code, fenv?.message || '');
             shipping = { source: 'cj-error', cjCode: fenv?.code ?? null, cjMessage: String(fenv?.message || '') || null };
           } else {
             const fd = fenv.data;
-            channels = Array.isArray(fd) ? fd : (fd?.list || fd?.channels || fd?.content || []);
-            if (channels.length) cacheSet(freightCache, fkey, channels);
+            dbg.rawType = Array.isArray(fd) ? 'array' : (fd && typeof fd === 'object' ? 'object' : typeof fd);
+            channels = Array.isArray(fd) ? fd : (fd?.list || fd?.channels || fd?.content || fd?.rows || []);
+            if (channels.length) {
+              cacheSet(freightCache, fkey, channels);
+            } else {
+              // 🫥 200 بقنوات خاوية — CJ ما قدرش يسعّر هاد الـ route (بلا سبب فالجواب)
+              //   1.3 unavailableShippingMethods (10pt) بنفس الـ payload كيقول علاش
+              console.error('[cj-live/product][freight][empty]', JSON.stringify(row), JSON.stringify(fd).slice(0, 300));
+              emptyDiag = await freightDiagnose(row);
+              dbg.diag = emptyDiag;
+              cacheSet(freightCache, fkey, { __empty: true, unavailable: emptyDiag }); // كاش سلبي — حماية النقاط
+            }
           }
         } catch (fe) {
           console.error('[cj-live/product][freight]', fe.message);
+          dbg.rawType = 'throw: ' + fe.message;
         }
       }
+
+      dbg.channelCount = (channels || []).length; // كاش ولا MISS — نفس الحساب
 
       // أرخص قناة صالحة → totalPostageFee = الثمن المباشر المعروض
       const valid = (channels || [])
@@ -346,6 +415,7 @@ router.get('/product/:pid', async (req, res) => {
         }))
         .filter(c => c.amount > 0)
         .sort((a, b) => a.amount - b.amount);
+      dbg.validCount = valid.length;
 
       if (valid.length) {
         freightUsd = valid[0].amount;
@@ -364,7 +434,7 @@ router.get('/product/:pid', async (req, res) => {
 
     if (shipping.source !== 'cj-live') {
       // 🛟 fallback — تقدير v3.1 القديم (نفس المعادلة) مع علامة المصدر
-      //    إلا كان الخطأ من CJ envelope كنحفظو التشخيص ف cjError (تشخيصي فقط)
+      //    cjError = خطأ envelope · unavailable = أسباب 1.3 (تشخيصي فقط)
       const cjErr = shipping.source === 'cj-error'
         ? { cjCode: shipping.cjCode ?? null, cjMessage: shipping.cjMessage ?? null } : null;
       shipping = {
@@ -372,6 +442,7 @@ router.get('/product/:pid', async (req, res) => {
         amount: +(5 + Math.max(weight, 50) / 1000 * 4).toFixed(2),
         currency: 'USD',
         ...(cjErr ? { cjError: cjErr } : {}),
+        ...(Array.isArray(emptyDiag) && emptyDiag.length ? { unavailable: emptyDiag.slice(0, 5) } : {}),
       };
     }
 
@@ -407,6 +478,7 @@ router.get('/product/:pid', async (req, res) => {
       original_price: null,        // قرار 1 — بلا strikethrough مولّد
       estimatedShipUsd: shipping.amount, // توافقية خلفية + القيمة الحقيقية إن توفرت
       shipping,                    // 🆕 الثمن المباشر الكامل
+      ...(wantDebug ? { freightDebug: dbg } : {}), // 🔬 ?debug=1 — تشخيص الفريت
       geo: geoInfo,                // 🆕 بلد الزائر المستعملة
       weightGrams: weight,
       productProp,
