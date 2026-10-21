@@ -654,12 +654,41 @@ app.post('/api/admin/add-coupon', async (req, res) => {
   }
 })();
 
+// ─── ⭐ [cj-reviews] دمج ريفيوزات CJ الحقيقية — قراءة فقط، بلا كتابة في الـ DB ───
+// الفرونت (Customer Reviews في PDP) كتقرا نفس هذا الـ endpoint — صفر تعديل فرونت.
+// الحقول مطبّعين على شكل صفوف الجدول: id/author/rating/content/country/images/created_at
+async function getCjMergedReviews(productId) {
+  try {
+    const { fetchCjReviews } = require('./routes/cjLiveBridge');
+    const q = await pool.query('SELECT cj_product_id FROM products WHERE id = $1 LIMIT 1', [productId]);
+    const cjPid = q.rows && q.rows[0] && q.rows[0].cj_product_id ? String(q.rows[0].cj_product_id) : null;
+    if (!cjPid) return []; // منتج بلا ربط CJ → ريفيوزات محلية فقط
+    const cj = await fetchCjReviews(cjPid, { size: 20 });
+    return (cj.reviews || []).map(r => ({
+      id: `cj-${r.id}`,
+      product_id: Number(productId) || 0,
+      author: r.name,
+      rating: r.score,
+      content: r.text,
+      country: r.country,
+      images: r.images,
+      created_at: r.date,
+      source: 'cj',
+    }));
+  } catch (e) {
+    console.warn('[cj-reviews] merge skipped:', e.message);
+    return []; // 🛟 تدهور صامت — الريفيوزات المحلية باقة تخدم
+  }
+}
+
 app.get('/api/reviews/:productId', async (req, res) => {
   try {
     const { productId } = req.params;
     // 🩹 FIX — أعمدة محددة (كان SELECT * يخرج user_id الداخلي في رد عام)
     const result = await pool.query('SELECT id, product_id, author, rating, content, country, images, created_at FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [productId]);
-    res.json(result.rows);
+    // ⭐ [cj-reviews] — المحليون أولاً (زبائن حقيقيون) ثم ريفيوزات CJ (كاش 6 ساعات)
+    const cjRows = await getCjMergedReviews(productId);
+    res.json([...result.rows, ...cjRows]);
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });

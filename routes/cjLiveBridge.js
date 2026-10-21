@@ -112,6 +112,79 @@ const SEARCH_TTL = 5 * 60 * 1000;     // 5 دقائق — نتائج البحث
 const FREIGHT_TTL = 10 * 60 * 1000;   // 10 دقائق — عروض الشحن
 const searchCache = new Map();        // "q|page|country" → { data, ts }
 const freightCache = new Map();       // "pid|vid|src|dest" → { data, ts }
+// ── ⭐ ريفيوزات CJ [cj-reviews] — productComments GET — كاش 6 ساعات ──
+//    (الريفيوزات كتبدل بالأيام — 6h كافية وحيانية مع النقاط)
+const REVIEWS_TTL = 6 * 60 * 60 * 1000;
+const reviewsCache = new Map();       // "pid|page|size|score" → { data, ts }
+
+// 🛡️ درس الوثيقة: commentId = long 19 خانة (1536993287524069376) أكبر من
+//    Number.MAX_SAFE_INTEGER (16 خانة) — JSON.parse كيقصّو بصمت.
+//    الحل: الجواب كيتقري كنص وكنقتبسو الأرقام الطوال قبل JSON.parse.
+function parseCjCommentsText(txt) {
+  const safe = String(txt).replace(/("[A-Za-z_]*[Ii]d"\s*:\s*)(\d{15,})/g, '$1"$2"');
+  return JSON.parse(safe);
+}
+
+// ⭐ جيب ريفيوزات CJ مطبّعين — كيستهلكو server.js (الدمج في /api/reviews/:id)
+//    والراوت GET /reviews/:pid مباشرة. الاستجابة:
+//    { total, page, size, reviews: [{ id, name, score, date, text, images, country, flag }] }
+async function fetchCjReviews(pid, opts = {}) {
+  const page = Math.max(parseInt(opts.page, 10) || 1, 1);
+  const size = Math.min(Math.max(parseInt(opts.size, 10) || 20, 1), 50);
+  const scoreN = parseInt(opts.score, 10) || 0;
+  const score = scoreN >= 1 && scoreN <= 5 ? scoreN : null;
+  const key = `${pid}|${page}|${size}|${score || ''}`;
+  const hit = cacheGet(reviewsCache, key, REVIEWS_TTL);
+  if (hit) return hit;
+
+  const params = { pid, pageNum: page, pageSize: size };
+  if (score) params.score = score;
+  const r = await cjRequest((token, config) =>
+    axios.get(`${CJ_API}/product/productComments`, {
+      ...config,
+      headers: { 'CJ-Access-Token': token },
+      params,
+      timeout: 15000,
+      responseType: 'text',            // 🛡️ precision-safe — كنحللو بيدينا
+      transformResponse: [(x) => x],   // axios ما يلمسش الجواب
+    })
+  );
+
+  // 🔍 envelope ديال CJ — ⚠️ الوثيقة: النجاح success:true والخطأ result:false!
+  //    الثابت الوحيد الموثوق: code===0 (وكنقبلو 200 للتوافقية مع ES-backed)
+  let env = null;
+  try { env = parseCjCommentsText(r?.data); } catch (pe) {
+    console.error('[cj-live/reviews][parse]', pe.message);
+  }
+  const envCode = env?.code ?? null;
+  if (!env || (envCode !== 0 && envCode !== 200) || env.result === false) {
+    console.error('[cj-live/reviews][cj-envelope]', envCode, env?.message || '');
+    const err = new Error(`CJ envelope ${envCode}: ${String(env?.message || 'unknown')}`);
+    err.cjCode = envCode;
+    throw err;
+  }
+
+  const d = env?.data || {};
+  const list = Array.isArray(d.list) ? d.list : [];
+  const reviews = list
+    .map(c => ({
+      id: String(c.commentId ?? ''),
+      name: String(c.commentUser || 'CJ Buyer').slice(0, 60),
+      score: Math.min(Math.max(parseInt(c.score, 10) || 0, 1), 5),
+      date: String(c.commentDate || ''),
+      text: String(c.comment || '').slice(0, 1000),
+      images: (Array.isArray(c.commentUrls) ? c.commentUrls : [])
+        .filter(u => typeof u === 'string' && u.startsWith('http')).slice(0, 6),
+      country: c.countryCode ? (geo.countryName(String(c.countryCode)) || String(c.countryCode)) : '',
+      flag: typeof c.flagIconUrl === 'string' ? c.flagIconUrl : '',
+    }))
+    .filter(x => x.id && x.date && x.score >= 1);
+
+  const out = { total: parseInt(d.total, 10) || reviews.length, page, size, reviews };
+  cacheSet(reviewsCache, key, out);
+  return out;
+}
+
 
 function cacheGet(map, key, ttl) {
   const hit = map.get(key);
@@ -489,4 +562,23 @@ router.get('/product/:pid', async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════
+// ⭐ GET /api/cj-live/reviews/:pid?page=&size=&score=   [cj-reviews]
+//    وكيل ريفيوزات CJ مباشر (تشخيص + استهلاك مستقبلي للفرونت)
+// ════════════════════════════════════════════════════════════
+router.get('/reviews/:pid', async (req, res) => {
+  try {
+    const pid = String(req.params.pid || '').trim();
+    if (!pid || pid.length < 5) return res.status(400).json({ error: 'Bad pid' });
+    const data = await fetchCjReviews(pid, {
+      page: req.query.page, size: req.query.size, score: req.query.score,
+    });
+    return res.json(data);
+  } catch (e) {
+    console.error('[cj-live/reviews]', e.message);
+    return res.status(502).json({ error: 'CJ unavailable', cjCode: e.cjCode ?? null });
+  }
+});
+
 module.exports = router;
+module.exports.fetchCjReviews = fetchCjReviews; // ⭐ [cj-reviews] — server.js كيستهلكو للدمج
