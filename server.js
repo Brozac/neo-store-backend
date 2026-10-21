@@ -662,9 +662,9 @@ async function getCjMergedReviews(productId) {
     const { fetchCjReviews } = require('./routes/cjLiveBridge');
     const q = await pool.query('SELECT cj_product_id FROM products WHERE id = $1 LIMIT 1', [productId]);
     const cjPid = q.rows && q.rows[0] && q.rows[0].cj_product_id ? String(q.rows[0].cj_product_id) : null;
-    if (!cjPid) return []; // منتج بلا ربط CJ → ريفيوزات محلية فقط
-    const cj = await fetchCjReviews(cjPid, { size: 20 });
-    return (cj.reviews || []).map(r => ({
+    if (!cjPid) return { rows: [], total: 0 }; // منتج بلا ربط CJ → ريفيوزات محلية فقط [cj-reviews v2]
+    const cj = await fetchCjReviews(cjPid, { size: 50 }); // [cj-reviews v2] 50 بدل 20 — تغطية أوسع بنفس نداء CJ الواحد (الكاش 6h نفسو)
+    const rows = (cj.reviews || []).map(r => ({
       id: `cj-${r.id}`,
       product_id: Number(productId) || 0,
       author: r.name,
@@ -675,9 +675,10 @@ async function getCjMergedReviews(productId) {
       created_at: r.date,
       source: 'cj',
     }));
+    return { rows, total: cj.total || rows.length }; // [cj-reviews v2] الصفوف + الإجمالي الحقيقي من CJ (ماشي غير المحمّل)
   } catch (e) {
     console.warn('[cj-reviews] merge skipped:', e.message);
-    return []; // 🛟 تدهور صامت — الريفيوزات المحلية باقة تخدم
+    return { rows: [], total: 0 }; // 🛟 تدهور صامت — الريفيوزات المحلية باقة تخدم [cj-reviews v2]
   }
 }
 
@@ -687,8 +688,30 @@ app.get('/api/reviews/:productId', async (req, res) => {
     // 🩹 FIX — أعمدة محددة (كان SELECT * يخرج user_id الداخلي في رد عام)
     const result = await pool.query('SELECT id, product_id, author, rating, content, country, images, created_at FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [productId]);
     // ⭐ [cj-reviews] — المحليون أولاً (زبائن حقيقيون) ثم ريفيوزات CJ (كاش 6 ساعات)
-    const cjRows = await getCjMergedReviews(productId);
-    res.json([...result.rows, ...cjRows]);
+    const cj = await getCjMergedReviews(productId); // [cj-reviews v2] { rows, total }
+    const merged = [...result.rows, ...cj.rows];
+
+    // ⭐ [cj-reviews v2] — ?v2=1 → { reviews, meta }: meta.total = الإجمالي الحقيقي
+    //    (المحليون + total تاع CJ) ماشي غير المحمّل. بلا ?v2 → array القديم (توافق رجعي كامل).
+    if (req.query.v2 === '1' || req.query.v2 === 'true') {
+      const counts = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+      for (const r of merged) {
+        const k = parseInt(r.rating, 10) || 0;
+        if (k >= 1 && k <= 5) counts[k]++;
+      }
+      return res.json({
+        reviews: merged,
+        meta: {
+          total: result.rows.length + (cj.total || cj.rows.length),
+          loaded: merged.length,
+          counts,
+          local: result.rows.length,
+          cj: cj.rows.length,
+          hasMore: cj.total > cj.rows.length, // CJ عندها أكثر مما حُمّل → عرض جزئي صادق
+        },
+      });
+    }
+    res.json(merged);
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
