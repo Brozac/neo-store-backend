@@ -39,6 +39,24 @@ function stripHtml(html) {
   return String(html || '').replace(/<[^>]*>?/gm, '').replace(/&nbsp;/gi, ' ').trim();
 }
 
+// 🆕 v5.2b — بيانات CJ أحياناً كتجي بالعنوان مكتوب جوج مرات (داتا سيلر خاسرة):
+// "Name Name" / "NameName" / "Name - Name" بحال بالضبط → نحيدو التكرار.
+// دقيق ومحافظ: كيتفعل غير إلا النصفين متطابقين حرفياً (≥5 حروف لكل نصف)
+function dedupeTitle(t) {
+  const s = String(t || '').trim();
+  const len = s.length;
+  if (len < 10) return s;
+  for (const sepLen of [0, 1, 3]) {                       // '' · ' ' · ' - '
+    if ((len - sepLen) % 2 !== 0) continue;
+    const k = (len - sepLen) / 2;
+    if (k < 5) continue;
+    const a = s.slice(0, k).trim();
+    const b = s.slice(k + sepLen).trim();
+    if (a === b && a.length >= 5) return a;
+  }
+  return s;
+}
+
 // تنظيف الوصف قبل التخزين — الواجهة تعرضه كـ HTML: سكريبت/هاندلرز/JS-URIs ما يعبروش (P2-6)
 function sanitizeDescription(html) {
   return String(html || '')
@@ -242,7 +260,8 @@ async function buildProductRow(details, options = {}) {
   }
   const hasVideo = Boolean(videoUrl);
 
-  const safeTitle = (details.productNameEn || 'Premium Product').trim().slice(0, 250);
+  // 🆕 v5.2b — بيانات CJ أحياناً كتجي بالعنوان مضاعف (السيلر كيكتبو جوج مرات بلا فاصل)
+  const safeTitle = dedupeTitle((details.productNameEn || 'Premium Product').trim()).slice(0, 250);
 
   // ── الشحن والجودة ──
   // ⚠️ P3-2: معنى addMarkStatus=1 موثق من فهرس endpoints — تأكد عند أول تشغيل حي

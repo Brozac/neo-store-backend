@@ -3539,10 +3539,13 @@ cron.schedule('0 */6 * * *', async () => {
   }
 });
 
-// 6. كرون مطابقة مدفوعات Stripe v2 (كل 15 دقيقة)
+// 6. كرون مطابقة مدفوعات Stripe v2 (كل ساعة — CRON-THIN F#29d)
 // الهدف الحقيقي: طلب paid اللي fulfillment فشل قبل ما يوصل CJ (crash شبكي...)
 // ✅ v2: guard cj_order_number — الطلب المقبول فـ CJ عندو رقم → عمرو ما يتعاود
-cron.schedule('*/15 * * * *', async () => {
+// 🔥 CRON-THIN: كان */15 — الـ webhooks تاع Stripe كيأكدو فورياً، والكرون هو safety net برك
+//   → كل 15 دقيقة = الداتابيز عمرها ما تنام = حرق الكوتا = 53000 في وسط الشهر
+//   → كل ساعة على :00 مع باقي الكرونات = صحوة وحدة/ساعة، النيون ينام 55 دقيقة بين كل صحوة
+cron.schedule('0 * * * *', async () => {
   if (isReconciling) return;
   isReconciling = true;
 
@@ -3683,7 +3686,7 @@ cron.schedule('0 * * * *', async () => {
 //    ⚠️ migration إلزامي (مطبق):
 //    ALTER TABLE orders ADD COLUMN IF NOT EXISTS recovery_email_sent_at TIMESTAMPTZ;
 // ==========================================
-cron.schedule('15 * * * *', async () => {
+cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 15 * (كل ساعة على :15) → انتقل لـ :00 باش يتجمع مع الباقي في صحوة وحدة
   console.log('⏳ [Abandoned Cart] Checking for abandoned checkouts...');
   try {
     const { rows: abandonedOrders } = await pool.query(`
@@ -4104,7 +4107,7 @@ cron.schedule('0 5 * * *', async () => {
   }
 });
 
-cron.schedule('30 * * * *', async () => {
+cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 30 * (كل ساعة على :30) → انتقل لـ :00 باش يتجمع مع الباقي في صحوة وحدة
   console.log('⏳ [CJ Logistics v3] Batch tracking (1 call / up to 50 orders)...');
   try {
     const { rows: pendingTrackingOrders } = await pool.query(`
