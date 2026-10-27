@@ -98,7 +98,14 @@ app.get('/__sentry_test', (req, res) => {
 // ──── [/LACLARC::SENTRY-TEST] ────
 const cookieParser = require('cookie-parser');
 app.set('trust proxy', 1);
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
+// ═══ CORSFIX (F#33) — دعم عدة أصول: CORS_ORIGINS (فاصلة بينهم) ولا FRONTEND_URL وحدها ═══
+// workers.dev كيدخل القائمة بلا ما نبدلو FRONTEND_URL (راه كيتستعمل في لينكات الإيميل والدفع)
+// مثال Render env: CORS_ORIGINS=https://laclarc.com,https://laclarc.xaanabroza75.workers.dev
+const allowedOrigins = (process.env.CORS_ORIGINS || process.env.FRONTEND_URL || 'http://localhost:3000')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(cookieParser());
 
 // Rate Limiters
