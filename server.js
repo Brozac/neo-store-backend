@@ -32,7 +32,7 @@ const { buildProductRow, upsertProductRow } = require('./services/productImportS
 const { selfHealStuckOrders, disputeWatchdogCron, auditEvent } = require('./services/cjService');
 const logger = require('./logger');
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
-const templates = require('./emails/templates'); // 🎨 ROSE DUO email design system (F#83) — all customer emails in English
+const templates = require('./emails/templates'); // 🎨 SERENE email design system (F#84) — all customer emails in English
 const shipTruth = require('./services/shipTruth'); // كان مستعمل بلا require → ReferenceError → 500 دايماً
 const multer = require('multer');
 const path = require('path');
@@ -1676,9 +1676,9 @@ app.get('/api/verify-email', async (req, res) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.type !== 'verify') return res.status(400).send('Invalid token type.');            // 🩹 FIX#3
     await pool.query('UPDATE users SET is_verified = true WHERE id = $1', [decoded.id]);
-    res.send('<div style="font-family:Segoe UI,Arial,sans-serif;text-align:center;margin-top:60px;padding:0 20px;"><h1 style="color:#6B3DB4;">Email verified successfully! 🎉</h1><p style="color:#4B5563;">You can now log in to your account.</p><a href="' + (process.env.FRONTEND_URL || 'https://laclarc.com') + '/auth" style="display:inline-block;margin-top:14px;background:#6B3DB4;color:#fff;padding:12px 30px;border-radius:30px;text-decoration:none;font-weight:bold;">Go to Login</a></div>');
+    res.send('<div style="font-family:-apple-system,Segoe UI,Arial,sans-serif;text-align:center;margin-top:60px;padding:0 20px;"><h1 style="color:#2E4057;">Email verified successfully! <span style="color:#7C9E85;">✓</span></h1><p style="color:#7A8CA0;">You can now log in to your account.</p><a href="' + (process.env.FRONTEND_URL || 'https://laclarc.com') + '/auth" style="display:inline-block;margin-top:14px;background:#5B7EA6;color:#fff;padding:13px 32px;border-radius:12px;text-decoration:none;font-weight:bold;font-size:13px;letter-spacing:1.2px;text-transform:uppercase;">Go to Login</a></div>');
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
-    res.status(400).send('<div style="font-family:Segoe UI,Arial,sans-serif;text-align:center;margin-top:60px;padding:0 20px;"><h1 style="color:#C9465E;">Invalid or expired link</h1><p style="color:#4B5563;">This link is invalid or has expired. Try logging in — if anything is wrong, we are here to help.</p></div>');
+    res.status(400).send('<div style="font-family:-apple-system,Segoe UI,Arial,sans-serif;text-align:center;margin-top:60px;padding:0 20px;"><h1 style="color:#B05C5C;">Invalid or expired link</h1><p style="color:#7A8CA0;">This link is invalid or has expired. Try logging in — if anything is wrong, we are here to help.</p></div>');
   }
 });
 
