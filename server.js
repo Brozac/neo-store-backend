@@ -32,6 +32,7 @@ const { buildProductRow, upsertProductRow } = require('./services/productImportS
 const { selfHealStuckOrders, disputeWatchdogCron, auditEvent } = require('./services/cjService');
 const logger = require('./logger');
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
+const templates = require('./emails/templates'); // 🎨 ROSE DUO email design system (F#83) — all customer emails in English
 const shipTruth = require('./services/shipTruth'); // كان مستعمل بلا require → ReferenceError → 500 دايماً
 const multer = require('multer');
 const path = require('path');
@@ -1657,10 +1658,8 @@ app.post('/api/register', authLimiter, async (req, res) => {
 
     sendEmail({
       to: cleanEmail,
-      subject: 'Confirm your Email for Laclarc',
-      html: `<h2>Welcome to Laclarc, ${name}!</h2>
-             <p>Please click the button below to activate your account:</p>
-             <a href="${verifyUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Verify My Email</a>`
+      subject: 'Confirm your email — Welcome to Laclarc',
+      html: templates.verifyEmail({ name, verifyUrl })
     });
 
     res.status(201).json({ message: 'User registered successfully! Please check your email to verify your account.' });
@@ -1677,9 +1676,9 @@ app.get('/api/verify-email', async (req, res) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.type !== 'verify') return res.status(400).send('Invalid token type.');            // 🩹 FIX#3
     await pool.query('UPDATE users SET is_verified = true WHERE id = $1', [decoded.id]);
-    res.send('<h1 style="color:#8B78C6; text-align:center; margin-top:50px;">Email verified successfully! 🎉</h1><p style="text-align:center;">You can now log in to your account.</p>');
+    res.send('<div style="font-family:Segoe UI,Arial,sans-serif;text-align:center;margin-top:60px;padding:0 20px;"><h1 style="color:#6B3DB4;">Email verified successfully! 🎉</h1><p style="color:#4B5563;">You can now log in to your account.</p><a href="' + (process.env.FRONTEND_URL || 'https://laclarc.com') + '/auth" style="display:inline-block;margin-top:14px;background:#6B3DB4;color:#fff;padding:12px 30px;border-radius:30px;text-decoration:none;font-weight:bold;">Go to Login</a></div>');
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
-    res.status(400).send('<h1 style="color:red; text-align:center; margin-top:50px;">Invalid or expired link.</h1>');
+    res.status(400).send('<div style="font-family:Segoe UI,Arial,sans-serif;text-align:center;margin-top:60px;padding:0 20px;"><h1 style="color:#C9465E;">Invalid or expired link</h1><p style="color:#4B5563;">This link is invalid or has expired. Try logging in — if anything is wrong, we are here to help.</p></div>');
   }
 });
 
@@ -1696,10 +1695,8 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
 
       sendEmail({
         to: cleanEmail,
-        subject: 'Password Reset Request',
-        html: `<h2>Did you forget your password?</h2>
-               <p>Click the button below to set a new password. This link will expire in 15 minutes.</p>
-               <a href="${resetUrl}" style="background-color:#8B78C6; color:white; padding:10px 20px; text-decoration:none; border-radius:5px; font-weight:bold;">Reset My Password</a>`
+        subject: 'Reset your password — Laclarc',
+        html: templates.passwordReset({ resetUrl })
       });
     }
 
@@ -3248,65 +3245,20 @@ app.get('/api/tracking/:orderId/journey', async (req, res) => {
 // ==========================================
 async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
   try {
-    const itemsHtml = items.map(item => `
-      <tr>
-        <td style="padding: 15px 0; border-bottom: 1px solid #eee; display: flex; align-items: center;">
-          <img src="${item.image_url || 'https://via.placeholder.com/50'}" alt="${item.title || 'Product'}" style="width: 50px; height: 50px; object-fit: cover; border-radius: 8px; margin-right: 15px;">
-          <span style="color: #1D1E3C; font-weight: bold; font-size: 14px;">${item.title || 'Product'} (Qty: ${item.quantity})</span>
-        </td>
-        <td style="padding: 15px 0; border-bottom: 1px solid #eee; text-align: right; color: #FF6B9D; font-weight: bold; font-size: 14px;">
-          $${Number(item.price_at_purchase || 0).toFixed(2)}
-        </td>
-      </tr>
-    `).join('');
-
-    const htmlContent = `
-      <div style="font-family: 'Arial', sans-serif; max-width: 600px; margin: 0 auto; background-color: #f4f3f8; border-radius: 15px; overflow: hidden; border: 1px solid #ddd;">
-        <div style="background: linear-gradient(135deg, #1D1E3C 0%, #8B78C6 100%); padding: 30px; text-align: center;">
-          <h1 style="color: #fff; margin: 0; font-size: 28px; letter-spacing: 1px;">Laclarc</h1>
-        </div>
-        <div style="padding: 30px;">
-          <h2 style="color: #1D1E3C; margin-top: 0;">Order Confirmed Successfully! 🎉</h2>
-          <p style="color: #555; font-size: 16px; line-height: 1.6;">
-            Thank you for your purchase from Laclarc. Your order <strong style="color: #8B78C6;">#${orderId}</strong> is currently being processed and will be shipped soon.
-          </p>
-          <table style="width: 100%; border-collapse: collapse; margin: 25px 0;">
-            <thead>
-              <tr style="border-bottom: 2px solid #8B78C6;">
-                <th style="text-align: left; padding-bottom: 10px; color: #1D1E3C;">Product</th>
-                <th style="text-align: right; padding-bottom: 10px; color: #1D1E3C;">Price</th>
-              </tr>
-            </thead>
-            <tbody>${itemsHtml}</tbody>
-          </table>
-          <div style="text-align: right; margin-top: 20px; border-top: 2px dashed #eee; padding-top: 20px;">
-            <span style="font-size: 18px; color: #1D1E3C; font-weight: bold;">Total Paid:</span>
-            <span style="font-size: 22px; color: #FF6B9D; font-weight: bold; margin-left: 10px;">$${Number(total).toFixed(2)}</span>
-          </div>
-          <div style="background-color: #f9f9f9; border-left: 4px solid #8B78C6; padding: 15px; margin-top: 30px; border-radius: 5px;">
-            <p style="margin: 0; color: #1D1E3C; font-weight: bold; font-size: 14px;">Shipping & Tracking Information:</p>
-            <p style="margin: 5px 0 0 0; color: #777; font-size: 13px;">
-              Once CJ Dropshipping ships your order, we will send you the tracking number. You can track your shipment directly through our "Track My Order" page.
-            </p>
-          </div>
-          <div style="text-align: center; margin-top: 40px;">
-            <a href="${process.env.FRONTEND_URL || 'https://laclarc.com'}" style="background-color: #FF6B9D; color: #fff; text-decoration: none; padding: 12px 30px; border-radius: 25px; font-weight: bold; display: inline-block;">
-              Continue Shopping
-            </a>
-          </div>
-        </div>
-        <div style="background-color: #1D1E3C; padding: 20px; text-align: center; color: #888; font-size: 12px;">
-          &copy; ${new Date().getFullYear()} Laclarc. All rights reserved.
-        </div>
-      </div>
-    `;
+    let orderNumber = null;
+    let customerName = null;
+    try {
+      const meta = await pool.query('SELECT order_number, customer_name FROM orders WHERE id = $1', [orderId]);
+      orderNumber = meta.rows[0] ? (meta.rows[0].order_number || null) : null;
+      customerName = meta.rows[0] ? (meta.rows[0].customer_name || null) : null;
+    } catch (metaErr) { /* order_number optional — fallback to #id */ }
 
     await sendEmail({
       to: email,
-      subject: `Order Confirmation #${orderId} - Laclarc`,
-      html: htmlContent
+      subject: templates.orderSubject(orderNumber, orderId),
+      html: templates.orderConfirmation({ orderId, orderNumber, total, items, customerName })
     });
-    console.log(`📧 Professional confirmation email sent to ${email}`);
+    console.log(`📧 Confirmation email sent to ${email}`);
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Send Order Email', err);
   }
@@ -3697,7 +3649,7 @@ cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 15 * (كل ساع�
   console.log('⏳ [Abandoned Cart] Checking for abandoned checkouts...');
   try {
     const { rows: abandonedOrders } = await pool.query(`
-      SELECT id, customer_name, customer_email, total_amount, created_at
+      SELECT id, customer_name, customer_email, total_amount, order_number, created_at
       FROM orders
       WHERE status = 'pending'
         AND customer_email IS NOT NULL
@@ -3723,53 +3675,15 @@ cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 15 * (كل ساع�
       const items = itemsRes.rows;
       if (items.length === 0) continue;
 
-      const itemsListHtml = items.map(item => `
-        <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 12px; padding: 10px; background: #fff; border-radius: 8px;">
-          <img src="${item.image_url || 'https://laclarc.com/icon-192.png'}" style="width: 55px; height: 55px; object-fit: cover; border-radius: 6px;" />
-          <div>
-            <p style="margin: 0; font-weight: bold; color: #1D1E3C; font-size: 13px;">${item.title}</p>
-            <p style="margin: 2px 0 0; color: #FF6B9D; font-weight: bold; font-size: 12px;">Qty: ${item.quantity} &bull; $${Number(item.price_at_purchase).toFixed(2)}</p>
-          </div>
-        </div>
-      `).join('');
-
-      const recoveryHtml = `
-        <div style="font-family: Arial, sans-serif; max-width: 550px; margin: 0 auto; background: #F9F8FC; padding: 25px; border-radius: 16px; border: 1px solid #E5E7EB;">
-          <div style="text-align: center; margin-bottom: 20px;">
-            <h1 style="color: #1D1E3C; margin: 0; font-size: 26px;">Laclarc</h1>
-            <p style="color: #8B78C6; font-weight: bold; font-size: 13px; margin: 4px 0 0;">Did you leave something behind?</p>
-          </div>
-
-          <p style="color: #4B5563; font-size: 14px; line-height: 1.6;">
-            Hello <strong>${order.customer_name || 'there'}</strong>,<br>
-            Your curated items are still safely reserved in your bag, but limited flash inventory is selling out fast!
-          </p>
-
-          <div style="margin: 20px 0;">
-            ${itemsListHtml}
-          </div>
-
-          <div style="background: #FFF; border: 2px dashed #8B78C6; padding: 15px; border-radius: 12px; text-align: center; margin-bottom: 25px;">
-            <p style="margin: 0 0 5px; color: #1D1E3C; font-size: 12px; font-weight: bold;">USE THIS EXCLUSIVE 10% RECOVERY DISCOUNT:</p>
-            <span style="display: inline-block; background: #8B78C6; color: #fff; padding: 6px 16px; border-radius: 6px; font-weight: bold; font-size: 15px; letter-spacing: 1px;">RECOVER10</span>
-          </div>
-
-          <div style="text-align: center;">
-            <a href="${process.env.FRONTEND_URL || 'https://laclarc.com'}/cart" style="display: inline-block; background: #1D1E3C; color: #fff; padding: 14px 32px; border-radius: 30px; font-weight: bold; text-decoration: none; font-size: 14px;">
-              Complete My Order Now &rarr;
-            </a>
-          </div>
-
-          <p style="text-align: center; color: #9CA3AF; font-size: 11px; margin-top: 25px;">
-            Free Worldwide Insured Shipping &bull; 30-Day Money Back Guarantee
-          </p>
-        </div>
-      `;
-
       await sendEmail({
         to: order.customer_email,
-        subject: `Exclusive 10% OFF: Complete your order #${order.id} at Laclarc`,
-        html: recoveryHtml
+        subject: `Still there? Your cart + exclusive 10% OFF inside (Order ${order.order_number || '#' + order.id})`,
+        html: templates.abandonedCart({
+          customerName: order.customer_name,
+          orderId: order.id,
+          orderNumber: order.order_number || null,
+          items
+        })
       });
 
       // 🩹 FIX#4 — سقف الـ spam: إيميل واحد لكل طلب، للأبد
@@ -4476,7 +4390,7 @@ cron.schedule('0 10 * * *', async () => {
   console.log('🌟 [ReviewInvite] Checking for delivered orders...');
   try {
     const { rows: toInvite } = await pool.query(`
-      SELECT id, customer_name, customer_email, review_token
+      SELECT id, customer_name, customer_email, review_token, order_number
       FROM orders
       WHERE status = 'completed'
         AND delivered_at BETWEEN NOW() - INTERVAL '10 days' AND NOW() - INTERVAL '5 days'
@@ -4498,33 +4412,14 @@ cron.schedule('0 10 * * *', async () => {
 
       await sendEmail({
         to: order.customer_email,
-        subject: `⭐ How was your ${product?.title || 'order'}? Get 5% off!`,
-        html: `
-          <div style="font-family:Arial;max-width:550px;margin:auto;background:#F9F8FC;padding:25px;border-radius:16px;border:1px solid #E5E7EB;">
-            <div style="text-align:center;margin-bottom:20px;">
-              <h1 style="color:#1D1E3C;margin:0;font-size:24px;">Laclarc</h1>
-              <p style="color:#8B78C6;font-weight:bold;font-size:12px;margin:4px 0 0;">Your opinion matters 💜</p>
-            </div>
-            <p style="color:#4B5563;font-size:14px;line-height:1.6;">
-              Hello <strong>${order.customer_name || 'there'}</strong>,<br>
-              Your order <strong>#${order.id}</strong> has been delivered! 🎉<br><br>
-              We'd love to hear about your experience. Your honest review helps other shoppers and helps us improve.
-            </p>
-            ${product?.image_url ? `<div style="text-align:center;margin:20px 0;"><img src="${product.image_url}" style="max-width:200px;border-radius:12px;border:1px solid #E5E7EB;" /></div>` : ''}
-            <div style="background:#FFF;border:2px dashed #8B78C6;padding:15px;border-radius:12px;text-align:center;margin-bottom:25px;">
-              <p style="margin:0 0 5px;color:#1D1E3C;font-size:12px;font-weight:bold;">WRITE A REVIEW & GET:</p>
-              <span style="display:inline-block;background:#8B78C6;color:#fff;padding:6px 16px;border-radius:6px;font-weight:bold;font-size:15px;letter-spacing:1px;">5% OFF NEXT ORDER</span>
-            </div>
-            <div style="text-align:center;">
-              <a href="${reviewUrl}" style="display:inline-block;background:#8B78C6;color:#fff;padding:14px 32px;border-radius:30px;font-weight:bold;text-decoration:none;font-size:14px;">
-                Write My Review ⭐
-              </a>
-            </div>
-            <p style="text-align:center;color:#9CA3AF;font-size:11px;margin-top:25px;">
-              This link is unique to your order and expires after use.
-            </p>
-          </div>
-        `
+        subject: `How was your order? Get 5% off your next one ⭐`,
+        html: templates.reviewInvite({
+          customerName: order.customer_name,
+          orderId: order.id,
+          orderNumber: order.order_number || null,
+          reviewUrl,
+          product
+        })
       });
 
       await pool.query('UPDATE orders SET review_invited_at = NOW() WHERE id = $1', [order.id]);
