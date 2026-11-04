@@ -340,6 +340,12 @@ app.post('/api/cj-webhook', express.raw({ type: 'application/json' }), cjWebhook
 // ==========================================
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ limit: '2mb', extended: true }));
+
+// [TANK:v1] طبقة التحصين — /health + gzip + edge-cache(singleflight) + idempotency(checkout)
+// ⚠️ خاصها تبقى قبل أول app.get (ترتيب الميدلوير) — ما تتحركش من بلاصتها
+// ⚠️ الامتداد .cjs إجباري في require — Node ما كيحلّش .cjs بلا امتداد
+require('./tank-kit/tank-hardening.cjs')(app, { pool });
+
 app.use(require('./routes/paymentGateways'));
 
 // راوتر الدفع
