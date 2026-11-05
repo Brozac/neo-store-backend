@@ -1,28 +1,56 @@
-🚦 laclarc-supakit — النقل Neon → Supabase (F#33)
-═══════════════════════════════════════════════════
+﻿🚦 laclarc-visibility-backend-kit — v25 [visibility-persist]
+════════════════════════════════════════════════════════════
 
-الدليل الكامل: MIGRATION-SUPABASE.md (في نفس مجلد التحميل)
+البلاغ ديالك: «حبست فرع من غرفة التحكم، درت save، عاودت دخلت → لقيته رجع»
 
-التشغيل السريع:
-  1) فك الضغط في أي مجلد
-  2) PowerShell داخل المجلد:
-        npm install
-  3) فحص صحة النيون (شوف واش الكوتا سالات ولا لا):
-        node migrate.mjs --check --from '<NEON_URL>'
-  4) النقل:
-        node migrate.mjs --from '<NEON_URL>' --to '<SUPABASE_URL>'
+الحقيقة (مثبتة بالكود):
+  الـ save ديالك كان كيتسجل في قاعدة البيانات من الأول ✓
+  المشكل: نقطتي القراءة في الباكند كانو مغمضين على المفاتيح الجديدة:
+    • /api/admin/settings (الغرفة)    → كان يرجّع show_reels وحداه
+    • /api/settings (الزوار)          → كان whitelist مغلق + تحويل boolean فقط
+  يعني: كتسجل ✓ → كتقرا ✗ → يبانلك رجع. دابا نقطة القراءة ولّاو يحتزمو.
 
-ما كتخدمش بلا:
-  - NEON_URL   : console.neon.tech → Connection string (pooled، فيه sslmode=require)
-  - SUPABASE_URL: supabase.com → Settings → Database → Session pooler (port 5432)
-    الشكل: postgresql://postgres.<ref>:<PASSWORD>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require
+──────────────────────────────────────────────
+التشغيل (دقيقتين):
+──────────────────────────────────────────────
+  1) فكّ ضغط الكيت «فمجلد الباكند» — نفس البلاصة فين كاين server.js
+     (المجلد اللي كتعملو منه push لـ Render)
 
-⚠️ الرموز الخاصة في كلمة السر قادهم بـ URL-encoding (@ → %40 ...)
+  2) دبل-كليك على:  PATCH-VISIBILITY.bat
+     → كيدير backup أوتوماتيكي + يرقّع + يفحص السينتاكس
+     → إلا طاحت مرساة (انجراف محلي): جرب  python fix_visibility_settings.py --full
 
-السكريبت:
-  - كيقرا برك من النيون (لا كتابة عليه والو)
-  - كيصايب في Supabase: enums + sequences + الجداول + الداتا + السيكانسات + FKs + الفهارس
-  - كيتحقق: عدادات + هاش MD5 لكل جدول — أي ❌ = راجع الرسالة وعاود بـ --truncate
-  - حمايات: كيرفض Neon كهدف، وكيرفض هدف معمّر بلا --truncate
+  3) دبل-كليك على:  PUSH-DEPLOY.bat
+     → commit + push → Render يبني أوتوماتيك (~دقيقتين)
 
-متكريش تحذف node_modules من الارشيف ديالك — npm install كيجيبهم
+  4) التحقق (مهم — تشوف بعينيك):
+     أ) افتح فالبراوزر:  https://neo-store-backend.onrender.com/api/settings
+        من بعد ما تحبس شي حاجة من الغرفة، خاصك تشوف فيها hidden_routes:[...]
+     ب) دخّل لـ /admin/visibility → حبس فرع → save → سدّ الصفحة → عاود دخّل
+        = المفاتيح باقة في بلاصتها ✓
+     ج) افتح الموقع فنافذة خاصة (بلا login) = الفرع المحجوب يطلع 404 ✓
+
+──────────────────────────────────────────────
+شنو تبدّل بالضبط (3 بلايص في server.js):
+──────────────────────────────────────────────
+  A) GET /api/admin/settings  → يرجّع show_reels + hidden_routes + hidden_sections
+                                 (كيقرا من store_settings — نفس الجدول القديم)
+  B) GET /api/settings        → القائمتين داخل whitelist كقوائم JSON
+                                 (سقف 100 عنصر · قيمة فاسدة = [] · show_reels ما تلمساتش)
+  C) PUT /admin/settings/:key → حارس شكل المفتاح + حارس الحجم 10KB
+                                 (نفس السلوك القديم بالضبط للمفاتيح الصالحة)
+
+ملاحظات:
+  • الرقعة idempotent — تقدر تشغلها مرتين، المرة الثانية = SKIP.
+  • الـ backup دايماً جنب الملف: server.js.bak-visibility-<وقت> — رجوع فوري إلا بغيت.
+  • كاش الطرف: /api/settings عنده s-maxage=60 + SWR (طبقة tank) → الزوار الجدد
+    يشوفو التغيير خلال ~دقيقة-دقيقتين من بعد الـ save. التابات المفتوحة تتحدث دغيا.
+  • الكيت اختبر ببطارية 17/17 سيناريو HTTP على الكود المستخرج حرفياً من الملف المرقّع.
+
+محتويات الكيت:
+  PATCH-VISIBILITY.bat          → الرقعة (دبل-كليك)
+  PUSH-DEPLOY.bat               → commit + push (دبل-كليك)
+  fix_visibility_settings.py    → السكريبت (بحماياته)
+  server.patched.js             → الملف الكامل المرقّع (وضع --full)
+  visibility-backend-FROM-51c9a78.patch → diff موحد (للمراجعة ولا git apply)
+  README-FIRST.txt              → هاد الدليل
