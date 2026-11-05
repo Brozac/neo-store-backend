@@ -1391,13 +1391,39 @@ app.get('/api/admin/videos', requireAdmin, async (req, res) => {
 });
 
 // ═══ 🆕 /admin/settings GET — زوج الـ PUT /admin/settings/:key ═══
+// 🆕 v25 [visibility-persist] — يرجّع show_reels + hidden_routes + hidden_sections.
+//    القديم كان يرجّع show_reels وحداه → غرفة التحكم في الظهور كتلقى الحالة خاوية
+//    بعد كل reload («سجّلت ورجعت») — الجذر كان هنا، التخزين في store_settings كان خدّام.
+const ADMIN_SETTING_KEYS = ['show_reels', 'hidden_routes', 'hidden_sections'];
+const ADMIN_LIST_KEYS = ['hidden_routes', 'hidden_sections'];
+function parseSettingValue(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'boolean') return raw;
+  if (Array.isArray(raw)) return raw.filter((x) => typeof x === 'string').slice(0, 100);
+  const s = String(raw).trim();
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  try {
+    const p = JSON.parse(s);
+    if (Array.isArray(p)) return p.filter((x) => typeof x === 'string').slice(0, 100);
+    return p;
+  } catch { return s; }
+}
 app.get('/api/admin/settings', requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT value FROM store_settings WHERE key = 'show_reels' LIMIT 1`
+      'SELECT key, value FROM store_settings WHERE key = ANY($1)', [ADMIN_SETTING_KEYS]
     );
-    const v = rows[0]?.value;
-    res.json({ show_reels: v === undefined ? true : (v === true || v === 'true') });
+    const out = { show_reels: true, hidden_routes: [], hidden_sections: [] };
+    for (const row of rows) {
+      const v = parseSettingValue(row.value);
+      if (row.key === 'show_reels') {
+        out.show_reels = (v === undefined) ? true : (v === true || v === 'true');
+      } else if (ADMIN_LIST_KEYS.includes(row.key) && Array.isArray(v)) {
+        out[row.key] = v;
+      }
+    }
+    res.json(out);
   } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     console.error('[admin/settings GET] failed:', e.message);
     res.status(500).json({ error: 'Failed to load settings' });
@@ -2885,12 +2911,23 @@ app.put('/api/admin/update-category/:id', async (req, res) => {
 // 🩹 FIX#9 — GET: كان يرجع كل store_settings للعامة
 //    (بما فيها المفاتيح الداخلية: exchange_resend_done / stripe_coupon_* / ...)
 //    whitelist فقط — عدّل القائمة حسب مفاتيحك العامة الفعلية
-const PUBLIC_SETTING_KEYS = ['show_reels', 'show_lightning', 'show_fb'];
+// 🆕 v25 [visibility-persist] — hidden_routes/hidden_sections داخلو للـ whitelist
+//    كقوائم JSON (مصفوفة strings، سقف 100) — الواجهة كتقرا الحجب من هنا.
+//    قيمة فاسدة/ناقصة = [] (fail-open: كلش باين — ما كيتحبس والو بغلط).
+const PUBLIC_SETTING_KEYS = ['show_reels', 'show_lightning', 'show_fb', 'hidden_routes', 'hidden_sections'];
+const PUBLIC_LIST_KEYS = ['hidden_routes', 'hidden_sections'];
 app.get('/api/settings', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT key, value FROM store_settings WHERE key = ANY($1)', [PUBLIC_SETTING_KEYS]);
     const settings = rows.reduce((acc, row) => {
-      acc[row.key] = row.value === 'true';
+      if (PUBLIC_LIST_KEYS.includes(row.key)) {
+        try {
+          const p = Array.isArray(row.value) ? row.value : JSON.parse(String(row.value));
+          acc[row.key] = Array.isArray(p) ? p.filter((x) => typeof x === 'string').slice(0, 100) : [];
+        } catch { acc[row.key] = []; }
+      } else {
+        acc[row.key] = row.value === 'true';
+      }
       return acc;
     }, {});
     res.json(settings);
@@ -2900,15 +2937,25 @@ app.get('/api/settings', async (req, res) => {
   }
 });
 
-// PUT: تحديث إعداد معين (مثل إظهار/إخفاء الريلز)
+// PUT: تحديث إعداد معين (مثل إظهار/إخفاء الريلز وقوائم الظهور hidden_routes/hidden_sections)
+// 🆕 v25 [visibility-persist] — حارس شكل المفتاح وحجم القيمة (نفس السلوك للمفاتيح الصالحة)
+const SETTING_KEY_RX = /^[a-z0-9_]{1,64}$/;
 app.put('/api/admin/settings/:key', async (req, res) => {
   const { key } = req.params;
-  const { value } = req.body; // true أو false
+  const { value } = req.body; // true / false / JSON string (قائمة مفاتيح مخفية)
+
+  if (!SETTING_KEY_RX.test(String(key || ''))) {
+    return res.status(400).json({ error: 'Invalid setting key' });
+  }
+  const stored = String(value);
+  if (stored.length > 10000) {
+    return res.status(400).json({ error: 'Setting value too large' });
+  }
 
   try {
     await pool.query(
       'INSERT INTO store_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2',
-      [key, String(value)]
+      [key, stored]
     );
     res.json({ success: true, message: 'Setting updated successfully' });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
