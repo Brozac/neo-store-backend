@@ -2171,6 +2171,109 @@ function withSwatches(rows) {
 }
 // ═══ [card-swatches] Kit 30 — نهاية ═══
 
+// ═══ 🆕 KIT [merchant-feed-v27] 2026-11-07 — Google Merchant Center feed ═══
+// طلب المالك: «بدا بالثنين» (meta descriptions + Merchant Center feed)
+// URL واحد يبني من قاعدة البيانات نيشان — الفرونت ما يقدرش يبنيه حيت
+// /api/products تعطي 24 برك في الصفحة (74,183 منتج = 3,091 طلب — مستحيل).
+//   · /api/merchant-feed.xml                  → الملف الكامل streamed بالدفعات
+//   · /api/merchant-feed.xml?chunk=0&size=5000 → بلاطة وحدة (خطة بديلة إلا timeout)
+// العملة: USD (أسعار الموقع). للدزاير: بدل MERCHANT_CURRENCY إلى 'DZD' وحط
+// MERCHANT_RATE = 135 (مثال) — التحويل أوتوماتيك في كل الأسعار.
+const MERCHANT_CURRENCY = 'USD';
+const MERCHANT_RATE = 0; // 0 = بلا تحويل · مثال للدزاير: 135
+
+function xmlEscMc(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function mcClean(v, max) {
+  return String(v == null ? '' : v)
+    .replace(/<[^>]*>?/gm, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .substring(0, max);
+}
+
+// 🩹 FIX-TRUST — نفس فلسفة الفرونت: بلا سعر = بلا صف · بلا صورة = بلا صف
+//    (Google كيرفض العنصر بلا image_link ولا price)
+function mcItem(p) {
+  const price = Number(p.price) || 0;
+  const orig = Number(p.original_price) || 0;
+  const img = String(p.image_url || '').trim();
+  if (price <= 0 || !img) return '';
+  const conv = (v) => (MERCHANT_RATE > 0 ? v * MERCHANT_RATE : v).toFixed(2);
+  const title = mcClean(p.title, 150) || `Product ${p.id}`;
+  const cat = mcClean(p.category, 900).split('/').filter(Boolean).join(' > ').substring(0, 250);
+  const desc = mcClean(p.description, 500)
+    || `${title}${cat ? ` — ${cat}` : ''} from Laclarc. Free worldwide express shipping, secure checkout.`;
+  const hasSale = orig > price;
+  return [
+    '  <item>',
+    `    <g:id>${Number(p.id)}</g:id>`,
+    `    <title>${xmlEscMc(title)}</title>`,
+    `    <g:description>${xmlEscMc(desc)}</g:description>`,
+    `    <link>https://laclarc.com/products/${Number(p.id)}</link>`,
+    `    <g:image_link>${xmlEscMc(img)}</g:image_link>`,
+    '    <g:condition>new</g:condition>',
+    '    <g:availability>in stock</g:availability>',
+    '    <g:brand>Laclarc</g:brand>',
+    '    <g:identifier_exists>no</g:identifier_exists>',
+    cat ? `    <g:product_type>${xmlEscMc(cat)}</g:product_type>` : '',
+    hasSale
+      ? `    <g:price>${conv(orig)} ${MERCHANT_CURRENCY}</g:price>\n    <g:sale_price>${conv(price)} ${MERCHANT_CURRENCY}</g:sale_price>`
+      : `    <g:price>${conv(price)} ${MERCHANT_CURRENCY}</g:price>`,
+    '  </item>',
+  ].filter(Boolean).join('\n');
+}
+
+app.get('/api/merchant-feed.xml', async (req, res) => {
+  try {
+    const size = Math.min(Math.max(parseInt(req.query.size, 10) || 5000, 100), 20000);
+    const chunkParam = parseInt(req.query.chunk, 10);
+    const hasChunk = Number.isFinite(chunkParam) && chunkParam >= 0;
+
+    res.set('Content-Type', 'application/xml; charset=utf-8');
+    res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400');
+    res.write('<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">\n<channel>\n<title>Laclarc Products</title>\n<link>https://laclarc.com</link>\n<description>Laclarc catalog — free worldwide express shipping</description>\n');
+
+    const BATCH = 5000;
+    let offset = hasChunk ? chunkParam * size : 0;
+    const cap = hasChunk ? offset + size : Infinity;
+    let written = 0;
+
+    while (offset < cap) {
+      const limit = Math.min(BATCH, hasChunk ? cap - offset : BATCH);
+      const { rows } = await pool.query(
+        'SELECT id, title, price, original_price, image_url, category, description FROM products WHERE stock_status = true ORDER BY id DESC LIMIT $1 OFFSET $2',
+        [limit, offset]
+      );
+      if (!rows.length) break;
+      const batchXml = rows.map(mcItem).filter(Boolean).join('\n');
+      if (batchXml) {
+        // backpressure — نستناو drain باش الذاكرة ما تطيحش مع كليان بطيء
+        if (!res.write(batchXml + '\n')) {
+          await new Promise((resolve) => res.once('drain', resolve));
+        }
+        written += batchXml.split('<item>').length - 1;
+      }
+      offset += rows.length;
+      if (rows.length < limit) break;
+    }
+
+    res.end('</channel>\n</rss>');
+    console.log(`[merchant-feed] written=${written} mode=${hasChunk ? `chunk=${chunkParam}` : 'ALL'}`);
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
+    console.error('❌ merchant-feed error:', err);
+    try { res.end('</channel>\n</rss>'); } catch (e) { /* socket راح */ }
+  }
+});
+// ═══ نهاية KIT [merchant-feed-v27] ═══
+
 app.get('/api/products', async (req, res) => {
   try {
     const search = req.query.search || '';
