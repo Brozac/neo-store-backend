@@ -87,11 +87,35 @@ async function getCJToken(forceRefresh = false) {
 // 2. بوابة QPS عالمية
 // ==========================================
 const CJ_MIN_GAP_MS = 1100;
+const CJ_JITTER_MS = 150;            // 🩹 jitter صغير — يمنع تزامن عدة عمليات (Render + scripts) على نفس الميلي‌ثانية
 let cjChain = Promise.resolve();
 let cjLastAt = 0;
+let cjCooldownUntil = 0;             // 🩹 تبريد مشترك: أي QPS hit يوقف *كل* الطلبات المنتظرة، لا الطلب الحالي فقط
+
+// 🛑 Circuit breaker — إذا تكرر QPS hit بسرعة، نتوقف فترة أطول بدل ما نحرق النقاط في retries فاشلة
+const CJ_BREAKER_THRESHOLD = 4;      // عدد الـ QPS hits داخل النافذة
+const CJ_BREAKER_WINDOW_MS = 30 * 1000;
+const CJ_BREAKER_COOLDOWN_MS = 20 * 1000;
+let cjQpsHits = [];
+function cjNoteQpsHit(backoffMs) {
+  const now = Date.now();
+  cjQpsHits = cjQpsHits.filter(t => now - t < CJ_BREAKER_WINDOW_MS);
+  cjQpsHits.push(now);
+  let pause = backoffMs;
+  if (cjQpsHits.length >= CJ_BREAKER_THRESHOLD) {
+    pause = Math.max(pause, CJ_BREAKER_COOLDOWN_MS);
+    cjQpsHits = [];
+    console.warn(`🛑 CJ circuit breaker OPEN — pausing all CJ calls for ${pause}ms`);
+  }
+  cjCooldownUntil = Math.max(cjCooldownUntil, now + pause);
+  return pause;
+}
+
 function cjPace() {
   const job = cjChain.then(async () => {
-    const wait = Math.max(0, cjLastAt + CJ_MIN_GAP_MS - Date.now());
+    const jitter = Math.floor(Math.random() * CJ_JITTER_MS);
+    const readyAt = Math.max(cjLastAt + CJ_MIN_GAP_MS + jitter, cjCooldownUntil);
+    const wait = Math.max(0, readyAt - Date.now());
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
     cjLastAt = Date.now();
   });
@@ -109,12 +133,16 @@ function logCjPointsInfo(resp) {
   try {
     const pi = resp && resp.data && resp.data.pointsInfo;
     if (!pi || typeof pi.remaining !== 'number') return;
-    const ratio = pi.total > 0 ? pi.remaining / pi.total : 1;
+    // 🩹 CJ كيرجّع أحياناً remaining == total رغم usedToday > 0 (لوج 2026-11-05: used=4420/54751 remaining=54751)
+    //    → ratio القديم يبقى 1 دائماً والتنبيه LOW عمره ما يشتغل. نحسب من الأسوأ بين القيمتين.
+    const fromUsed = (pi.total > 0 && typeof pi.usedToday === 'number') ? (pi.total - pi.usedToday) : pi.remaining;
+    const effectiveRemaining = Math.min(pi.remaining, fromUsed);
+    const ratio = pi.total > 0 ? effectiveRemaining / pi.total : 1;
     const now = Date.now();
     if (ratio < 0.15 || now - cjPointsLastLog > 60 * 60 * 1000) {
       cjPointsLastLog = now;
       const tag = ratio < 0.15 ? '⚠️ [CJ Points LOW]' : '📊 [CJ Points]';
-      console.log(tag + ' used=' + pi.usedToday + '/' + pi.total + ' remaining=' + pi.remaining);
+      console.log(tag + ' used=' + pi.usedToday + '/' + pi.total + ' remaining=' + effectiveRemaining + (effectiveRemaining !== pi.remaining ? ' (reported=' + pi.remaining + ')' : ''));
     }
   } catch (e) { /* monitoring never breaks requests */ }
 }
@@ -126,6 +154,17 @@ async function cjRequest(requestFn, retryCount = 0) {
     await cjPace();
     const __cjResp27 = await requestFn(token, config);
     logCjPointsInfo(__cjResp27);
+
+    // 🩹 CJ كيرجّع QPS كـ HTTP 200 + body.code=1600200 فالغالب → axios ما كيرميش error والـ retry القديم ما كيشوفوش.
+    //    نعاملوه كـ QPS hit؛ وإلا استنفدنا المحاولات نرجّع الـ response الأصلي (سلوك المستدعين ما يتبدلش).
+    if (__cjResp27?.data?.code === 1600200) {
+      if (retryCount < 3) {
+        const backoffTime = cjNoteQpsHit((retryCount + 1) * 1500);
+        console.warn(`⚠️ CJ QPS Limit hit (body). Retrying in ${backoffTime}ms (Attempt ${retryCount + 1}/3)...`);
+        return cjRequest(requestFn, retryCount + 1);   // cjPace يحترم cjCooldownUntil
+      }
+      return __cjResp27;
+    }
     return __cjResp27;
   } catch (err) {
     const status = err.response?.status;
@@ -134,10 +173,9 @@ async function cjRequest(requestFn, retryCount = 0) {
 
     if (cjCode === 1600200 || status === 429) {
       if (retryCount < 3) {
-        const backoffTime = (retryCount + 1) * 1500;
+        const backoffTime = cjNoteQpsHit((retryCount + 1) * 1500);
         console.warn(`⚠️ CJ QPS Limit hit. Retrying in ${backoffTime}ms (Attempt ${retryCount + 1}/3)...`);
-        await new Promise(r => setTimeout(r, backoffTime));
-        return cjRequest(requestFn, retryCount + 1);
+        return cjRequest(requestFn, retryCount + 1);   // الانتظار يتم داخل cjPace (مشترك بين كل الطلبات)
       }
       throw err;
     }
@@ -146,7 +184,9 @@ async function cjRequest(requestFn, retryCount = 0) {
       console.log('⚠️ CJ token expired during request. Refreshing now...');
       const freshToken = await getCJToken(true);
       await cjPace();
-      return await requestFn(freshToken, { timeout: 45000 });
+      const __cjRespAuth = await requestFn(freshToken, { timeout: 45000 });
+      logCjPointsInfo(__cjRespAuth);
+      return __cjRespAuth;
     }
     throw err;
   }

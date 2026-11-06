@@ -1,6 +1,7 @@
 // server.js — Laclarc Enterprise Dropshipping Engine (hardened)
 // Full audit applied 2026-10-02 (findings #1–#28 across session)
 // 🩹 HOTFIX v2.0.1 — تهريب wildcards ديال LIKE/ILIKE (% _ \) — PostgreSQL كيستعمل \ كـ escape افتراضي
+// 🩹 KIT [topsellers-fix + admin-log-throttle] 2026-11-06 — marker: topsellers-fix-v26
 function escapeLikeSafe(s) {
   return String(s).replace(/[\\%_]/g, '\\$&');
 }
@@ -204,6 +205,29 @@ const ADMIN_PUBLIC_EXCEPTIONS = new Set([
   '/api/admin/logout',
 ]);
 
+// 🩹 لوج الرفض: سطر واحد + throttle (كان logError → stack trace كامل + errors.log لكل 401 عادي).
+//    الرفض نفسه (401/403) ما تبدّل — فقط الضجيج. نفس (ip+path+reason) يُسجَّل مرة كل 60 ثانية.
+const ADMIN_VIOLATION_LOG_TTL_MS = 60 * 1000;
+const ADMIN_VIOLATION_LOG_MAX = 500;
+const adminViolationSeen = new Map();
+function logAdminViolation(req, reason) {
+  try {
+    const now = Date.now();
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const key = `${req.ip}|${req.method}|${req.path}|${reason}`;
+    const last = adminViolationSeen.get(key);
+    if (last && now - last < ADMIN_VIOLATION_LOG_TTL_MS) return;
+    if (adminViolationSeen.size >= ADMIN_VIOLATION_LOG_MAX) {
+      for (const [k, t] of adminViolationSeen) {
+        if (now - t >= ADMIN_VIOLATION_LOG_TTL_MS) adminViolationSeen.delete(k);
+      }
+      if (adminViolationSeen.size >= ADMIN_VIOLATION_LOG_MAX) adminViolationSeen.clear();
+    }
+    adminViolationSeen.set(key, now);
+    console.warn(`[${new Date().toISOString()}] 🛡️ ADMIN-SURFACE ${reason}: ${req.method} ${req.path} ip=${req.ip}${xff && xff !== req.ip ? ` xff=${xff}` : ''}`);
+  } catch (_) { /* logging never breaks requests */ }
+}
+
 app.use((req, res, next) => {
   // 🩹 hygiene — bare '/api/admin' محروس كذلك
   const isAdminPath = req.path === '/api/admin' || req.path.startsWith('/api/admin/');
@@ -218,20 +242,20 @@ app.use((req, res, next) => {
   }
 
   if (!token) {
-    logger.logError('ADMIN-SURFACE VIOLATION', new Error(`${req.method} ${req.path} — IP: ${req.ip} — no token`));
+    logAdminViolation(req, 'no token');
     return res.status(401).json({ error: 'Access Denied: Administrative authentication required' });
   }
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     if (decoded.role !== 'admin') {
-      logger.logError('ADMIN-SURFACE VIOLATION', new Error(`${req.method} ${req.path} — IP: ${req.ip} — insufficient role`));
+      logAdminViolation(req, 'insufficient role');
       return res.status(403).json({ error: 'Access Denied: Administrative privileges required' });
     }
     req.user = decoded;
     return next();
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
-    logger.logError('ADMIN-SURFACE VIOLATION', new Error(`${req.method} ${req.path} — IP: ${req.ip} — invalid token`));
+    logAdminViolation(req, 'invalid token');
     return res.status(403).json({ error: 'Access Denied: Invalid administrative token' });
   }
 });
@@ -4039,8 +4063,11 @@ cron.schedule('0 5 * * *', async () => {
               pid,
               p.description || 'High quality product from Laclarc Global Catalog.',
               categorySlug.toLowerCase().replace(/\s+/g, '-'),
-              true,                             // is_sourced — منتج CJ مؤهل
-              p.listedNum || 0,                 // sales_count = listedNum الحقيقي
+              // 🩹 FIX [sales_count-int] — كان هنا `true` (is_sourced) بلا placeholder: الـ SQL يجتاز is_sourced
+              //    كـ literal أصلاً → هاد true طاح على $9 = sales_count (INTEGER) →
+              //    "invalid input syntax for type integer: \"true\"" — كرون TopSellers كامل ميت كل يوم 5ص.
+              p.listedNum || 0,                 // $9 sales_count = listedNum الحقيقي (كما كان مقصود)
+              p.listedNum || 0,                 // $10 cj_listed_num — نفس المصدر (نفس مسار massSync)
               p.warehouseInventoryNum || 0,     // warehouse_inventory
               p.verifiedWarehouse === 1,        // verified_warehouse
               p.isVideo === 1,                  // has_video
