@@ -2171,7 +2171,11 @@ function withSwatches(rows) {
 }
 // ═══ [card-swatches] Kit 30 — نهاية ═══
 
-// ═══ 🆕 KIT [merchant-feed-v29] 2026-11-08 — Google Merchant Center feed ═══
+// ═══ 🆕 KIT [merchant-feed-v30] 2026-11-08 — Google Merchant Center feed (ثنائي العملة) ═══
+// 💵 v30 USD FEED: «انا نحوس العالم كامل وبدولار» — الفلوس من بلدان الدولار ماشي من الدزاير:
+//    /api/merchant-feed-usd.xml → أسعار الداتابيس أصلان USD (rate=1، بلا er-api، بلا تحويل)
+//    → جوجل تقبلها فبلدان الدولار: US/EC/SV/PA/ZW/FM/MH/PW/TL (عملة الـfeed = عملة البلد)
+//    /api/merchant-feed.xml     → تبقى DZD بالمعدل الحي (الجزائر — v29 كيف ما هي)
 // طلب المالك: «بدا بالثنين» (meta descriptions + Merchant Center feed)
 // URL واحد يبني من قاعدة البيانات نيشان — الفرونت ما يقدرش يبنيه حيت
 // /api/products تعطي 24 برك في الصفحة (74,183 منتج = 3,091 طلب — مستحيل).
@@ -2222,7 +2226,8 @@ function mcClean(v, max) {
 
 // 🩹 FIX-TRUST — نفس فلسفة الفرونت: بلا سعر = بلا صف · بلا صورة = بلا صف
 //    (Google كيرفض العنصر بلا image_link ولا price)
-function mcItem(p, rate) {
+// v30: cur = 'DZD' (كيحوّل بالمعدل الحي) ولا 'USD' (الأسعار خام كيف ما هي فالداتابيس)
+function mcItem(p, rate, cur) {
   const price = Number(p.price) || 0;
   const orig = Number(p.original_price) || 0;
   const img = String(p.image_url || '').trim();
@@ -2247,13 +2252,14 @@ function mcItem(p, rate) {
     '    <g:identifier_exists>no</g:identifier_exists>',
     cat ? `    <g:product_type>${xmlEscMc(cat)}</g:product_type>` : '',
     hasSale
-      ? `    <g:price>${conv(orig)} ${MERCHANT_CURRENCY}</g:price>\n    <g:sale_price>${conv(price)} ${MERCHANT_CURRENCY}</g:sale_price>`
-      : `    <g:price>${conv(price)} ${MERCHANT_CURRENCY}</g:price>`,
+      ? `    <g:price>${conv(orig)} ${cur}</g:price>\n    <g:sale_price>${conv(price)} ${cur}</g:sale_price>`
+      : `    <g:price>${conv(price)} ${cur}</g:price>`,
     '  </item>',
   ].filter(Boolean).join('\n');
 }
 
-app.get('/api/merchant-feed.xml', async (req, res) => {
+// v30: مصنع الهاندلر — نفس الجنيراتور للجوج العملات (chunk= كيبقى يخدم في الزوج)
+const mcFeedHandler = (cur) => async (req, res) => {
   try {
     const size = Math.min(Math.max(parseInt(req.query.size, 10) || 5000, 100), 20000);
     const chunkParam = parseInt(req.query.chunk, 10);
@@ -2263,7 +2269,7 @@ app.get('/api/merchant-feed.xml', async (req, res) => {
     res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400');
     res.write('<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">\n<channel>\n<title>Laclarc Products</title>\n<link>https://laclarc.com</link>\n<description>Laclarc catalog — free worldwide express shipping</description>\n');
 
-    const rate = await mcRate();
+    const rate = cur === 'USD' ? 1 : await mcRate(); // 🆕 v30: الدولار = بلا تحويل بلا fetch
     const BATCH = 5000;
     let offset = hasChunk ? chunkParam * size : 0;
     const cap = hasChunk ? offset + size : Infinity;
@@ -2276,7 +2282,7 @@ app.get('/api/merchant-feed.xml', async (req, res) => {
         [limit, offset]
       );
       if (!rows.length) break;
-      const batchXml = rows.map((p) => mcItem(p, rate)).filter(Boolean).join('\n');
+      const batchXml = rows.map((p) => mcItem(p, rate, cur)).filter(Boolean).join('\n');
       if (batchXml) {
         // backpressure — نستناو drain باش الذاكرة ما تطيحش مع كليان بطيء
         if (!res.write(batchXml + '\n')) {
@@ -2289,13 +2295,19 @@ app.get('/api/merchant-feed.xml', async (req, res) => {
     }
 
     res.end('</channel>\n</rss>');
-    console.log(`[merchant-feed] written=${written} rate=${rate} ${MERCHANT_CURRENCY} mode=${hasChunk ? `chunk=${chunkParam}` : 'ALL'}`);
+    console.log(`[merchant-feed] feed=${cur} written=${written} rate=${rate} mode=${hasChunk ? `chunk=${chunkParam}` : 'ALL'}`);
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ merchant-feed error:', err);
     try { res.end('</channel>\n</rss>'); } catch (e) { /* socket راح */ }
   }
-});
-// ═══ نهاية KIT [merchant-feed-v29] ═══
+};
+// ═══ نهاية KIT [merchant-feed-v30] ═══
+
+// 🆕 v30 — جوج مصادر في MC (كل مصدر ببلادو):
+//   DZD → /api/merchant-feed.xml      → Target countries: Algeria برك (v29)
+//   USD → /api/merchant-feed-usd.xml  → Target countries: United States (+EC/SV/PA/ZW/FM/MH/PW/TL)
+app.get('/api/merchant-feed.xml', mcFeedHandler('DZD'));
+app.get('/api/merchant-feed-usd.xml', mcFeedHandler('USD'));
 
 app.get('/api/products', async (req, res) => {
   try {
