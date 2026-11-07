@@ -2171,19 +2171,40 @@ function withSwatches(rows) {
 }
 // ═══ [card-swatches] Kit 30 — نهاية ═══
 
-// ═══ 🆕 KIT [merchant-feed-v27] 2026-11-07 — Google Merchant Center feed ═══
+// ═══ 🆕 KIT [merchant-feed-v29] 2026-11-08 — Google Merchant Center feed ═══
 // طلب المالك: «بدا بالثنين» (meta descriptions + Merchant Center feed)
 // URL واحد يبني من قاعدة البيانات نيشان — الفرونت ما يقدرش يبنيه حيت
 // /api/products تعطي 24 برك في الصفحة (74,183 منتج = 3,091 طلب — مستحيل).
 //   · /api/merchant-feed.xml                  → الملف الكامل streamed بالدفعات
 //   · /api/merchant-feed.xml?chunk=0&size=5000 → بلاطة وحدة (خطة بديلة إلا timeout)
-// العملة: USD (أسعار الموقع). للدزاير: بدل MERCHANT_CURRENCY إلى 'DZD' وحط
-// MERCHANT_RATE = 135 (مثال) — التحويل أوتوماتيك في كل الأسعار.
-const MERCHANT_CURRENCY = 'USD';
-const MERCHANT_RATE = 0; // 0 = بلا تحويل · مثال للدزاير: 135
+// 💵 CUR (v29 2026-11-08): جوجل رفض 69,175 عنصر "Unsupported currency" — عملة
+//    الـ feed لازمها تطابق بلد الاستهداف (الدولار ما عندو حتى بلاد مفعلة بدولار).
+//    الدزاير = السوق الأساسي → DZD. المعدل حي كل 24h من open.er-api.com
+//    (مجاني بلا مفتاح) — فشل = fallback ثابت. رجوع للدولار: USD/0.
+const MERCHANT_CURRENCY = 'DZD';
+const MERCHANT_RATE_FALLBACK = 136; // ~نوفمبر 2026 (xe 135.8 · wise 136.2) — كيتعوض بالمعدل الحي
+
+let __mcRate = { v: MERCHANT_RATE_FALLBACK, at: 0 };
+async function mcRate() {
+  if (Date.now() - __mcRate.at < 86400000) return __mcRate.v; // مؤمنة 24h
+  try {
+    const ctl = new AbortController();
+    const tmr = setTimeout(() => ctl.abort(), 3000);
+    const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: ctl.signal });
+    clearTimeout(tmr);
+    const j = await r.json();
+    const v = j && j.rates ? Number(j.rates[MERCHANT_CURRENCY]) : 0;
+    if (v > 0) { __mcRate = { v, at: Date.now() }; console.log('[merchant-feed] live rate:', MERCHANT_CURRENCY, v); return v; }
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} }
+  __mcRate.at = Date.now() - 82800000; // فشل → عاود من بعد ساعة — ما نضربوش الـ API
+  console.warn('[merchant-feed] rate fetch failed — fallback', __mcRate.v);
+  return __mcRate.v;
+}
 
 function xmlEscMc(v) {
   return String(v == null ? '' : v)
+    // 🧹 v29: حروف تحكم ممنوعة ف XML — جوجل رفض 1 عنصر بيها (line 899,385)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFE\uFFFF]/g, ' ')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -2201,16 +2222,17 @@ function mcClean(v, max) {
 
 // 🩹 FIX-TRUST — نفس فلسفة الفرونت: بلا سعر = بلا صف · بلا صورة = بلا صف
 //    (Google كيرفض العنصر بلا image_link ولا price)
-function mcItem(p) {
+function mcItem(p, rate) {
   const price = Number(p.price) || 0;
   const orig = Number(p.original_price) || 0;
   const img = String(p.image_url || '').trim();
   if (price <= 0 || !img) return '';
-  const conv = (v) => (MERCHANT_RATE > 0 ? v * MERCHANT_RATE : v).toFixed(2);
+  const conv = (v) => (v * rate).toFixed(2);
   const title = mcClean(p.title, 150) || `Product ${p.id}`;
   const cat = mcClean(p.category, 900).split('/').filter(Boolean).join(' > ').substring(0, 250);
-  const desc = mcClean(p.description, 500)
-    || `${title}${cat ? ` — ${cat}` : ''} from Laclarc. Free worldwide express shipping, secure checkout.`;
+  // 🩹 MCDESC (v28): المواصفات الخام ("Product information:Material:...") خرجت —
+  //    الجملة النظيفة هي الأساسية، متسقة مع SEO-BLURB تاع صفحة المنتج (الفرونت)
+  const desc = `${title}${cat ? ` — ${cat}` : ''} from Laclarc. Free worldwide express shipping, secure checkout.`;
   const hasSale = orig > price;
   return [
     '  <item>',
@@ -2241,6 +2263,7 @@ app.get('/api/merchant-feed.xml', async (req, res) => {
     res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400');
     res.write('<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">\n<channel>\n<title>Laclarc Products</title>\n<link>https://laclarc.com</link>\n<description>Laclarc catalog — free worldwide express shipping</description>\n');
 
+    const rate = await mcRate();
     const BATCH = 5000;
     let offset = hasChunk ? chunkParam * size : 0;
     const cap = hasChunk ? offset + size : Infinity;
@@ -2249,11 +2272,11 @@ app.get('/api/merchant-feed.xml', async (req, res) => {
     while (offset < cap) {
       const limit = Math.min(BATCH, hasChunk ? cap - offset : BATCH);
       const { rows } = await pool.query(
-        'SELECT id, title, price, original_price, image_url, category, description FROM products WHERE stock_status = true ORDER BY id DESC LIMIT $1 OFFSET $2',
+        'SELECT id, title, price, original_price, image_url, category FROM products WHERE stock_status = true ORDER BY id DESC LIMIT $1 OFFSET $2',
         [limit, offset]
       );
       if (!rows.length) break;
-      const batchXml = rows.map(mcItem).filter(Boolean).join('\n');
+      const batchXml = rows.map((p) => mcItem(p, rate)).filter(Boolean).join('\n');
       if (batchXml) {
         // backpressure — نستناو drain باش الذاكرة ما تطيحش مع كليان بطيء
         if (!res.write(batchXml + '\n')) {
@@ -2266,13 +2289,13 @@ app.get('/api/merchant-feed.xml', async (req, res) => {
     }
 
     res.end('</channel>\n</rss>');
-    console.log(`[merchant-feed] written=${written} mode=${hasChunk ? `chunk=${chunkParam}` : 'ALL'}`);
+    console.log(`[merchant-feed] written=${written} rate=${rate} ${MERCHANT_CURRENCY} mode=${hasChunk ? `chunk=${chunkParam}` : 'ALL'}`);
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ merchant-feed error:', err);
     try { res.end('</channel>\n</rss>'); } catch (e) { /* socket راح */ }
   }
 });
-// ═══ نهاية KIT [merchant-feed-v27] ═══
+// ═══ نهاية KIT [merchant-feed-v29] ═══
 
 app.get('/api/products', async (req, res) => {
   try {
