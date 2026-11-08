@@ -21,28 +21,60 @@ async function syncShipmentEvents(orderId) {
     );
     if (!rows[0]) return { synced: 0 };
 
-    const code = rows[0].cj_order_number;
+    // v36 G1 — الدوك 2.1: البرامتر الوحيد trackNumber (batch) — كان orderId=cj_order_number
+    //   (موثق حتى لا مرة) + القراءة كانت data.result[0].logisticsTrackEvents (شكل غير موثق).
+    const track = String(rows[0].tracking_number || '').trim();
+    if (!track) return { synced: 0, reason: 'no_tracking_number' };
     const token = await getCJToken();
 
     const res = await axios.get(`${CJ_API}/logistic/trackInfo`, {
-      params: { orderId: code },
+      params: { trackNumber: track },
       headers: { 'CJ-Access-Token': token },
       timeout: 30000,
     });
 
-    const events = res.data?.data?.result?.[0]?.logisticsTrackEvents || [];
+    // v36 G1 — parse مزدوج الشكل:
+    //   legacy  = data.result[0].logisticsTrackEvents[] — أحداث كاملة (الشكل القديم، إذا CJ رجعو)
+    //   summary = data[] الملخص الموثق فالدوك (trackingStatus/lastTrackNumber/lastMileCarrier...) بلا أحداث
+    //             → نصايبو حدث واحد «آخر حالة حية» · اللوغ كيبين الشكل اللي رجع CJ = probe حي دائم
+    const d = res.data && res.data.data;
+    let events = [];
+    let shape = 'none';
+    let descOnly = false;
+    const legacy = d && d.result && Array.isArray(d.result) && d.result[0] && d.result[0].logisticsTrackEvents;
+    if (Array.isArray(legacy)) {
+      events = legacy;
+      shape = 'legacy';
+    } else if (Array.isArray(d) && d[0] && (d[0].trackingStatus || d[0].lastTrackNumber)) {
+      const s = d[0];
+      const desc = [String(s.trackingStatus || '').trim(), s.lastTrackNumber ? `last mile: ${s.lastTrackNumber}` : '']
+        .filter(Boolean).join(' · ') || 'CJ live status';
+      events = [{ ...s, logisticsStatus: s.trackingStatus || '', logisticsPlace: '', logisticsTime: '', description: desc }];
+      shape = 'summary';
+      descOnly = true;   // الملخص بلا وقت ثابت → dedup بالوصف برك (الوقت كيتبدل كل مزامنة)
+    }
+    console.log(`[ShipTruth] sync #${orderId} shape=${shape} events=${events.length}`);
+
     let inserted = 0;
 
+
     for (const ev of events) {
-      // Dedup — لا تكرار لنفس الحدث
-      const dup = await pool.query(
-        `SELECT 1 FROM shipment_events WHERE order_id = $1 AND event_time = $2 AND description = $3 LIMIT 1`,
-        [orderId, ev.logisticsTime || ev.time, ev.description || ev.trackInfo || '']
-      );
+      const desc = ev.description || ev.trackInfo || '';
+      const time = ev.logisticsTime || ev.time || new Date().toISOString();
+      // Dedup — لا تكرار لنفس الحدث (الملخص: بالوصف برك — الوقت كيتبدل كل مزامنة)
+      const dup = descOnly
+        ? await pool.query(
+            `SELECT 1 FROM shipment_events WHERE order_id = $1 AND description = $2 LIMIT 1`,
+            [orderId, desc]
+          )
+        : await pool.query(
+            `SELECT 1 FROM shipment_events WHERE order_id = $1 AND event_time = $2 AND description = $3 LIMIT 1`,
+            [orderId, time, desc]
+          );
       if (dup.rows.length > 0) continue;
 
       await pool.query(`
-        INSERT INTO shipment_events 
+        INSERT INTO shipment_events
         (order_id, event_type, status_raw, location, description, tracking_number, event_time, raw_data)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       `, [
@@ -50,13 +82,14 @@ async function syncShipmentEvents(orderId) {
         classifyEvent(ev),
         ev.logisticsStatus || ev.status || '',
         ev.logisticsPlace || ev.location || '',
-        ev.description || ev.trackInfo || '',
+        desc,
         rows[0].tracking_number || '',
-        ev.logisticsTime || new Date().toISOString(),
+        time,
         JSON.stringify(ev),
       ]);
       inserted++;
     }
+
 
     if (inserted > 0) {
       await auditEvent('SHIPTRUTH_SYNCED', orderId, { new_events: inserted }, 'info');
@@ -70,6 +103,16 @@ async function syncShipmentEvents(orderId) {
 
 /** 2️⃣ تصنيف حدث CJ خام → نوع قياسي (للـ timeline الموحد) */
 function classifyEvent(ev) {
+  // v36 G1 — الحالة الصريحة (trackingStatus من الملخص الموثق 2.1) لها الأولوية على النص،
+  //   حتّى «last mile: …» فالوصف ما تقلبش الحالة OUT_FOR_DELIVERY بالغلط.
+  const st = String(ev.logisticsStatus || ev.status || '').toLowerCase();
+  if (/out for delivery/.test(st)) return 'OUT_FOR_DELIVERY';
+  if (/deliver/.test(st)) return 'DELIVERED';
+  if (/custom|clearance/.test(st)) return 'CUSTOMS';
+  if (/transit/.test(st)) return 'IN_TRANSIT';
+  if (/arriv/.test(st)) return 'ARRIVED_COUNTRY';
+  if (/depart|leave/.test(st)) return 'DEPARTED';
+  if (/warehouse|pack/.test(st)) return 'PACKED';
   const text = `${ev.description || ''} ${ev.trackInfo || ''} ${ev.logisticsStatus || ''}`.toLowerCase();
   if (/deliver|arrive.*door|完成派/.test(text)) return 'DELIVERED';
   if (/out for delivery|派送|last mile/.test(text)) return 'OUT_FOR_DELIVERY';

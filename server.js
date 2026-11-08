@@ -30,7 +30,7 @@ const { secondShotConversion } = require('./services/conversionService');
 const { fulfillCJOrder, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
-const { selfHealStuckOrders, disputeWatchdogCron, auditEvent, querySourcingList, pickSourcingAlert, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress } = require('./services/cjService');
+const { selfHealStuckOrders, disputeWatchdogCron, auditEvent, querySourcingList, pickSourcingAlert, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress, queryOrderTrackHistory } = require('./services/cjService');
 const logger = require('./logger');
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
 const templates = require('./emails/templates'); // 🎨 SERENE email design system (F#84) — all customer emails in English
@@ -1007,6 +1007,7 @@ app.get('/api/admin/track/:trackNumber', async (req, res) => {
 const shippingEstimateCache = new Map();
 const SHIPPING_ESTIMATE_TTL_MS = 6 * 60 * 60 * 1000;
 const shipIpHits = new Map();
+const feeOrNull = (v) => { const n = Number(v); return Number.isFinite(n) ? n : null; }; // v36 G3 — الرسوم الموثقة (1.1)
 
 app.get('/api/shipping/estimate', async (req, res) => {
   try {
@@ -1075,8 +1076,10 @@ app.get('/api/shipping/estimate', async (req, res) => {
     const data = {
       supported: true,
       country,
-      cheapest: { price: cheapest.logisticPrice, carrier: cheapest.logisticName, aging: cheapest.logisticAging || null },
-      fastest: { days: fastest.logisticAging || null, price: fastest.logisticPrice, carrier: fastest.logisticName },
+      // v36 G3 — الرسوم من الدوك 1.1: totalPostageFee = السوم الإجمالي (postage + ضرايب + تخليص).
+      //   null = CJ ما رجعتهاش فهاد النداء — الواجهة كتبقى على price كي ما كاينش.
+      cheapest: { price: cheapest.logisticPrice, carrier: cheapest.logisticName, aging: cheapest.logisticAging || null, totalPostageFee: feeOrNull(cheapest.totalPostageFee), taxesFee: feeOrNull(cheapest.taxesFee), clearanceOperationFee: feeOrNull(cheapest.clearanceOperationFee) },
+      fastest: { days: fastest.logisticAging || null, price: fastest.logisticPrice, carrier: fastest.logisticName, totalPostageFee: feeOrNull(fastest.totalPostageFee), taxesFee: feeOrNull(fastest.taxesFee), clearanceOperationFee: feeOrNull(fastest.clearanceOperationFee) },
       agingDays,
       carriersCount: list.length,
       source: 'cj-live',
@@ -3320,6 +3323,28 @@ app.get('/api/admin/order-pod/:orderId', requireAdmin, async (req, res) => {
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Order POD', err);
     res.status(502).json({ error: 'CJ POD query failed: ' + err.message });
+
+// ═══ v36 (G2 — دوك logistic.html#_2-2) — كاشف تبديل رقم التتبع ═══
+// POST /api/admin/track-history { trackNumbers: [...] } (1–10 أرقام)
+//   الرقم القديم كيوقف يتحرك كي CJ تعاود تشحن — هذي كتجاوب: شنو الرقم الحالي + آخر حدث للجوج.
+//   data خاوية = حتى رقم ما تطابق مع طلباتنا (الدوك: صامتة بلا خطأ) — ماشي فشل. الكاش 10د.
+app.post('/api/admin/track-history', requireAdmin, async (req, res) => {
+  try {
+    const nums = Array.isArray(req.body && req.body.trackNumbers) ? req.body.trackNumbers : [];
+    if (!nums.length) return res.status(400).json({ error: 'trackNumbers مطلوبة — مصفوفة 1–10 أرقام تتبع' });
+    if (nums.length > 10) return res.status(400).json({ error: 'أقصى 10 أرقام في النداء (حد الدوك 2.2)' });
+    const rows = await queryOrderTrackHistory(nums);
+    res.json({
+      count: rows.length,
+      replacedCount: rows.filter((r) => r.replaced).length,
+      note: rows.length ? '' : 'حتى رقم ما تطابق مع طلباتك (أجنبية/مؤرشفوية/مقسمة) — هذي ماشي فشل (الدوك 2.2).',
+      data: rows,
+    });
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
+    logger.logError('Track History', err);
+    res.status(502).json({ error: 'CJ track-history query failed: ' + err.message });
+  }
+});
   }
 });
 

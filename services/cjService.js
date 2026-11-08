@@ -415,6 +415,41 @@ async function queryProofOfDelivery(cjOrderNumbers) {
   return result;
 }
 
+// ═══ v36 G2 — 2.2 getOrderTrackHistory (logistic.html#_2-2) ═══
+// كاشف تبديل رقم التتبع: الرقم القديم (اللي عند الزبون) → الرقم الحالي + آخر حدث للجوج.
+// الدوك: 1–10 أرقام/نداء (10 نقاط) · الأرقام الأجنبية/المؤرشفوية/المقسومة كيتسكتو بلا خطأ
+// (data خاوية ≠ فشل) · «ما تبدلش» = trackNumber == currentTrackNumber (تجاهل الحالة) → علم replaced محلي
+const CJ_TRACK_HISTORY_TTL_MS = 10 * 60 * 1000;
+const cjTrackHistoryCache = new Map();   // مفتاح: الأرقام مرتبة مع بعض — نفس نمط POD/v34
+
+async function queryOrderTrackHistory(trackNumbers) {
+  const list = (Array.isArray(trackNumbers) ? trackNumbers : [trackNumbers])
+    .map((x) => String(x || '').trim())
+    .filter(Boolean)
+    .filter((t, i, a) => a.indexOf(t) === i);   // الدوك: المكررين كيتسكتو
+  if (list.length === 0) throw new Error('NO_TRACK_NUMBERS: أرسل على الأقل رقم تتبع واحد');
+  if (list.length > 10) list.length = 10;             // الدوك 2.2: أكثر من 10 = 1600300
+  const key = list.slice().sort().join('|');
+  const hit = cjTrackHistoryCache.get(key);
+  if (hit && Date.now() < hit.expires) return hit.result;
+  const res = await cjRequest((token) => axios.post(`${CJ_API}/logistic/getOrderTrackHistory`, { trackNumbers: list }, {
+    headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' },
+  }));
+  const env = res.data || {};
+  const ok = env.code === 200 || env.code === 0 || env.success === true;
+  if (!ok || env.result === false) throw new Error(`getOrderTrackHistory envelope ${env.code}: ${env.message || 'unknown'}`);
+  const rows = Array.isArray(env.data) ? env.data : [];
+  const result = rows.map((r) => {
+    const sent = String((r && r.trackNumber) || '').trim();
+    const cur = String((r && r.currentTrackNumber) || '').trim();
+    return { ...r, replaced: !!(sent && cur && sent.toLowerCase() !== cur.toLowerCase()) };
+  });
+  cjTrackHistoryCache.set(key, { expires: Date.now() + CJ_TRACK_HISTORY_TTL_MS, result });
+  if (cjTrackHistoryCache.size > 200) cjTrackHistoryCache.clear();   // ذاكرة آمنة
+  return result;
+}
+
+
 // F4 — تصحيح عنوان الشحن (دوك 11.1 — POST، 2 نقاط): كيصيفط غير الحقول المُمرّرة — اللي ما تنشافش كتبقى كما هي عند CJ.
 //    الجدول الرسمي: CREATED/IN_CART = كلشي · من بعد رقم التتبع = 1613003 · البلد = جوج حقول مع بعضياتهم ·
 //    '' = مسح حقل اختياري (مثال shippingAddress2). logisticName غير للطلبات غير المدفوعة.
@@ -2153,4 +2188,4 @@ async function payCJOrderBalance(...candidates) {
 // 📤 التصديرات — 🩹 إجباري: probeOrderStatus + classifyDuplicate + auditEvent
 //    cjWebhookService v2.1 (P0-20 anti-spoof) يعتمدهما — بلاهما أول webhook يرمي undefined
 // ==========================================
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate, querySourcingList, pickSourcingAlert, getCjVariantStock, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress };
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate, querySourcingList, pickSourcingAlert, getCjVariantStock, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress, queryOrderTrackHistory };
