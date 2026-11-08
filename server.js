@@ -30,7 +30,7 @@ const { secondShotConversion } = require('./services/conversionService');
 const { fulfillCJOrder, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
-const { selfHealStuckOrders, disputeWatchdogCron, auditEvent } = require('./services/cjService');
+const { selfHealStuckOrders, disputeWatchdogCron, auditEvent, querySourcingList, pickSourcingAlert } = require('./services/cjService');
 const logger = require('./logger');
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
 const templates = require('./emails/templates'); // 🎨 SERENE email design system (F#84) — all customer emails in English
@@ -1492,16 +1492,18 @@ async function runCjVideoSync() {
 
   for (const keyword of SEARCH_QUERIES) {
     for (let pageNum = 1; pageNum <= 3; pageNum++) {
-      const params = { pageNum, pageSize: 20, searchType: 2 };
-      if (keyword) params.productNameEn = keyword;
+      // 🩹 v33 (F#44): هاد الكرون كان كيحرق حتى 39 نداء على /product/list المتوقفة في كل ضغطة → listV2 بنفس السيمانيتيك (Trending)
+      const params = { page: pageNum, size: 20, productFlag: 0 };
+      if (keyword) params.keyWord = keyword;
 
       let cjProducts;
       try {
         const listRes = await cjRequest((token, config) =>
-          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list',
+          axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/listV2',
             { ...config, headers: { 'CJ-Access-Token': token }, params })
         );
-        cjProducts = listRes.data?.data?.list || [];
+        const contentArr = listRes.data?.data?.content || [];
+        cjProducts = (contentArr[0] && contentArr[0].productList) || [];
       } catch (listErr) { try { Sentry.captureException(listErr); } catch (__laclarcGuard) {}
         logger.logError(`CJ Video Sync list (${keyword || 'Trending'} p${pageNum})`, listErr);
         continue;
@@ -1512,7 +1514,7 @@ async function runCjVideoSync() {
       console.log(`📄 [Video Sync] "${keyword || 'Trending'}" p${pageNum}: scanning ${cjProducts.length}...`);
 
       for (const cjItem of cjProducts) {
-        const productId = cjItem.pid ? String(cjItem.pid) : null;
+        const productId = cjItem.id ? String(cjItem.id) : null;
         if (!productId || seenPids.has(productId)) continue;
         seenPids.add(productId);
         checkedCount++;
@@ -1601,21 +1603,24 @@ async function runCjProductSync(keyword) {
   const pageSize = 20;
   let importedCount = 0;
 
+  // 🩹 v33 (F#44): /product/list توقفت رسمياً (حد 1000 طلب/نهار + ماكاينش تطوير) → listV2
+  //    نفس الدورة بالضبط: page/size + keyWord (ولا productFlag=0 = Trending) + الرد من content[0].productList
   for (let pageNum = 1; pageNum <= pagesToFetch; pageNum++) {
-    const params = { pageNum, pageSize };
-    if (keyword) params.productNameEn = keyword;
-    else params.searchType = 2;
+    const params = { page: pageNum, size: pageSize };
+    if (keyword) params.keyWord = keyword;
+    else params.productFlag = 0;
 
     const listRes = await cjRequest((token, config) =>
-      axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list', { ...config, headers: { 'CJ-Access-Token': token }, params })
+      axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/listV2', { ...config, headers: { 'CJ-Access-Token': token }, params })
     );
 
-    const cjProducts = listRes.data?.data?.list || [];
+    const contentArr = listRes.data?.data?.content || [];
+    const cjProducts = (contentArr[0] && contentArr[0].productList) || [];
     if (cjProducts.length === 0) break;
 
     for (const cjItem of cjProducts) {
       await new Promise(r => setTimeout(r, 1200));
-      const productId = cjItem.pid ? String(cjItem.pid) : null;
+      const productId = cjItem.id ? String(cjItem.id) : null;
       if (!productId) continue;
 
       try {
@@ -3222,7 +3227,31 @@ app.post('/api/admin/sourcing/create', async (req, res) => {
     const { productName, productImage, productUrl, price } = req.body;
     if (!productName || !productImage) return res.status(400).json({ error: 'Product name and image are required' });
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/product/sourcing/create', { productName, productImage, productUrl: productUrl || '', price: price || 0 }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
-    if (response.data.success || response.data.code === 200 || response.data.code === 0) res.status(201).json({ message: 'Sourcing request sent successfully! CJ will review it.' });
+    if (response.data.success || response.data.code === 200 || response.data.code === 0) {
+      // 🆕 v33 — F#44: نخزنو cjSourcingId باش كرون السورسنغ يقدر يسول CJ على النتيجة (دوك 5.3 queryList)
+      const sid = response.data && response.data.data && response.data.data.cjSourcingId;
+      if (sid) {
+        try {
+          await pool.query(
+            `CREATE TABLE IF NOT EXISTS cj_sourcing_requests (
+              source_id TEXT PRIMARY KEY,
+              product_name TEXT,
+              status TEXT DEFAULT 'pending',
+              notified BOOLEAN DEFAULT FALSE,
+              payload JSONB,
+              created_at TIMESTAMPTZ DEFAULT NOW(),
+              updated_at TIMESTAMPTZ DEFAULT NOW()
+            )`
+          );
+          await pool.query(
+            `INSERT INTO cj_sourcing_requests (source_id, product_name) VALUES ($1, $2)
+             ON CONFLICT (source_id) DO NOTHING`,
+            [String(sid), String(productName).slice(0, 200)]
+          );
+        } catch (storeErr) { try { Sentry.captureException(storeErr); } catch (__laclarcGuard) {} console.warn('⚠️ [Sourcing] id store failed (غير التسجيل — الطلب نفسو مشى):', storeErr.message); }
+      }
+      res.status(201).json({ message: 'Sourcing request sent successfully! CJ will review it.', sourcingId: sid || null });
+    }
     else res.status(400).json({ error: response.data.message || 'Failed to create sourcing request' });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
@@ -3702,6 +3731,46 @@ cron.schedule('0 11,18 * * *', async () => {
 // 🩺 🩹 (بقيت كما هي — مع FIX من الجلسة السابقة)
 cron.schedule('0 */2 * * *', async () => {
   try { await selfHealStuckOrders(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('SelfHeal Scheduler', e); }
+});
+
+// ═══ 📮 Sourcing Watchdog — v33 (F#44 دوك 5.3): كيسول CJ على نتائج السورسنغ مرتين فالنهار (04:30 و 16:30)
+//     صفر نداءات إلا كان شي طلب pending — نقاط: GET واحد (نقطة) لكل 100 طلب
+async function runSourcingWatch() {
+  const { rows: pending } = await pool.query(
+    'SELECT source_id, product_name FROM cj_sourcing_requests WHERE notified = FALSE ORDER BY created_at ASC LIMIT 200'
+  );
+  if (!pending.length) { console.log('📮 [SourcingWatch] no pending requests — صفر نداءات'); return; }
+  console.log(`📮 [SourcingWatch] checking ${pending.length} sourcing request(s) مع CJ`);
+  for (let i = 0; i < pending.length; i += 100) {
+    const chunk = pending.slice(i, i + 100);
+    let records;
+    try { records = await querySourcingList(chunk.map((r) => r.source_id)); }
+    catch (e) { logger.logError('SourcingWatch queryList', e); continue; }   // فشل الشبكة = نجرب المرة الجاية، عمرو ما يرمي الكرون
+    const byId = new Map(records.map((r) => [String(r && r.sourceId), r]));
+    for (const row of chunk) {
+      const rec = byId.get(String(row.source_id));
+      if (!rec) continue;                       // CJ مازال ما جاوبش على هاد الـid — نبقاو نتسناو
+      const verdict = pickSourcingAlert(rec);
+      if (!verdict || !verdict.terminal) continue;   // pending — لا إشعار لا تحديث
+      try {
+        if (verdict.kind === 'success') {
+          sendAdminAlert(`✅ [Laclarc] Sourcing #${verdict.sourceId} نجح — CJ لقا المنتج`,
+            `<p>طلب السورسنغ <b>#${verdict.sourceId}</b> (${row.product_name || '—'}) <b>نجح</b>.</p>${verdict.cjProductId ? `<p>CJ pid: <code>${verdict.cjProductId}</code>${verdict.cjVariantSku ? ` · variant SKU: <code>${verdict.cjVariantSku}</code>` : ''}</p>` : ''}<p>قدر تزيد المنتج للكاطالوغ من MyCJ ولا من أدمن بانل.</p>`);
+        } else {
+          sendAdminAlert(`❌ [Laclarc] Sourcing #${verdict.sourceId} فشل`,
+            `<p>طلب السورسنغ <b>#${verdict.sourceId}</b> (${row.product_name || '—'}) <b>فشل</b>.</p><p>السبب: <b>${verdict.failReason}</b></p><p>قدر تعاود محاولة بمنتج آخر ولا تغلق الملف.</p>`);
+        }
+        await pool.query(
+          `UPDATE cj_sourcing_requests SET status = $1, notified = TRUE, payload = $2, updated_at = NOW() WHERE source_id = $3`,
+          [verdict.kind, JSON.stringify(rec), String(row.source_id)]
+        );
+        console.log(`📮 [SourcingWatch] #${verdict.sourceId} → ${verdict.kind}${verdict.failReason ? ` (${verdict.failReason})` : ''}`);
+      } catch (e) { logger.logError('SourcingWatch notify', e); }
+    }
+  }
+}
+cron.schedule('30 4,16 * * *', async () => {
+  try { await runSourcingWatch(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('SourcingWatch Scheduler', e); }
 });
 
 // ═══ ⚖️ Dispute Watchdog — مراقبة chargebacks (كل 6 ساعات) ═══

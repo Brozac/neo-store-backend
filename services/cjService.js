@@ -251,6 +251,9 @@ const capiSent = new Set();             // orderId — Purchase مرة واحد�
 const CJ_STOCK_GATE_ENABLED = process.env.CJ_STOCK_GATE !== '0';   // '0' = kill-switch
 const CJ_STOCK_TTL_MS = 15 * 60 * 1000;                            // كاش 15 دقيقة — إعادات المحاولة ما كتحرقش نقاط زايدة
 const cjStockCache = new Map();                                    // pid → { expires, availByVid: Map(vid → total) }
+// 🆕 v33 — تفصيل cj/factory من نفس الرد (دوك product.html#_3-3): cjInventory = فيزيائي فمستودع CJ،
+//    factoryInventory = وعد المورد. كيتخزن من نفس نداء getInventoryByPid — صفر نقاط زايدة.
+const cjStockDetailCache = new Map();                              // pid → { expires, detailByVid: Map(vid → {cj, factory, total, warehouses[]}) }
 
 async function getCjVariantStock(pid) {
   const key = String(pid);
@@ -261,20 +264,55 @@ async function getCjVariantStock(pid) {
     headers: { 'CJ-Access-Token': token },
   }));
   const availByVid = new Map();
+  const detailByVid = new Map();
   const variantInventories = res.data && res.data.data && res.data.data.variantInventories;
   if (Array.isArray(variantInventories)) {
     for (const vi of variantInventories) {
       if (!vi || vi.vid == null) continue;
-      let total = 0;
+      let total = 0, cj = 0, factory = 0;
+      const warehouses = [];
       if (Array.isArray(vi.inventory)) {
-        for (const inv of vi.inventory) total += (Number(inv && inv.totalInventory) || 0);
+        for (const inv of vi.inventory) {
+          total += (Number(inv && inv.totalInventory) || 0);
+          cj += (Number(inv && inv.cjInventory) || 0);
+          factory += (Number(inv && inv.factoryInventory) || 0);
+          warehouses.push({ area: (inv && (inv.countryCode || inv.areaEn)) || '?', cj: (Number(inv && inv.cjInventory) || 0), factory: (Number(inv && inv.factoryInventory) || 0) });
+        }
       }
       availByVid.set(String(vi.vid), total);
+      detailByVid.set(String(vi.vid), { cj, factory, total, warehouses });
     }
   }
   cjStockCache.set(key, { expires: Date.now() + CJ_STOCK_TTL_MS, availByVid });
-  if (cjStockCache.size > 2000) cjStockCache.clear();   // ذاكرة آمنة — pids الفعالة قلال
+  cjStockDetailCache.set(key, { expires: Date.now() + CJ_STOCK_TTL_MS, detailByVid });
+  if (cjStockCache.size > 2000) { cjStockCache.clear(); cjStockDetailCache.clear(); }   // ذاكرة آمنة — pids الفعالة قلال
   return availByVid;
+}
+
+// 🆕 v33 — F#44 دوك product.html#_5-3: GET /product/sourcing/queryList — كيسد لوب السورسنغ.
+//    كنعرفو دابا شنو جاوب CJ على طلبات sourcing/create (حتى دابا كنصيفطو وتسنا غير MyCJ).
+//    ملاحظة: sourceIds كيتكرر فالـquery (`sourceIds=1&sourceIds=2`) — كنبنيو السطر بيدينا باش مايعتمدوش على paramsSerializer.
+async function querySourcingList(sourceIds) {
+  const ids = [...new Set((Array.isArray(sourceIds) ? sourceIds : [sourceIds]).map((x) => String(x).trim()).filter(Boolean))];
+  if (ids.length === 0) return [];
+  if (ids.length > 100) ids.length = 100;             // الدوك: 100 id/طلب حد أقصى
+  const qs = ids.map((id) => `sourceIds=${encodeURIComponent(id)}`).join('&');
+  const res = await cjRequest((token) => axios.get(`${CJ_API}/product/sourcing/queryList?${qs}`, {
+    headers: { 'CJ-Access-Token': token },
+  }));
+  const ok = res.data && (res.data.code === 0 || res.data.code === 200) && res.data.success !== false && res.data.result !== false;
+  if (!ok) throw new Error(`sourcing/queryList envelope ${res.data && res.data.code}: ${(res.data && res.data.message) || 'unknown'}`);
+  return Array.isArray(res.data.data) ? res.data.data : [];
+}
+
+// 🆕 v33 — تصنيف حالة سورسنغ (دوك 5.3: 3=Sourcing succeeded، 5=Sourcing failed — الباقي مازال فالمعالجة).
+//    pure function باش تكون قابلة للاختبار بلا شبكة.
+function pickSourcingAlert(record) {
+  if (!record || record.sourceId == null) return null;
+  const status = String(record.sourceStatus ?? '');
+  if (status === '3') return { terminal: true, kind: 'success', sourceId: String(record.sourceId), cjProductId: record.cjProductId || null, cjVariantSku: record.cjVariantSku || null };
+  if (status === '5') return { terminal: true, kind: 'failed', sourceId: String(record.sourceId), failReason: record.failReasonStr || record.failReason || 'unknown' };
+  return { terminal: false, kind: 'pending', sourceId: String(record.sourceId) };
 }
 
 const numberFor = (base, bump) => (bump <= 1 ? base : `${base}-R${bump}`);
@@ -722,9 +760,20 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
         if (stockBlock) {
           console.warn(`🚫 [StockGate] #${orderId} OUT_OF_STOCK vid=${stockBlock.vid} (have=${stockBlock.have} need=${stockBlock.need}) → manual بلا ما نحرقو نداءات الإنشاء`);
           await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
+          // 🆕 v33 — تشخيص cj/factory من نفس رد البوابة (صفر نقاط زايدة — دوك 3.3: cjInventory=فيزيائي، factoryInventory=وعد المورد)
+          let diagHtml = '';
+          try {
+            const cached = cjStockDetailCache.get(String(stockBlock.pid));
+            const det = cached && cached.detailByVid && cached.detailByVid.get(String(stockBlock.vid));
+            if (det) {
+              stockBlock.diag = { cj: det.cj, factory: det.factory, warehouses: det.warehouses };
+              const rows = (det.warehouses || []).map((w) => `<tr><td>${w.area}</td><td style="text-align:right">${w.cj}</td><td style="text-align:right">${w.factory}</td></tr>`).join('');
+              diagHtml = `<p>🔍 <b>تشخيص v33</b> — في مستودع CJ فيزيائياً: <b>${det.cj}</b> · وعد المورد (factory): <b>${det.factory}</b></p>${det.warehouses && det.warehouses.length ? `<table border="1" cellpadding="4" style="border-collapse:collapse"><tr><th>مستودع</th><th>CJ</th><th>Factory</th></tr>${rows}</table>` : ''}${det.cj === 0 && det.factory > 0 ? '<p>⚠️ CJ ما عندو حتى قطعة فمستودعو — كل الستوك هو وعد المورد: الشحن غادي يتأخر، قيم الطلب ولا بدل المنتج.</p>' : ''}`;
+            }
+          } catch (diagErr) { console.warn(`⚠️ [StockGate] #${orderId} diag skipped: ${diagErr.message}`); }
           sendAdminAlert(
             `🚫 [Laclarc] Out of stock — order #${orderId} marked manual`,
-            `<p>Order <b>#${orderId}</b> blocked by <b>StockGate v32</b> قبل أي نداء إنشاء لـ CJ.</p><p>vid <code>${stockBlock.vid}</code> (pid ${stockBlock.pid}): have <b>${stockBlock.have}</b> · need <b>${stockBlock.need}</b>.</p><p>الطلب راه <b>manual</b> فالبانل — سير لـ MyCJ تشوف البديل ولا تسنا الاستوك يرجع.</p>`
+            `<p>Order <b>#${orderId}</b> blocked by <b>StockGate v32</b> قبل أي نداء إنشاء لـ CJ.</p><p>vid <code>${stockBlock.vid}</code> (pid ${stockBlock.pid}): have <b>${stockBlock.have}</b> · need <b>${stockBlock.need}</b>.</p>${diagHtml}<p>الطلب راه <b>manual</b> فالبانل — سير لـ MyCJ تشوف البديل ولا تسنا الاستوك يرجع.</p>`
           );
           auditEvent('CJ_STOCK_BLOCK', orderId, stockBlock, 'warning');
           return { success: false, reason: 'OUT_OF_STOCK', detail: stockBlock };
@@ -1963,4 +2012,4 @@ async function payCJOrderBalance(...candidates) {
 // 📤 التصديرات — 🩹 إجباري: probeOrderStatus + classifyDuplicate + auditEvent
 //    cjWebhookService v2.1 (P0-20 anti-spoof) يعتمدهما — بلاهما أول webhook يرمي undefined
 // ==========================================
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate };
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate, querySourcingList, pickSourcingAlert, getCjVariantStock };
