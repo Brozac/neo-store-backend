@@ -97,6 +97,18 @@ const CJ_BREAKER_THRESHOLD = 4;      // عدد الـ QPS hits داخل النا
 const CJ_BREAKER_WINDOW_MS = 30 * 1000;
 const CJ_BREAKER_COOLDOWN_MS = 20 * 1000;
 let cjQpsHits = [];
+
+// 🆕 v31 2026-11-08 — النقاط ولّو مورد كيتقاد (حصة يومية كتنفد قبل حتى توا)! الحالة الحية
+// كتحدث من pointsInfo ديال كل رد (بلا لوج) — cjPace كيقراها وكيوسع الفجوة أوتوماتيك:
+// الحصة خاوية = كلشي كيراشن (سنك، تتبع، طلبات) وكيرجع يتسرع بوحدو من بعد ريسيت الحصة.
+let cjPointsState = { rem: 1, total: 1, at: 0 };
+function cjAdaptiveGap() {
+  const r = cjPointsState.total > 0 ? cjPointsState.rem / cjPointsState.total : 1;
+  if (r <= 0) return 15000;   // نفدت — راشن أقصى (~240 نداء/ساعة بدل 2500)
+  if (r < 0.10) return 8000;
+  if (r < 0.25) return 3000;
+  return CJ_MIN_GAP_MS;       // عادي
+}
 function cjNoteQpsHit(backoffMs) {
   const now = Date.now();
   cjQpsHits = cjQpsHits.filter(t => now - t < CJ_BREAKER_WINDOW_MS);
@@ -114,7 +126,7 @@ function cjNoteQpsHit(backoffMs) {
 function cjPace() {
   const job = cjChain.then(async () => {
     const jitter = Math.floor(Math.random() * CJ_JITTER_MS);
-    const readyAt = Math.max(cjLastAt + CJ_MIN_GAP_MS + jitter, cjCooldownUntil);
+    const readyAt = Math.max(cjLastAt + cjAdaptiveGap() + jitter, cjCooldownUntil); // 🆕 v31
     const wait = Math.max(0, readyAt - Date.now());
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
     cjLastAt = Date.now();
@@ -129,6 +141,7 @@ function cjPace() {
 // أو فوراً إلا نقص الأيقونة لأقل من 15% — المراقبة عمرها ما كتوقف طلب.
 // ==========================================
 let cjPointsLastLog = 0;
+let cjPointsLowSeen = false; // 🆕 v31 — الانتقال تحت 15% = تحذير واحد، من بعد السقف القديم (مرة/ساعة)
 function logCjPointsInfo(resp) {
   try {
     const pi = resp && resp.data && resp.data.pointsInfo;
@@ -138,9 +151,16 @@ function logCjPointsInfo(resp) {
     const fromUsed = (pi.total > 0 && typeof pi.usedToday === 'number') ? (pi.total - pi.usedToday) : pi.remaining;
     const effectiveRemaining = Math.min(pi.remaining, fromUsed);
     const ratio = pi.total > 0 ? effectiveRemaining / pi.total : 1;
+    // 🆕 v31 — حالة حية للتنعيم التكيفي (cjPace) — كتحدث فكل رد، بلا لوج
     const now = Date.now();
-    if (ratio < 0.15 || now - cjPointsLastLog > 60 * 60 * 1000) {
+    cjPointsState = { rem: effectiveRemaining, total: pi.total || 1, at: now };
+    // 🩹 v31 SPAMFIX — كان: ratio < 0.15 كيقفز على التهدئة → ملي كتخلص الحصة، كل رد CJ = سطر
+    //    تحذير (~60 ألف سطر/نهار). دابا: نزل تحت 15% = تنبيه واحد، ومن بعد مرة/ساعة كيف قبل.
+    if (ratio >= 0.15) cjPointsLowSeen = false;
+    const isCrossing = ratio < 0.15 && !cjPointsLowSeen;
+    if (isCrossing || now - cjPointsLastLog > 60 * 60 * 1000) {
       cjPointsLastLog = now;
+      if (ratio < 0.15) cjPointsLowSeen = true;
       const tag = ratio < 0.15 ? '⚠️ [CJ Points LOW]' : '📊 [CJ Points]';
       console.log(tag + ' used=' + pi.usedToday + '/' + pi.total + ' remaining=' + effectiveRemaining + (effectiveRemaining !== pi.remaining ? ' (reported=' + pi.remaining + ')' : ''));
     }
