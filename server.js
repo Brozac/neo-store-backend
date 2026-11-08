@@ -3855,6 +3855,20 @@ cron.schedule('0 */2 * * *', async () => {
 // ═══ 📮 Sourcing Watchdog — v33 (F#44 دوك 5.3): كيسول CJ على نتائج السورسنغ مرتين فالنهار (04:30 و 16:30)
 //     صفر نداءات إلا كان شي طلب pending — نقاط: GET واحد (نقطة) لكل 100 طلب
 async function runSourcingWatch() {
+  // 🩹 FIX [F54-SOURCING-TABLE] — ضمان الجدول قبل الاستعلام (كان CREATE داخل /api/admin/sourcing/create فقط
+  //    → كرون السورسنغ 04:30/16:30 يرمي relation "cj_sourcing_requests" does not exist كل يوم — Sentry SERVER-R)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cj_sourcing_requests (
+      source_id TEXT PRIMARY KEY,
+      product_name TEXT,
+      status TEXT DEFAULT 'pending',
+      notified BOOLEAN DEFAULT FALSE,
+      payload JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
   const { rows: pending } = await pool.query(
     'SELECT source_id, product_name FROM cj_sourcing_requests WHERE notified = FALSE ORDER BY created_at ASC LIMIT 200'
   );
