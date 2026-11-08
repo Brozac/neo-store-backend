@@ -224,6 +224,15 @@ const parseNumeric = (val) => {
 // ==========================================
 const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
 
+// 🆕 v32 — نوع الشحن حسب دوك CJ الرسمي (Orders Synchronization Processing):
+//   1|3 = Platform Waybill — المستودع كيستنى رفع الليل من عندك (uploadWaybillInfo) وحنا عمرو ما ترفع
+//   2   = CJ Logistics — CJ كيشحن بوسطائو، logisticName إجباري (واحنا دايما كنفوتو من freightCalculate)
+//   الافتراضي 3 = نفس سلوك الإنتاج المثبت (V2+payType=2 ربط فوري — M#32). ما تبدلش لِ 2 إلا بتجربة ساندبوكس قبل.
+const CJ_SHOP_LOGISTICS_TYPE = (() => {
+  const v = parseInt(process.env.CJ_SHOP_LOGISTICS_TYPE, 10);
+  return (v === 1 || v === 2 || v === 3) ? v : 3;
+})();
+
 const DEAD_CJ_STATUSES = ['TRASH', 'CANCELLED', 'CLOSED', 'INTERCEPTED'];
 
 // 🔢 CJ يحتجز رقم الطلب للأبد حتى بعد الحذف (TRASH) → 1603003 دائماً.
@@ -235,6 +244,38 @@ const MAX_SPLIT_BUMPS = 6;
 const burnedBump = new Map();           // base -> أعلى bump مؤكد الموت
 const fulfillInFlight = new Set();      // orderId — fulfillment واحد فقط لكل طلب في نفس الوقت
 const capiSent = new Set();             // orderId — Purchase مرة واحدة لكل عملية
+
+// 🆕 v32 — بوابة الستوك (GET /product/stock/getInventoryByPid) قبل أي نداء إنشاء.
+// الدوك: المستودع ما كيبداش بلا ستوك — احنا كنمنعو الطلب قبل ما يحرق نداءات إنشاء/أرقام/نقاط.
+// fail-open: أي خطأ فالبوابة = نكملو عادي — البوابة عمرو ما يحجب مدخول.
+const CJ_STOCK_GATE_ENABLED = process.env.CJ_STOCK_GATE !== '0';   // '0' = kill-switch
+const CJ_STOCK_TTL_MS = 15 * 60 * 1000;                            // كاش 15 دقيقة — إعادات المحاولة ما كتحرقش نقاط زايدة
+const cjStockCache = new Map();                                    // pid → { expires, availByVid: Map(vid → total) }
+
+async function getCjVariantStock(pid) {
+  const key = String(pid);
+  const hit = cjStockCache.get(key);
+  if (hit && Date.now() < hit.expires) return hit.availByVid;
+  const res = await cjRequest((token) => axios.get(`${CJ_API}/product/stock/getInventoryByPid`, {
+    params: { pid: key },
+    headers: { 'CJ-Access-Token': token },
+  }));
+  const availByVid = new Map();
+  const variantInventories = res.data && res.data.data && res.data.data.variantInventories;
+  if (Array.isArray(variantInventories)) {
+    for (const vi of variantInventories) {
+      if (!vi || vi.vid == null) continue;
+      let total = 0;
+      if (Array.isArray(vi.inventory)) {
+        for (const inv of vi.inventory) total += (Number(inv && inv.totalInventory) || 0);
+      }
+      availByVid.set(String(vi.vid), total);
+    }
+  }
+  cjStockCache.set(key, { expires: Date.now() + CJ_STOCK_TTL_MS, availByVid });
+  if (cjStockCache.size > 2000) cjStockCache.clear();   // ذاكرة آمنة — pids الفعالة قلال
+  return availByVid;
+}
 
 const numberFor = (base, bump) => (bump <= 1 ? base : `${base}-R${bump}`);
 
@@ -654,6 +695,45 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
       await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
       return { success: false, reason: 'NO_CJ_VARIANTS' };
     }
+
+    // ═══ 🆕 v32 — بوابة الستوك قبل أي نداء إنشاء (دوك CJ: المستودع ما كيبداش بلا ستوك) ═══
+    //    fail-open: أي خطأ (شبكة/نقاط/شكل رد جديد) = نكملو عادي — البوابة عمرو ما يحجب مدخول
+    if (CJ_STOCK_GATE_ENABLED) {
+      try {
+        const pidRes = await pool.query(
+          `SELECT DISTINCT p.cj_product_id AS pid FROM order_items oi
+             JOIN products p ON p.id = oi.product_id
+            WHERE oi.order_id = $1 AND p.cj_product_id IS NOT NULL AND p.cj_product_id NOT LIKE 'MANUAL_%'`,
+          [orderId]
+        );
+        const gatePids = pidRes.rows.map((r) => String(r.pid)).filter(Boolean);
+        let stockBlock = null;
+        for (const pid of gatePids) {
+          let availByVid = null;
+          try { availByVid = await getCjVariantStock(pid); }
+          catch (gateErr) { console.warn(`⚠️ [StockGate] #${orderId} pid=${pid} inventory query failed (${gateErr.message}) — fail-open`); continue; }
+          for (const cp of cjProducts) {
+            const vidKey = String(cp.vid);
+            if (!availByVid.has(vidKey)) continue;   // ويد غايب من الرد = مجهول → نداء الإنشاء هو لي كيشرح
+            if (availByVid.get(vidKey) < cp.quantity) { stockBlock = { pid, vid: cp.vid, have: availByVid.get(vidKey), need: cp.quantity }; break; }
+          }
+          if (stockBlock) break;
+        }
+        if (stockBlock) {
+          console.warn(`🚫 [StockGate] #${orderId} OUT_OF_STOCK vid=${stockBlock.vid} (have=${stockBlock.have} need=${stockBlock.need}) → manual بلا ما نحرقو نداءات الإنشاء`);
+          await pool.query("UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1", [orderId]);
+          sendAdminAlert(
+            `🚫 [Laclarc] Out of stock — order #${orderId} marked manual`,
+            `<p>Order <b>#${orderId}</b> blocked by <b>StockGate v32</b> قبل أي نداء إنشاء لـ CJ.</p><p>vid <code>${stockBlock.vid}</code> (pid ${stockBlock.pid}): have <b>${stockBlock.have}</b> · need <b>${stockBlock.need}</b>.</p><p>الطلب راه <b>manual</b> فالبانل — سير لـ MyCJ تشوف البديل ولا تسنا الاستوك يرجع.</p>`
+          );
+          auditEvent('CJ_STOCK_BLOCK', orderId, stockBlock, 'warning');
+          return { success: false, reason: 'OUT_OF_STOCK', detail: stockBlock };
+        }
+        if (gatePids.length) console.log(`✅ [StockGate] #${orderId} ${gatePids.length} pid(s) stock OK (shopLogisticsType=${CJ_SHOP_LOGISTICS_TYPE})`);
+      } catch (gateOuter) {
+        console.warn(`⚠️ [StockGate] #${orderId} gate failed (${gateOuter.message}) — fail-open`);
+      }
+    }
         // ═══ 🩹 M#34b — Precision Shipping Data (from single Product Details call) ═══
     //    الموضع: بعد cjProducts extraction · قبل freightCalculate
     //    من نداء واحد: productProp · shippingWeight(g) · volume(cm³) · warehouses · hsCode
@@ -728,7 +808,7 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
       platform: 'others',
       fromCountryCode: 'CN',
       orderFlow: 1,
-      shopLogisticsType: 3,
+      shopLogisticsType: CJ_SHOP_LOGISTICS_TYPE,   // 🆕 v32 — flag (default 3 = نفس الإنتاج)
       isSandbox: isSandbox,
     };
 
@@ -813,7 +893,7 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
               logisticName: logisticsToTry[0] || 'CJPacket Ordinary',
               fromCountryCode: 'CN',
               platform: 'others',
-              shopLogisticsType: 3,
+              shopLogisticsType: CJ_SHOP_LOGISTICS_TYPE,   // 🆕 v32 — flag (default 3 = نفس الإنتاج)
               orderFlow: 1,
               isSandbox: isSandbox,
               products: cjProducts.map(p => ({ vid: p.vid, quantity: p.quantity })),
@@ -839,6 +919,10 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
     }
 
     // ═══ V3 gauntlet (fallback) — يُنفذ فقط إذا V2 فشل ═══
+    // 🩹 v32 FIX — الشرط كان ناقص من M#32: V3 كان كيجري حتى بعد نجاح V2 → كل طلب كيدير
+    //    createOrderV3 زايدة (1603003 محتجز) + probe duplicate = ~2-3 نداءات ضايعة/طلب (نقاط!).
+    //    CJ dedup بالرقم كان هو لي كيمنع الشحنة المزدوجة — رهان هش. دابا: نجاح V2 = تخطي كامل.
+    if (!cjCreated)
     // 1. محاولة الإرسال المجمّع
     for (let li = 0; li < logisticsToTry.length; li++) {
       const logisticName = logisticsToTry[li];
