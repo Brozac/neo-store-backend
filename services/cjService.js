@@ -315,6 +315,33 @@ function pickSourcingAlert(record) {
   return { terminal: false, kind: 'pending', sourceId: String(record.sourceId) };
 }
 
+// 🆕 v34 — F#46 دوك storage.html#_2-6: صور التغليف تاع الطلبات من مستودع CJ (QC photos).
+//    POST /storehouseCenterWeb/syncStorehouseVideoRequests — orderIdList → pictureJson [{url, type}]
+//    خدامة على الطلبات العادية ديالنا (ماشي غير مخزون خاص) — ذهب للدعم («وين الطلب؟») والنزاعات (إثبات التغليف).
+//    الاسم «Requests» مشكوك فيه: يقدر يرجع الصور فوراً ولا يطلب من المستودع يصور — الكاش 10د يحمي النقاط فالجوج حالات.
+const CJ_PHOTOS_TTL_MS = 10 * 60 * 1000;
+const cjPhotosCache = new Map();   // "id1|id2" → { expires, result }
+
+async function queryOrderPackingPhotos(cjOrderNumbers) {
+  const ids = [...new Set((Array.isArray(cjOrderNumbers) ? cjOrderNumbers : [cjOrderNumbers]).map((x) => String(x).trim()).filter(Boolean))];
+  if (ids.length === 0) return [];
+  const key = ids.join('|');
+  const hit = cjPhotosCache.get(key);
+  if (hit && Date.now() < hit.expires) return hit.result;
+  const res = await cjRequest((token) => axios.post(`${CJ_API}/storehouseCenterWeb/syncStorehouseVideoRequests`, { orderIdList: ids }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
+  const env = res.data || {};
+  const okEnvelope = env.code === 200 || env.code === 0 || env.success === true;
+  if (!okEnvelope || env.result === false) throw new Error(`order photos envelope ${env.code}: ${env.message || 'unknown'}`);
+  const rows = Array.isArray(env.data) ? env.data : [];
+  const result = rows.map((r) => ({
+    orderId: r && r.orderId != null ? String(r.orderId) : null,
+    pictures: Array.isArray(r && r.pictureJson) ? r.pictureJson.filter((p) => p && p.url).map((p) => ({ url: p.url, type: p.type || 'packing' })) : [],
+  }));
+  cjPhotosCache.set(key, { expires: Date.now() + CJ_PHOTOS_TTL_MS, result });
+  if (cjPhotosCache.size > 500) cjPhotosCache.clear();   // ذاكرة آمنة
+  return result;
+}
+
 const numberFor = (base, bump) => (bump <= 1 ? base : `${base}-R${bump}`);
 
 async function loadBurnedBump(base, orderId) {
@@ -2012,4 +2039,4 @@ async function payCJOrderBalance(...candidates) {
 // 📤 التصديرات — 🩹 إجباري: probeOrderStatus + classifyDuplicate + auditEvent
 //    cjWebhookService v2.1 (P0-20 anti-spoof) يعتمدهما — بلاهما أول webhook يرمي undefined
 // ==========================================
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate, querySourcingList, pickSourcingAlert, getCjVariantStock };
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate, querySourcingList, pickSourcingAlert, getCjVariantStock, queryOrderPackingPhotos };

@@ -30,7 +30,7 @@ const { secondShotConversion } = require('./services/conversionService');
 const { fulfillCJOrder, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
-const { selfHealStuckOrders, disputeWatchdogCron, auditEvent, querySourcingList, pickSourcingAlert } = require('./services/cjService');
+const { selfHealStuckOrders, disputeWatchdogCron, auditEvent, querySourcingList, pickSourcingAlert, queryOrderPackingPhotos } = require('./services/cjService');
 const logger = require('./logger');
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
 const templates = require('./emails/templates'); // 🎨 SERENE email design system (F#84) — all customer emails in English
@@ -3256,6 +3256,29 @@ app.post('/api/admin/sourcing/create', async (req, res) => {
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ═══ 📸 v34 (F#46 دوك storage 2.6) — صور التغليف تاع الطلب من مستودع CJ (للدعم والنزاعات) ═══
+//     نداء واحد عند الطلب برك (2 نقاط POST) + كاش 10د فـ cjService يحمي من النقر المزدوج
+app.get('/api/admin/order-photos/:orderId', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT cj_order_number FROM orders WHERE id = $1 LIMIT 1', [req.params.orderId]);
+    const cjOrderNumber = rows[0] ? (rows[0].cj_order_number || '').toString().trim() : '';
+    if (!cjOrderNumber) return res.status(400).json({ error: 'Order has no CJ order number yet — الطلب مازال ما تخلقش فـ CJ' });
+    const result = await queryOrderPackingPhotos([cjOrderNumber]);
+    const entry = result.find((r) => r.orderId === cjOrderNumber) || result[0] || null;
+    const photos = entry ? entry.pictures : [];
+    res.json({
+      orderId: Number(req.params.orderId),
+      cjOrderNumber,
+      photos,
+      count: photos.length,
+      note: photos.length ? null : 'ما كاينش صور دابا — إما CJ مازال ما صوّرش الطلب، وإما الطلب مازال ما وصلش للمستودع. عاود بعد شوية (الكاش 10 دقايق).'
+    });
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
+    logger.logError('Order Photos', err);
+    res.status(502).json({ error: 'CJ photos query failed: ' + err.message });
   }
 });
 
