@@ -84,4 +84,64 @@ Thank you for choosing *Laclarc*! ✨`;
   return true;
 }
 
-module.exports = { sendOrderTrackingWhatsApp, formatToInternationalPhone };
+// ═══ v37 H2 — إشعار تبديل رقم التتبع (رسالة مخصصة — قالب "shipped" ما يصلحش هنا:
+//   الطلب مشحون من قبل، اللي تبدل هو الرقم). نفس مسار التسليم: Meta Cloud API + fallback log.
+async function sendOrderTrackReplacedWhatsApp({ phone, customerName, orderId, oldTrackingNumber, trackingNumber, email }) {
+  const cleanPhone = formatToInternationalPhone(phone);
+  if (!cleanPhone) {
+    console.warn(`⚠️ [WhatsApp Engine] Skipped (TrackReplace): Invalid phone format for Order #${orderId}`);
+    return false;
+  }
+
+  const frontendUrl = process.env.FRONTEND_URL || 'https://laclarc.com';
+  const trackingLink = `${frontendUrl}/track-order?orderId=${orderId}&email=${encodeURIComponent(email || '')}`;
+  const customerFirstName = (customerName || 'Valued Customer').split(' ')[0];
+
+  const messageText =
+`🔁 *Tracking update from Laclarc!*
+Hello ${customerFirstName}, your order *#${orderId}* was re-shipped, so your tracking number has changed.
+
+❌ *Old number (no longer moving):* ${oldTrackingNumber}
+✅ *New tracking number:* ${trackingNumber}
+🚚 *Track Your Parcel Live:*
+${trackingLink}
+
+---
+مرحباً ${customerFirstName}، تم إعادة شحن طلبك رقم *#${orderId}* وبهذا تبدل رقم التتبع.
+الرقم القديم ما عادش يتحرك — استعمل الرقم الجديد أعلاه لتتبع شحنتك خطوة بخطوة.
+
+Thank you for choosing *Laclarc*! ✨`;
+
+  const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+  const WHATSAPP_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
+
+  if (WHATSAPP_TOKEN && WHATSAPP_PHONE_ID) {
+    try {
+      await axios.post(
+        `https://graph.facebook.com/v18.0/${WHATSAPP_PHONE_ID}/messages`,
+        {
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: cleanPhone,
+          type: 'text',
+          text: { body: messageText }
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      console.log(`📲 [WhatsApp Sent] Track-replacement notification dispatched to +${cleanPhone}`);
+      return true;
+    } catch (apiErr) {
+      logger.logError('WhatsApp Cloud API Dispatch (TrackReplace)', apiErr.response?.data || apiErr.message);
+    }
+  }
+
+  console.log(`💬 [WhatsApp Direct Link (TrackReplace) Order #${orderId}]: https://wa.me/${cleanPhone}?text=${encodeURIComponent(messageText)}`);
+  return true;
+}
+
+module.exports = { sendOrderTrackingWhatsApp, sendOrderTrackReplacedWhatsApp, formatToInternationalPhone };

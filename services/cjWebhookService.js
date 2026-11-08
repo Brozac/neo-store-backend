@@ -37,8 +37,8 @@ const crypto = require('crypto');
 const pool = require('../db');
 const logger = require('../logger');
 const { cjRequest } = require('./cjService');
-const { checkStripeDispute, sendAdminAlert, probeOrderStatus, classifyDuplicate, auditEvent, pickMakeupRows } = require('./cjService'); // 🩹 P0-20 — أدوات التحقق · 🆕 v35 F1 — قارئ makeup/list الموحد
-const { sendOrderTrackingWhatsApp } = require('./whatsappService');
+const { checkStripeDispute, sendAdminAlert, probeOrderStatus, classifyDuplicate, auditEvent, pickMakeupRows, queryOrderTrackHistory, queryWalletBalance, pickWalletAlert } = require('./cjService'); // 🩹 P0-20 — أدوات التحقق · 🆕 v35 F1 — قارئ makeup/list الموحد · 🆕 v37 H2/H3/H5 — track-history + wallet
+const { sendOrderTrackingWhatsApp, sendOrderTrackReplacedWhatsApp } = require('./whatsappService');
 const { syncShipmentEvents } = require('./shipTruth');
 
 const CJ_BASE = 'https://developers.cjdropshipping.com/api2.0/v1';
@@ -104,6 +104,38 @@ function verifySignatureFlexible(rawBody, signHeader, eventOpenId) {
 }
 
 // ==========================================
+// 💓 v37 H4 — نبض الويبهوك (الدوك webhook 3.3 auto-close): آخر ويبهوك وصل —
+//    جدول صغير صف واحد (id=1). بذرة عند الإقلاع (last_at=boot) — كتتحدث مع كل ويبهوك.
+//    الحكم (صمت؟) نقي وقابل للاختبار: طلبات في الطيران + نبض عتيق >24h.
+//    CJ كيسد الموضوع عند <80% نجاح/ساعتين + cold start تاع Render كيقتل الويبهوكات
+//    صامتة — بلا هاد الحارس ما كاين حتى تنبيه والطلبات كتسنى بلا أخبار.
+let _hbReady = false;
+async function ensureWebhookHeartbeat() {
+  if (_hbReady) return;
+  _hbReady = true;
+  try {
+    await pool.query('CREATE TABLE IF NOT EXISTS cj_webhook_heartbeat (id int PRIMARY KEY, last_at timestamptz NOT NULL, last_type text)');
+    await pool.query("INSERT INTO cj_webhook_heartbeat (id, last_at, last_type) VALUES (1, NOW(), 'boot') ON CONFLICT (id) DO NOTHING");
+    console.log('💓 [WebhookHeartbeat] ready');
+  } catch (e) { _hbReady = false; logger.logError('WebhookHeartbeat init', e); }
+}
+function noteWebhookHeartbeat(type) {
+  ensureWebhookHeartbeat()
+    .then(() => pool.query(
+      'INSERT INTO cj_webhook_heartbeat (id, last_at, last_type) VALUES (1, NOW(), $1) ON CONFLICT (id) DO UPDATE SET last_at = NOW(), last_type = EXCLUDED.last_type',
+      [String(type || '?').slice(0, 40)]
+    ))
+    .catch((e) => logger.logError('WebhookHeartbeat write', e));
+}
+function webhookSilenceVerdict({ lastAt, inflightCount, now = Date.now(), maxSilenceMs = 24 * 60 * 60 * 1000 }) {
+  if (!Number.isFinite(inflightCount) || inflightCount <= 0) return { silent: false, reason: 'no_inflight' };
+  if (!lastAt) return { silent: false, reason: 'no_heartbeat' };
+  const ageMs = now - Number(lastAt);
+  if (ageMs < maxSilenceMs) return { silent: false, reason: 'fresh' };
+  return { silent: true, ageHours: Math.round(ageMs / 3600000) };
+}
+
+// ==========================================
 // 📦 ORDER — حالات الطلب + لحظة الشحن الذهبية
 // خريطة حالات CJ → حالات laclarc
 // ⓘ CREATED/IN_STOCK/IN_PROGRESS = معلومات فقط (الطلب عندنا ديجا paid قبل
@@ -166,6 +198,84 @@ async function notifyShipment(order, trackNumber, logisticName) {
 
 // 🩹 P2-27 hygiene — sendEmailDirect يحتاج تعريفه قبل استعماله (function declaration = hoisted، آمن —
 //    لكن نثبّت الموضع للوضوح). التعريف الفعلي في الدفعة 2 مع بقية المرسلات.
+
+// ==========================================
+// 🔁 v37 H2 — تبديل رقم التتبع أوتوماتيك (الدوك webhook 3.5: ORDER UPDATE يشعل على
+//    «Tracking number replaced» + LOGISTIC UPDATE بالرقم الجديد).
+//    ORDER/LOGISTIC غير موقّعين → نفس درع P0-20: التحقق من CJ مباشرة قبل القبول.
+//    الأداة الموثقة: getOrderTrackHistory(الرقم القديم) → currentTrackNumber (v36 G2):
+//    CJ هي نفسها كتجاوب «القديم ولّى = X؟» — إيه = نقبل · لا = رفض + audit.
+//    probe فاشل (شبكة) = fail-closed — الرسالة ضايعة (no-retry) والأداة اليدوية
+//    POST /api/admin/track-history هي backstop.
+//    الكلفة: 10 نقاط لكل تبديل مُدّعى (نادر) — كاش 10د مدمج فـ queryOrderTrackHistory.
+async function handleTrackReplacement(order, claimedNewTrack, source, deps = {}) {
+  const verify = deps.verifyTrackHistory || queryOrderTrackHistory;
+  const oldTrack = String(order.tracking_number || '').trim();
+  const newTrack = String(claimedNewTrack || '').trim();
+  if (!oldTrack || !newTrack || oldTrack.toLowerCase() === newTrack.toLowerCase()) return { replaced: false, reason: 'noop' };
+
+  try {
+    const rows = await verify([oldTrack]);
+    const cur = rows && rows[0] ? String(rows[0].currentTrackNumber || '').trim() : '';
+    const ok = !!cur && cur.toLowerCase() === newTrack.toLowerCase();
+    if (!ok) {
+      await auditEvent('WEBHOOK_TRACK_REPLACE_REJECTED', order.id, { source, old: oldTrack, claimed: newTrack, cjCurrent: cur || null }, 'warning');
+      console.warn(`🛡️ [TrackReplace] #${order.id} claimed=${newTrack} ≠ CJ current=${cur || '(empty)'} — مرفوض (P0-20)`);
+      return { replaced: false, reason: 'unverified' };
+    }
+  } catch (e) {
+    await auditEvent('WEBHOOK_TRACK_REPLACE_UNVERIFIED', order.id, { source, old: oldTrack, claimed: newTrack, error: String(e.message || e) }, 'warning');
+    console.warn(`🛡️ [TrackReplace] #${order.id} probe فشل (${e.message}) — fail-closed`);
+    return { replaced: false, reason: 'probe_failed' };
+  }
+
+  const upd = await pool.query(
+    'UPDATE orders SET tracking_number = $1 WHERE id = $2 AND tracking_number = $3 RETURNING id',
+    [newTrack, order.id, oldTrack]
+  );
+  if (!upd.rows.length) return { replaced: false, reason: 'race' };
+
+  console.log(`🔁 [TrackReplace] #${order.id} (${source}): ${oldTrack} → ${newTrack}`);
+  await auditEvent('CJ_TRACK_REPLACED', order.id, { source, old: oldTrack, new: newTrack, cjOrderId: order.cj_order_number }, 'info');
+
+  // الأدمن دائماً — تبديل التتبع حدث تشغيلي مهم (نزاعات: الرقم القديم كيوقف يتحرك — الدوك 2.2)
+  sendAdminAlert(
+    `🔁 [Laclarc] رقم تتبع الطلب #${order.id} تبدل — CJ أكدو`,
+    `<p>CJ عاودت شحن الطلب — الرقم القديم غادي يوقف يتحرك (الدوك logistic 2.2).</p>
+     <p><b>Order:</b> #${order.id} — ${order.customer_name || ''}</p>
+     <p><b>القديم:</b> ${oldTrack} → <b>الجديد:</b> ${newTrack} <i>(مصدر الحدث: ${source})</i></p>
+     <p>الزبون توّا توصلو بالرقم الجديد (إيميل + واتساب مخصصين).</p>`
+  ).catch((e) => logger.logError('TrackReplace admin alert', e));
+
+  // الزبون — إيميل + واتساب مخصين (ماشي قالب "shipped" — ما نخلطوش)
+  try { await notifyTrackReplacement(order, oldTrack, newTrack); }
+  catch (e) { logger.logError('TrackReplace customer notify', e); }
+
+  syncShipmentEvents(order.id).catch(() => {}); // أحداث الرقم الجديد من دابا
+  return { replaced: true };
+}
+
+async function notifyTrackReplacement(order, oldTrack, newTrack) {
+  if (order.customer_phone) {
+    try {
+      await sendOrderTrackReplacedWhatsApp({ phone: order.customer_phone, customerName: order.customer_name, orderId: order.id, oldTrackingNumber: oldTrack, trackingNumber: newTrack, email: order.customer_email });
+    } catch (e) { logger.logError('TrackReplace WhatsApp', e); }
+  }
+  if (order.customer_email && !order.customer_email.includes('@laclarc.com')) {
+    await sendEmailDirect({
+      to: order.customer_email,
+      subject: 'Tracking update for your Laclarc order #' + order.id + ' — new tracking number',
+      html: '<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:20px;">'
+        + '<h2 style="color:#8B78C6;">Heads up — your tracking number changed</h2>'
+        + '<p>Your order <strong>#' + order.id + '</strong> was re-shipped by our supplier, so the tracking number has been updated.</p>'
+        + '<p style="background:#F9F8FC;border:1px solid #E5E7EB;border-radius:8px;padding:12px;">'
+        + '<strong>Old number (no longer moving):</strong> ' + oldTrack + '<br>'
+        + '<strong>New tracking number:</strong> <span style="font-size:16px;color:#1D1E3C;">' + newTrack + '</span></p>'
+        + '<p>Please use the new number above to follow your parcel. Sorry for any confusion — your order is on its way!</p>'
+        + '<p>Thank you for shopping with Laclarc! 💜</p></div>'
+    });
+  }
+}
 
 async function handleOrderUpdate(params = {}) {
   const cjOrderId    = String(params.cjOrderId || '').trim();
@@ -265,6 +375,16 @@ async function handleOrderUpdate(params = {}) {
     if (manz.rowCount) {
       logger.logError(`CJ Webhook: Order #${order.id} ${statusRaw}`, new Error(orderNum));
     }
+    return;
+  }
+
+  // v37 H2 — الدوك webhook 3.5: «Tracking number replaced» كيجي كـ ORDER UPDATE (نفس الحالة
+  //   SHIPPED). بلا هاد الفرع: rank-check كيرجعو (fulfilled>=fulfilled) والرقم الجديد عمرو
+  //   ما يدخل — الزبون يبقى عندو رقم ميت. الدرع الأول (probe P0-20) عدّى فوق — هذا الدرع الثاني.
+  if (mapped === 'fulfilled' && trackNumber && order.tracking_number
+      && (order.status === 'fulfilled' || order.status === 'completed')
+      && String(order.tracking_number).trim().toLowerCase() !== trackNumber.toLowerCase()) {
+    await handleTrackReplacement(order, trackNumber, 'ORDER');
     return;
   }
 
@@ -372,6 +492,15 @@ async function handleLogistic(params = {}) {
   );
   if (!findRes.rows.length) return;
   const order = findRes.rows[0];
+
+  // v37 H2 — LOGISTIC UPDATE بالرقم الجديد (تبديل تتبع): كنلقاو عبر cj_order_number
+  //   (الجديد ما كيتطابقش مع tracking_number عمودنا) → تحقق CJ ثم تحديث + إشعار.
+  if (order.tracking_number && trackingNumber
+      && (order.status === 'fulfilled' || order.status === 'completed')
+      && String(order.tracking_number).trim().toLowerCase() !== trackingNumber.toLowerCase()) {
+    await handleTrackReplacement(order, trackingNumber, 'LOGISTIC');
+    return;
+  }
 
   // 🛟 Rescue — للطلبات المدفوعة أو المشحونة بلا tracking (ORDER webhook فاتها)
   // 🩹 FIX#23 — وسّعنا الشرط ليشمل 'fulfilled': طلب مشحون (webhook) فقد tracking_number
@@ -693,8 +822,114 @@ async function handleMakeup(params = {}) {
         logger.logError('CJ Webhook: forged MAKEUP suspected', new Error(`orderId=${params.orderId} amount=${params.amount} — not found in CJ makeup/list`));
       }
     }
+    return;
+  }
+
+  // v37 H3 — الدوك webhook 4: messageType CANCEL→params.status CANCELED · PAID→PAID.
+  //   PAID = فلوس خرجت فعلاً من المحفظة — قبل v37 كان كيدوز صامت (console.warn برك):
+  //   دابا إيميل + فحص رصيد فوري (الكرون يومي برك — تنبيه لحظي قبل 1605001).
+  if (params.status === 'CANCELED') {
+    await sendAdminEmail({
+      subject: `➖ CJ Makeup Bill CANCELED — ${params.orderId} ($${params.amount})`,
+      html: `<h2>فاتورة Makeup تلغات من CJ</h2>
+             <p><strong>CJ Order:</strong> ${params.orderId} · <strong>Original:</strong> ${params.relationOrderId || '—'}</p>
+             <p><strong>Amount:</strong> $${params.amount} · <strong>Reason:</strong> ${params.reason || 'N/A'}</p>
+             <p style="color:#0a7d33;">ما كاين حتى إجراء — غير للعلم.</p>`
+    }).catch((err) => logger.logError('Makeup CANCELED email', err));
+    return;
+  }
+  if (params.status === 'PAID') {
+    let balanceLine = '';
+    try {
+      const bal = await queryWalletBalance();
+      const alert = pickWalletAlert(bal.amount, Number(process.env.CJ_WALLET_MIN_ALERT || 50));
+      balanceLine = `<p><strong>الرصيد دابا:</strong> $${bal.amount}${alert ? ` — <span style="color:#b00020;">${alert.level === 'critical' ? '🚨 شبه فارغ' : '⚠️ منخفض'}</span>` : ' ✅'}</p>`;
+      if (alert) {
+        sendAdminAlert(
+          `${alert.level === 'critical' ? '🚨' : '⚠️'} [Laclarc] CJ Wallet ${alert.level === 'critical' ? 'شبه فارغ' : 'منخفض'} بعد makeup: $${alert.amount}`,
+          `<p>فاتورة makeup خلات <b>$${params.amount}</b> (${params.orderId}) — الرصيد المتاح دابا: <b>$${alert.amount}</b> · الحد: $${alert.min}.</p>
+           <p>الطلبات الجاية غادي تعلق على 1605001 إلا عمّرتي المحفظة دابا: MyCJ → Finance → Top up.</p>`
+        ).catch(() => {});
+      }
+    } catch (e) {
+      logger.logError('Makeup PAID balance probe', e);
+      balanceLine = '<p><i>فحص الرصيد فشل (شبكة) — تحقق بـ GET /api/admin/cj-balance.</i></p>';
+    }
+    await sendAdminEmail({
+      subject: `💳 CJ Makeup Bill PAID — $${params.amount} خرجت من المحفظة (${params.orderId})`,
+      html: `<h2>فاتورة Makeup تخلصت — خروج فعلي من المحفظة</h2>
+             <p><strong>CJ Order:</strong> ${params.orderId} · <strong>Original:</strong> ${params.relationOrderId || '—'}</p>
+             <p><strong>Amount:</strong> $${params.amount} · <strong>Reason:</strong> ${params.reason || 'N/A'} · <strong>Payment date:</strong> ${params.paymentDate || '—'}</p>
+             ${balanceLine}`
+    }).catch((err) => logger.logError('Makeup PAID email', err));
+    return;
   }
 }
+// ==========================================
+// 💰 v37 H5 — WALLET (الدوك webhook 6): CREATED/UPDATED على سجلات الفوترة ═══
+//    التوقيع إجباري (موضوع مالي — signedTopic تحت). رسالة تسجيل CJ: messageId=wallet-registration-check
+//    وparams.id='test' — كنعرفوها بذلك ونردّ 200 بلا تسجيل (الدوك 6.1). التكرار وارد
+//    (نفس messageId) — dedup المعالج الرئيسي يحمي + هنا ماكاينش booking (لوج + تنبيه رصيد
+//    برك) = إعادة آمنة بنيوياً. المصالحة الرسمية: Query Billing History (الدوك 6.5) —
+//    كرون المحفظة اليومي runWalletWatch هو safety-net (no-retry: الرسائل الضائعة ضايعات).
+function walletTypeName(t) {
+  const MAP = { 1: 'Top-up', 2: 'Order payment', 3: 'Withdrawal', 4: 'Order refund', 5: 'Sold-out refund', 6: 'Order payment', 7: 'Benefit', 8: 'Balance deduction', 9: 'Order payment/affiliate', 17: 'Gift card top-up', 18: 'Order payment', 19: 'Order payment', 20: 'Order payment', 21: 'Deposit payment', 22: 'Deposit refund', 23: 'System refund', 26: 'CJ membership', 29: 'Order payment', 30: 'Shipping cost payment', 31: 'Paid sourcing', 32: 'Customization payment', 33: 'Freight payment', 34: 'Paid services', 35: 'AI credits top-up', 36: 'Credit loan', 37: 'Store sale' };
+  return MAP[String(t)] || `type=${t}`;
+}
+async function handleWallet(params = {}) {
+  if (String(params.id) === 'test') {
+    console.log('🧪 [WALLET] wallet-registration-check — 200 مسجل، ما كتسجلش (الدوك 6.1)');
+    return;
+  }
+  const statusName = { 0: 'Pending', 1: 'Success', 2: 'Failed', 3: 'Frozen' }[String(params.status)] || `status=${params.status}`;
+  const line = `${params.messageType || '?'} ${walletTypeName(params.type)} ${statusName} amount=$${params.amount} fee=$${params.feeAmount ?? 0} balance ${params.balanceBefore} → ${params.balanceAfter} (${params.orderId || 'no-order'})`;
+  console.log('💰 [WALLET] ' + line);
+  auditEvent('CJ_WALLET_TX', null, { id: params.id, orderId: params.orderId, type: params.type, status: params.status, amount: params.amount, balanceAfter: params.balanceAfter, messageType: params.messageType }, 'info').catch(() => {});
+  // تنبيه الرصيد المنخفض — نفس العتبة تاع الكرون اليومي (CJ_WALLET_MIN_ALERT)
+  if (Number.isFinite(Number(params.balanceAfter))) {
+    const alert = pickWalletAlert(Number(params.balanceAfter), Number(process.env.CJ_WALLET_MIN_ALERT || 50));
+    if (alert) {
+      sendAdminAlert(
+        `${alert.level === 'critical' ? '🚨' : '⚠️'} [Laclarc] CJ Wallet ${alert.level === 'critical' ? 'شبه فارغ' : 'منخفض'}: $${alert.amount} (ويبهوك لحظي)`,
+        `<p>${line}</p><p>الحد المبرمج: $${alert.min} — عمّر المحفظة: MyCJ → Finance → Top up.</p>`
+      ).catch(() => {});
+    }
+  }
+}
+
+// ==========================================
+// 📌 v37 H6 — اشتراك منتج واحد (fire-and-forget من الاستيراد) — الدوك webhook 2:
+//    product/stock webhooks يوجعو غير للمشتركين · subscribeAll ممنوع من يوليوز 2026
+//    → اشتراك صريح بالـpid: 1 نقطة/منتج عند الاستيراد. فشله ما يوقفش الاستيراد،
+//    وsubscribeAllStoreProducts اليدوي (POST /api/admin/webhook/subscribe) هو backstop.
+// ==========================================
+async function subscribeProductWebhook(cjProductId) {
+  const pid = String(cjProductId || '').trim();
+  if (!pid) return { ok: false, reason: 'no_pid' };
+  const res = await cjRequest((token) => axios.post(`${CJ_BASE}/webhook/product/subscribe`,
+    { productIds: [pid] },
+    { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+  ));
+  const d = (res.data && res.data.data) || {};
+  const ok = (d.successProductIds || []).includes(pid);
+  if (!ok) console.warn(`📌 [Subscribe] ${pid} ما تزادش (${(d.failProductIds || [])[0] || 'سبب غير معروف'})`);
+  else console.log(`📌 [Subscribe] ${pid} مشترك — webhooks ستوك/صور/سعر نشطين`);
+  return { ok, fail: (d.failProductIds || [])[0] || null };
+}
+
+// ═══ v37 H5 — تسجيل wallet بموضوعو وحدو فنداء منفصل (الدوك 6.1 صراحة: كيتبعت مع
+//   مواضيع أخرى، فشلو كيخسر الطلب كامل ولا يخليهم ناقصين). callbackUrls إجبارية حتى
+//   فالإلغاء. CJ كيصيفط رسالة اختبار أول — المعالج كيردّها 200 أوتوماتيكياً (الرد قبل المعالجة).
+async function registerWalletWebhook(callbackUrl) {
+  const whSecret = process.env.CJ_WEBHOOK_SECRET || '';
+  const finalUrl = whSecret
+    ? callbackUrl + (callbackUrl.includes('?') ? '&' : '?') + 'k=' + encodeURIComponent(whSecret)
+    : callbackUrl;
+  return cjRequest((token) => axios.post(`${CJ_BASE}/webhook/set`, {
+    wallet: { type: 'ENABLE', callbackUrls: [finalUrl] },
+  }, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
+}
+
 // ==========================================
 // 🎯 المعالج الرئيسي — 200 فوري (< 3s إجباري) + معالجة خلفية كاملة
 // ==========================================
@@ -741,8 +976,12 @@ async function cjWebhookHandler(req, res) {
       const { messageId, type, messageType, params } = event;
       if (!type) return;
 
-      // 🔬 عينة كاملة أول مرة لكل نوع — ground truth دايم فاللوج
-      const sampleKey = `_cjSample_${type}`;
+      // 💓 v37 H4 — نبض: أي ويبهوك وصل = CJ ما سدّناش (fire-and-forget)
+      noteWebhookHeartbeat(`${type}/${messageType || ''}`);
+
+      // 🔬 عينة كاملة أول مرة لكل نوع+messageType — ground truth دايم فاللوج
+      //    v37 H7: كان per-type برك → STOCK REDUCE (حذف سجل) عمره ما تلتقط عينتو
+      const sampleKey = `_cjSample_${type}_${messageType || 'x'}`;
       if (!global[sampleKey]) {
         global[sampleKey] = true;
         console.log(`🔬 [Sample ${type}]`, rawBody.toString('utf8').slice(0, 800));
@@ -762,7 +1001,7 @@ async function cjWebhookHandler(req, res) {
       //    ORDER/PRODUCT/STOCK/VARIANT/LOGISTIC: CJ ماكيوثقش عليهم — مباشرة
       //    (التزوير في ORDER مُغطى بـ P0-20 في handleOrderUpdate — التحقق عبر CJ)
       const signHeader = req.headers['sign'];
-      const signedTopic = type === 'MAKEUP' || type === 'PRIVATE_ORDER';
+      const signedTopic = type === 'MAKEUP' || type === 'PRIVATE_ORDER' || type === 'WALLET'; // v37 H5 — wallet موضوع مالي
       if (signedTopic) {
         if (!signHeader || !verifySignatureFlexible(rawBody, signHeader, event.openId)) {
           // 🧪 تسريب تشخيصي (مرة/10د) — زوج (body, sign) جاهز للـ calibrator
@@ -806,6 +1045,7 @@ async function cjWebhookHandler(req, res) {
         case 'VARIANT':     await handleVariantUpdate(params, messageType); break;
         case 'STOCK':       await handleStockUpdate(params); break;
         case 'MAKEUP':      await handleMakeup(params); break;
+        case 'WALLET':      await handleWallet(params); break; // v37 H5
         default:
           console.log(`ℹ️ [CJ Webhook] نوع غير معالج: ${type}/${messageType}`);
           break;
@@ -866,4 +1106,4 @@ async function subscribeAllStoreProducts() {
   return { total: ids.length, success, failed };
 }
 
-module.exports = { cjWebhookHandler, registerWebhooks, subscribeAllStoreProducts, notifyShipment };
+module.exports = { cjWebhookHandler, registerWebhooks, registerWalletWebhook, subscribeAllStoreProducts, subscribeProductWebhook, notifyShipment, webhookSilenceVerdict, handleTrackReplacement, handleWallet, handleMakeup };

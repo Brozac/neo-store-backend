@@ -18,6 +18,7 @@
 const axios = require('axios');
 const logger = require('../logger');
 const { cjRequest } = require('./cjService');
+const { subscribeProductWebhook } = require('./cjWebhookService'); // v37 H6 — اشتراك الويبهوك للمنتج المستورد (لا دائرية: cjWebhookService ما كيستوردناش)
 const { parseVariants, getCategorySlug, phoneAccRegex, pcBlacklistRegex } = require('../utils/parser');
 const { resolveCategoryByCjId } = require('./categoryService');
 const {
@@ -395,6 +396,13 @@ async function upsertProductRow(pool, row) {
     row.weight_grams ?? null,
     row.warehouse_countries ?? [],
   ]);
+
+  // v37 H6 — الدوك webhook 2: product/stock webhooks يوجعو غير للمشتركين — منتج جديد
+  //   بلا اشتراك = صفر تحديثات. اشتراك فوري fire-and-forget (1 نقطة/منتج) — فشله
+  //   ما يوقفش الاستيراد، واليدوي POST /api/admin/webhook/subscribe هو backstop.
+  if (row && row.cj_product_id) {
+    subscribeProductWebhook(row.cj_product_id).catch((e) => logger.logError('Product subscribe (import)', e));
+  }
 }
 
 // ==========================================

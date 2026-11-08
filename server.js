@@ -355,6 +355,8 @@ const {
   cjWebhookHandler,
   notifyShipment,
   registerWebhooks,
+  registerWalletWebhook,
+  webhookSilenceVerdict,
   subscribeAllStoreProducts
 } = require('./services/cjWebhookService');
 app.post('/api/cj-webhook', express.raw({ type: 'application/json' }), cjWebhookHandler);
@@ -773,7 +775,7 @@ app.post('/api/admin/add-review', async (req, res) => {
 // ==========================================
 // 🐺 CJ Webhooks Management (Admin)
 // ==========================================
-app.post('/api/admin/webhook/register', async (req, res) => {
+app.post('/api/admin/webhook/register', requireAdmin, async (req, res) => { // v37 H8 — كان بلا مصادقة! أي حد يقدر يعاود يوجه الويبهوكات لرابطو
   try {
     const callbackUrl = `${process.env.BACKEND_URL || 'https://neo-store-backend.onrender.com'}/api/cj-webhook`;
     const response = await registerWebhooks(callbackUrl);
@@ -788,7 +790,7 @@ app.post('/api/admin/webhook/register', async (req, res) => {
   }
 });
 
-app.post('/api/admin/webhook/subscribe', async (req, res) => {
+app.post('/api/admin/webhook/subscribe', requireAdmin, async (req, res) => { // v37 H8 — نفس الثغرة
   // ✨ v2 — 200 فوري (invariant #3: لا نحجب الرد على مهام طويلة)
   res.json({ message: '📌 Subscription started in background — راقب اللوج للنتيجة النهائية' });
   (async () => {
@@ -3323,8 +3325,11 @@ app.get('/api/admin/order-pod/:orderId', requireAdmin, async (req, res) => {
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Order POD', err);
     res.status(502).json({ error: 'CJ POD query failed: ' + err.message });
+  }
+});
 
-// ═══ v36 (G2 — دوك logistic.html#_2-2) — كاشف تبديل رقم التتبع ═══
+// ═══ v37 H1 هوتفكس (F#49) — الراوت كان محشور داخل catch تاع POD: ما يتسجلش إلا
+//     بعد أول فشل POD (قبلها 404) + كل فشل كيزيد نسخة مكررة من المسجل. دابا برا. ═══
 // POST /api/admin/track-history { trackNumbers: [...] } (1–10 أرقام)
 //   الرقم القديم كيوقف يتحرك كي CJ تعاود تشحن — هذي كتجاوب: شنو الرقم الحالي + آخر حدث للجوج.
 //   data خاوية = حتى رقم ما تطابق مع طلباتنا (الدوك: صامتة بلا خطأ) — ماشي فشل. الكاش 10د.
@@ -3343,8 +3348,6 @@ app.post('/api/admin/track-history', requireAdmin, async (req, res) => {
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Track History', err);
     res.status(502).json({ error: 'CJ track-history query failed: ' + err.message });
-  }
-});
   }
 });
 
@@ -3907,8 +3910,50 @@ async function runWalletWatch() {
   const walletCron = process.env.CJ_WALLET_CRON === '0' ? null : (process.env.CJ_WALLET_CRON || '20 9 * * *');
   if (walletCron) cron.schedule(walletCron, async () => {
     try { await runWalletWatch(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('WalletWatch Scheduler', e); }
+    try { await runWebhookSilenceGuard(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('WebhookSilenceGuard Scheduler', e); } // v37 H4
   });
 }
+
+// ═══ v37 H4 — حارس صمت الويبهوك (الدوك webhook 3.3): CJ كيسد الموضوع عند <80% نجاح
+//     فجوج ساعات كاملين، وcold start تاع Render كيقتل الويبهوكات صامتة — ما كيرجعوش
+//     حتى register يدوي. الحكم (من cjWebhookService — نقي): طلبات في الطيران + نبض
+//     عتيق >24h → تنبيه وحد فاليوم. 0 نقاط — الكرون نفسو تاع المحفظة.
+async function runWebhookSilenceGuard() {
+  const { rows } = await pool.query("SELECT COUNT(*)::int AS c FROM orders WHERE status IN ('paid','fulfilled') AND created_at > NOW() - INTERVAL '90 days'");
+  let lastAt = null;
+  try {
+    const hb = await pool.query('SELECT last_at FROM cj_webhook_heartbeat WHERE id = 1');
+    lastAt = hb.rows[0] ? new Date(hb.rows[0].last_at).getTime() : null;
+  } catch (e) { return; } // الجدول مازال — ensureWebhookHeartbeat كتديرو مع أول ويبهوك
+  const v = webhookSilenceVerdict({ lastAt, inflightCount: rows[0] ? rows[0].c : 0 });
+  if (!v.silent) return;
+  if (global._whSilenceAlertAt && Date.now() - global._whSilenceAlertAt < 24 * 60 * 60 * 1000) return;
+  global._whSilenceAlertAt = Date.now();
+  sendAdminAlert(
+    `🚨 [Laclarc] الويبهوك ساكت ${v.ageHours}h+ و${rows[0].c} طلب في الطيران — CJ سدو (auto-close) ولا السيرفر برد`,
+    `<p>ما وصل حتى ويبهوك من CJ منذ <b>${v.ageHours} ساعة</b> — مع <b>${rows[0].c}</b> طلب paid/fulfilled في الطيران.</p>
+     <p><b>الأسباب المحتملة:</b> auto-close (الدوك 3.3: معدل النجاح <80% في جوج ساعات) · cold start تاع Render · تسجيل طايح.</p>
+     <p><b>العلاج دابا:</b> POST <code>/api/admin/webhook/register</code> بالتوكن الأدمن (كيصيفط كل المواضيع) — من بعد راقب اللوج <code>📨 [CJ Webhook]</code> و<code>💓 [WebhookHeartbeat]</code>.</p>`
+  ).catch((e) => logger.logError('WebhookSilenceGuard alert', e));
+}
+
+// ═══ v37 H5 — تسجيل wallet بموضوعو وحدو (الدوك 6.1: لازم نداء منفصل — كيتبعت مع
+//     مواضيع أخرى، فشلو كيخسر الطلب كامل). بعد النجاح CJ كيصيفط رسالة اختبار
+//     (wallet-registration-check) — المعالج كيردّها 200 وما كيسجلهاش. مرة وحدة برك.
+app.post('/api/admin/webhook/register-wallet', requireAdmin, async (req, res) => {
+  try {
+    const callbackUrl = `${process.env.BACKEND_URL || 'https://neo-store-backend.onrender.com'}/api/cj-webhook`;
+    const response = await registerWalletWebhook(callbackUrl);
+    if (response.data?.code === 200) {
+      res.json({ message: '✅ Wallet webhook مسجل! الرسالة الاختبارية غادي توصل دغيا — شوف اللوج 🧪 [WALLET]. من بعد كل حركة فالمحفظة غادي تلقاها 💰 [WALLET] فاللوج.' });
+    } else {
+      res.status(400).json({ error: response.data?.message || 'Wallet registration failed' });
+    }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
+    logger.logError('Webhook Register Wallet', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 // ═══ ⚖️ Dispute Watchdog — مراقبة chargebacks (كل 6 ساعات) ═══
 cron.schedule('0 */6 * * *', async () => {
