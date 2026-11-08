@@ -233,6 +233,13 @@ const CJ_SHOP_LOGISTICS_TYPE = (() => {
   return (v === 1 || v === 2 || v === 3) ? v : 3;
 })();
 
+// 🆕 v35 (F5 — دوك shopping.html#_1-2): payType المحذوف/1 = cjPayUrl المتوقفة رسمياً. كنثبتو السيمانيتيك بـ
+//    payType=3 (إنشاء فقط بلا دفع) — نفس السلوك العملي الحالي بالضبط: الطلب يخلق غير مدفوع، payBalance (2.2)
+//    كيخلصو من بعد فـ SelfHeal/AutoHeal. ما نستعملوش payType=2 هنا: الطلب يمكن يتذبح (delete zombie بعد
+//    logisticsMiss) وهو خلاص = مشاكل استرداد. CJ_V3_PAYTYPE='0' = kill-switch (يرجع للحقل المحذوف).
+//    كيتحقق غير فـ basePayload (V3) — نداء V2 عندو payType:2 صريح برك.
+const CJ_V3_PAYTYPE = process.env.CJ_V3_PAYTYPE === '0' ? 0 : (parseInt(process.env.CJ_V3_PAYTYPE, 10) || 3);
+
 const DEAD_CJ_STATUSES = ['TRASH', 'CANCELLED', 'CLOSED', 'INTERCEPTED'];
 
 // 🔢 CJ يحتجز رقم الطلب للأبد حتى بعد الحذف (TRASH) → 1603003 دائماً.
@@ -340,6 +347,112 @@ async function queryOrderPackingPhotos(cjOrderNumbers) {
   cjPhotosCache.set(key, { expires: Date.now() + CJ_PHOTOS_TTL_MS, result });
   if (cjPhotosCache.size > 500) cjPhotosCache.clear();   // ذاكرة آمنة
   return result;
+}
+
+// ═══ 🆕 v35 (F#47 — دوك shopping.html) ═══
+
+// F1 — توحيد شكل makeup/list (دوك 9.2): الشكل الرسمي = data.pageData.content[] — والأشكال القديمة
+//    (data.list / data.data.list) نبقاو نقبلوهم للتوافق. pure function — الويب هوك (P0-27 probe)
+//    و /api/admin/makeup/list كيستعملو نفس الوحدة باش ما يتفاوتوش أبداً.
+function pickMakeupRows(resData) {
+  const d = resData && resData.data;
+  const cand =
+    (d && Array.isArray(d.list) && d.list) ||
+    (d && d.data && Array.isArray(d.data.list) && d.data.list) ||
+    (d && d.pageData && Array.isArray(d.pageData.content) && d.pageData.content) ||
+    (d && d.data && d.data.pageData && Array.isArray(d.data.pageData.content) && d.data.pageData.content) ||
+    (Array.isArray(d) ? d : null);
+  return Array.isArray(cand) ? cand : [];
+}
+
+// F2 — رصيد المحفظة (دوك 2.1 — GET، نقطة وحدة): amount=المتاح · freezeAmount=مجمّد · noWithdrawalAmount=بونص (nullable)
+async function queryWalletBalance() {
+  const res = await cjRequest((token) => axios.get(`${CJ_API}/shopping/pay/getBalance`, {
+    headers: { 'CJ-Access-Token': token },
+  }));
+  const env = res.data || {};
+  const ok = env.code === 200 || env.code === 0 || env.success === true;
+  if (!ok || env.result === false) throw new Error(`getBalance envelope ${env.code}: ${env.message || 'unknown'}`);
+  const d = env.data || {};
+  const num = (x) => (x == null ? null : (Number(x) || 0));
+  return { amount: num(d.amount), freezeAmount: num(d.freezeAmount), bonus: num(d.noWithdrawalAmount) };
+}
+
+// F2 — قرار التنبيه (pure): null = كلشي مزيان · low = تحت الحد · critical = تحت نص الحد
+function pickWalletAlert(balance, min) {
+  const b = Number(balance) || 0;
+  const m = Number(min) || 0;
+  if (m <= 0 || b >= m) return null;
+  return { level: b < m / 2 ? 'critical' : 'low', amount: b, min: m };
+}
+
+// F3 — إثبات التسليم الموقّع POD (دوك 1.17 — POST، ≤100 id/طلب، 2 نقاط): أقوى دليل فالنزاعات
+//    (chargebacks) — أقوى من صور QC تاع v34. الدوك: «download and archive them on your side» —
+//    CJ ما كيحفظش ليك للأبد. الكاش 30د يحمي من النقر المزدوج.
+const CJ_POD_TTL_MS = 30 * 60 * 1000;
+const cjPodCache = new Map();   // "id1|id2" → { expires, result }
+
+async function queryProofOfDelivery(cjOrderNumbers) {
+  const ids = [...new Set((Array.isArray(cjOrderNumbers) ? cjOrderNumbers : [cjOrderNumbers]).map((x) => String(x).trim()).filter(Boolean))];
+  if (ids.length === 0) return [];
+  if (ids.length > 100) ids.length = 100;             // الدوك: 100 id/طلب حد أقصى
+  const key = ids.join('|');
+  const hit = cjPodCache.get(key);
+  if (hit && Date.now() < hit.expires) return hit.result;
+  const res = await cjRequest((token) => axios.post(`${CJ_API}/shopping/order/getProofOfDelivery`, { orderIds: ids }, {
+    headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' },
+  }));
+  const env = res.data || {};
+  const ok = env.code === 200 || env.code === 0 || env.success === true;
+  if (!ok || env.result === false) throw new Error(`getProofOfDelivery envelope ${env.code}: ${env.message || 'unknown'}`);
+  const rows = Array.isArray(env.data) ? env.data : [];
+  const result = rows.map((r) => ({
+    orderId: r && r.orderId != null ? String(r.orderId) : null,
+    pods: Array.isArray(r && r.proofOfDeliveryList) ? r.proofOfDeliveryList.filter(Boolean) : [],
+  }));
+  cjPodCache.set(key, { expires: Date.now() + CJ_POD_TTL_MS, result });
+  if (cjPodCache.size > 500) cjPodCache.clear();   // ذاكرة آمنة
+  return result;
+}
+
+// F4 — تصحيح عنوان الشحن (دوك 11.1 — POST، 2 نقاط): كيصيفط غير الحقول المُمرّرة — اللي ما تنشافش كتبقى كما هي عند CJ.
+//    الجدول الرسمي: CREATED/IN_CART = كلشي · من بعد رقم التتبع = 1613003 · البلد = جوج حقول مع بعضياتهم ·
+//    '' = مسح حقل اختياري (مثال shippingAddress2). logisticName غير للطلبات غير المدفوعة.
+const ADDRESS_PATCH_FIELDS = ['shippingCustomerName', 'shippingCountryCode', 'shippingCountry', 'shippingProvince', 'shippingCity', 'shippingCounty', 'shippingAddress', 'shippingAddress2', 'shippingZip', 'shippingPhone', 'email', 'taxId', 'consigneeID', 'logisticName'];
+
+function humanizeAddressError(code, message) {
+  if (code === 1613003) return 'CJ رفض التغيير بهالحالة (غالباً رقم التتبع خرج، ولا الطريقة ما توصّلش للعنوان الجديد) — راجع الطلب فـ MyCJ';
+  if (code === 1613002) return 'التغيير راهي فمعالجة عند CJ — تسنى شوية وشوف حالة الطلب (1.7)';
+  if (code === 1613001) return 'كاين تعديل آخر جارٍ على نفس الطلب — عاود من بعد دقيقة';
+  if (code === 1603100) return 'رقم الطلب ما صالحش — تأكد من cj_order_number';
+  if (code === 1600300) return 'حقل إجباري ناقص/خاوي (الإجباريين ما يتفرغوش): ' + (message || '—');
+  if (code === 1600000) return 'CJ مشغول دابا — عاود من بعد شوية';
+  return null;
+}
+
+async function updateOrderShippingAddress(orderCode, patch) {
+  const body = { orderCode: String(orderCode) };
+  const used = [];
+  for (const f of ADDRESS_PATCH_FIELDS) {
+    const v = patch ? patch[f] : undefined;
+    if (v === undefined || v === null) continue;
+    body[f] = (typeof v === 'string' && v.trim() !== '') ? v.trim() : v;   // '' = نية مسح حقل اختياري — CJ كيتحقق
+    used.push(f);
+  }
+  const addrFields = ['shippingCustomerName', 'shippingCountryCode', 'shippingCountry', 'shippingProvince', 'shippingCity', 'shippingCounty', 'shippingAddress', 'shippingAddress2', 'shippingZip', 'shippingPhone', 'email'];
+  if (!used.some((f) => addrFields.includes(f))) return { ok: false, code: 'NO_ADDRESS_FIELD', message: 'خاص على الأقل حقل عنوان واحد (logisticName بوحدو ما يكفيش)' };
+  if (body.shippingCountryCode && !body.shippingCountry) return { ok: false, code: 'COUNTRY_PAIR', message: 'shippingCountryCode خاصو معاه shippingCountry (الدوك 11.1)' };
+  if (body.shippingCountry && !body.shippingCountryCode) return { ok: false, code: 'COUNTRY_PAIR', message: 'shippingCountry خاصو معاه shippingCountryCode (الدوك 11.1)' };
+  const res = await cjRequest((token) => axios.post(`${CJ_API}/shopping/order/updateShippingAddress`, body, {
+    headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' },
+  }));
+  const env = res.data || {};
+  const ok = (env.code === 200 || env.code === 0) && env.result !== false;
+  if (ok) {
+    const d = env.data || {};
+    return { ok: true, orderCode: d.orderCode || String(orderCode), logisticName: d.logisticName ?? null, logisticsCleared: !!d.logisticsCleared, fields: used };
+  }
+  return { ok: false, code: env.code, message: env.message || 'unknown', hint: humanizeAddressError(env.code, env.message), fields: used };
 }
 
 const numberFor = (base, bump) => (bump <= 1 ? base : `${base}-R${bump}`);
@@ -886,6 +999,7 @@ async function fulfillCJOrderImpl(orderId, customerName, customerDetails, items,
       orderFlow: 1,
       shopLogisticsType: CJ_SHOP_LOGISTICS_TYPE,   // 🆕 v32 — flag (default 3 = نفس الإنتاج)
       isSandbox: isSandbox,
+      ...(CJ_V3_PAYTYPE ? { payType: CJ_V3_PAYTYPE } : {}),   // 🆕 v35 F5 — payType=3 صريح (basePayload كيوصل غير لمسارات V3 الثلاثة)
     };
 
     // 🔧 حفظ آمن — COALESCE pattern
@@ -2039,4 +2153,4 @@ async function payCJOrderBalance(...candidates) {
 // 📤 التصديرات — 🩹 إجباري: probeOrderStatus + classifyDuplicate + auditEvent
 //    cjWebhookService v2.1 (P0-20 anti-spoof) يعتمدهما — بلاهما أول webhook يرمي undefined
 // ==========================================
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate, querySourcingList, pickSourcingAlert, getCjVariantStock, queryOrderPackingPhotos };
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate, querySourcingList, pickSourcingAlert, getCjVariantStock, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress };

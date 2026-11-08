@@ -30,7 +30,7 @@ const { secondShotConversion } = require('./services/conversionService');
 const { fulfillCJOrder, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
-const { selfHealStuckOrders, disputeWatchdogCron, auditEvent, querySourcingList, pickSourcingAlert, queryOrderPackingPhotos } = require('./services/cjService');
+const { selfHealStuckOrders, disputeWatchdogCron, auditEvent, querySourcingList, pickSourcingAlert, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress } = require('./services/cjService');
 const logger = require('./logger');
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
 const templates = require('./emails/templates'); // 🎨 SERENE email design system (F#84) — all customer emails in English
@@ -3204,7 +3204,12 @@ app.post('/api/admin/merge/submit', async (req, res) => {
 app.get('/api/admin/makeup/list', async (req, res) => {
   try {
     const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/makeup/list', { pageNum: 1, pageSize: 20, type: 0 }, { headers: { 'CJ-Access-Token': token } }));
-    res.json(response.data);
+    // 🆕 v35 F1 — الدوك: الشكل الرسمي = data.pageData.content — كنحقنو list موحّد (الأشكال القديمة + الجديدة)
+    //    باش البانل يقرأ data.list بلا ما يهمنه شنو رجّع CJ اليوم
+    const payload = response.data || {};
+    const rows = pickMakeupRows(payload);
+    const data = (payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)) ? { ...payload.data, list: rows } : { ...(payload.data || {}), list: rows };
+    res.json({ ...payload, data });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -3279,6 +3284,69 @@ app.get('/api/admin/order-photos/:orderId', requireAdmin, async (req, res) => {
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Order Photos', err);
     res.status(502).json({ error: 'CJ photos query failed: ' + err.message });
+  }
+});
+
+// ═══ 💰 v35 (F#47 دوك 2.1) — رصيد المحفظة (نقطة وحدة GET) — فحص يدوي للأدمن ═══
+app.get('/api/admin/cj-balance', requireAdmin, async (req, res) => {
+  try {
+    const bal = await queryWalletBalance();
+    const minAlert = Number(process.env.CJ_WALLET_MIN_ALERT || 50);
+    res.json({ ...bal, minAlert, alert: pickWalletAlert(bal.amount, minAlert), checkedAt: new Date().toISOString() });
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
+    logger.logError('CJ Balance', err);
+    res.status(502).json({ error: 'CJ getBalance failed: ' + err.message });
+  }
+});
+
+// ═══ 📄 v35 (F#47 دوك 1.17) — إثبات التسليم الموقّع POD (للنزاعات/chargebacks) ═══
+//     نداء عند الطلب برك (2 نقاط POST) + كاش 30د فـ cjService. الدوك: «download and archive» —
+//     CJ ما كيحفظش للأسد — نزّل الملفات وأرشفهم مع الطلب
+app.get('/api/admin/order-pod/:orderId', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT cj_order_number FROM orders WHERE id = $1 LIMIT 1', [req.params.orderId]);
+    const cjOrderNumber = rows[0] ? (rows[0].cj_order_number || '').toString().trim() : '';
+    if (!cjOrderNumber) return res.status(400).json({ error: 'Order has no CJ order number yet — الطلب مازال ما تخلقش فـ CJ' });
+    const result = await queryProofOfDelivery([cjOrderNumber]);
+    const entry = result.find((r) => r.orderId === cjOrderNumber) || result[0] || null;
+    const pods = entry ? entry.pods : [];
+    res.json({
+      orderId: Number(req.params.orderId),
+      cjOrderNumber,
+      pods,
+      count: pods.length,
+      note: pods.length ? 'نزّل الملفات وأرشفهم — CJ ما كيضمنش بقائهم للأبد.' : 'ما كاينش POD دابا — CJ كيرجعو فارغ حتى يتسلّم الطلب ويتوقّع. عاود من بعد التسليم (الكاش 30 دقيقة).'
+    });
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
+    logger.logError('Order POD', err);
+    res.status(502).json({ error: 'CJ POD query failed: ' + err.message });
+  }
+});
+
+// ═══ 🏠 v35 (F#47 دوك 11.1) — تصحيح عنوان الشحن عند CJ (قبل رقم التتبع) ═══
+//     الجدول الرسمي: CREATED/IN_CART = كلشي · من بعد التتبع = CJ كيرفض 1613003 · البلد = جوج حقول مع بعض ·
+//     الBody: أي حقل من حقول العنوان — اللي ما تنشافش كتبقى كما هي عند CJ. 2 نقاط عند الطلب
+app.post('/api/admin/order-address/:orderId', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT cj_order_number FROM orders WHERE id = $1 LIMIT 1', [req.params.orderId]);
+    const cjOrderNumber = rows[0] ? (rows[0].cj_order_number || '').toString().trim() : '';
+    if (!cjOrderNumber) return res.status(400).json({ error: 'Order has no CJ order number yet — الطلب مازال ما تخلقش فـ CJ' });
+    const patch = req.body || {};
+    if (typeof patch !== 'object' || Array.isArray(patch) || Object.keys(patch).length === 0) {
+      return res.status(400).json({ error: 'صيفط على الأقل حقل عنوان — مثال: {"shippingCity":"Oran","shippingPhone":"+213...","shippingCountry":"Algeria","shippingCountryCode":"DZ"}' });
+    }
+    const r = await updateOrderShippingAddress(cjOrderNumber, patch);
+    if (r.ok) {
+      auditEvent('CJ_ADDRESS_UPDATED', req.params.orderId, { cj: cjOrderNumber, fields: r.fields, logisticName: r.logisticName, logisticsCleared: r.logisticsCleared }, 'info');
+      const notes = ['تعدل العنوان عند CJ — تكلفة الشحن تقدر تتبدل، تحقق بحالة الطلب.'];
+      if (r.logisticsCleared) notes.push('⚠️ CJ حيّد طريقة الشحن (logisticsCleared=true) — لازم تختار وحدة جديدة (1.14 ولا MyCJ) قبل الخلاص');
+      res.json({ ...r, note: notes.join(' ') });
+    } else {
+      res.status(400).json(r);
+    }
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
+    logger.logError('Order Address Update', err);
+    res.status(502).json({ error: 'CJ address update failed: ' + err.message });
   }
 });
 
@@ -3795,6 +3863,27 @@ async function runSourcingWatch() {
 cron.schedule('30 4,16 * * *', async () => {
   try { await runSourcingWatch(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('SourcingWatch Scheduler', e); }
 });
+
+// ═══ 💰 Wallet Watch — v35 (F#47 دوك 2.1): فحص الرصيد مرة فالنهار (نقطة وحدة) — تنبيه قبل ما يفشل
+//     شي طلب بـ 1605001. الدوك: amount=المتاح · freezeAmount=مجمّد · noWithdrawalAmount=بونص. Kill-switch: CJ_WALLET_CRON='0'
+const CJ_WALLET_MIN_ALERT = Number(process.env.CJ_WALLET_MIN_ALERT || 50);
+async function runWalletWatch() {
+  const bal = await queryWalletBalance();
+  const alert = pickWalletAlert(bal.amount, CJ_WALLET_MIN_ALERT);
+  console.log(`💰 [WalletWatch] balance=$${bal.amount} (freeze=${bal.freezeAmount ?? '—'} · bonus=${bal.bonus ?? '—'}) min=$${CJ_WALLET_MIN_ALERT} → ${alert ? alert.level.toUpperCase() : 'OK'}`);
+  if (!alert) return;
+  const emoji = alert.level === 'critical' ? '🚨' : '⚠️';
+  sendAdminAlert(
+    `${emoji} [Laclarc] CJ Wallet ${alert.level === 'critical' ? 'شبه فارغ' : 'منخفض'}: $${alert.amount}`,
+    `<p>الرصيد المتاح: <b>$${alert.amount}</b> · الحد المبرمج: <b>$${alert.min}</b>${bal.freezeAmount != null ? ` · مجمّد: $${bal.freezeAmount}` : ''}${bal.bonus != null ? ` · بونص (ما يترجعش): $${bal.bonus}` : ''}</p><p>الطلبات الجاية غادي تعلق على 1605001 (محفظة خاوية) إلا عمّرتي المحفظة دابا: MyCJ → Finance → Top up.</p>`
+  );
+}
+{
+  const walletCron = process.env.CJ_WALLET_CRON === '0' ? null : (process.env.CJ_WALLET_CRON || '20 9 * * *');
+  if (walletCron) cron.schedule(walletCron, async () => {
+    try { await runWalletWatch(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('WalletWatch Scheduler', e); }
+  });
+}
 
 // ═══ ⚖️ Dispute Watchdog — مراقبة chargebacks (كل 6 ساعات) ═══
 cron.schedule('0 */6 * * *', async () => {

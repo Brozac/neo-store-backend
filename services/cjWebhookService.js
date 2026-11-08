@@ -37,7 +37,7 @@ const crypto = require('crypto');
 const pool = require('../db');
 const logger = require('../logger');
 const { cjRequest } = require('./cjService');
-const { checkStripeDispute, sendAdminAlert, probeOrderStatus, classifyDuplicate, auditEvent } = require('./cjService'); // 🩹 P0-20 — أدوات التحقق
+const { checkStripeDispute, sendAdminAlert, probeOrderStatus, classifyDuplicate, auditEvent, pickMakeupRows } = require('./cjService'); // 🩹 P0-20 — أدوات التحقق · 🆕 v35 F1 — قارئ makeup/list الموحد
 const { sendOrderTrackingWhatsApp } = require('./whatsappService');
 const { syncShipmentEvents } = require('./shipTruth');
 
@@ -654,7 +654,7 @@ async function handleMakeup(params = {}) {
           { pageNum, pageSize: 50, type: 0 },
           { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' }, timeout: 45000 }
         ));
-        const list = listRes?.data?.data?.list || listRes?.data?.list || [];
+        const list = pickMakeupRows(listRes && listRes.data);   // 🩹 v35 F1 — الدوك: data.pageData.content (الأشكال القديمة مغطيين نفس الشي)
         if (!Array.isArray(list) || list.length === 0) break;
         // مطابقة schema-agnostic: معرّف الطلب (BT...) فأي حقل ديال الفاتورة
         verified = list.some(item => {
