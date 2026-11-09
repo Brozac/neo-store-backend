@@ -100,6 +100,8 @@ app.get('/__sentry_test', (req, res) => {
 // ──── [/LACLARC::SENTRY-TEST] ────
 const cookieParser = require('cookie-parser');
 app.set('trust proxy', 1);
+// 🆕 F#55 AntiClone — إخفاء بصمة Express (كانت x-powered-by مكشوفة في الهيدرات الحية)
+app.disable('x-powered-by');
 // ═══ CORSFIX (F#33) — دعم عدة أصول: CORS_ORIGINS (فاصلة بينهم) ولا FRONTEND_URL وحدها ═══
 // workers.dev كيدخل القائمة بلا ما نبدلو FRONTEND_URL (راه كيتستعمل في لينكات الإيميل والدفع)
 // مثال Render env: CORS_ORIGINS=https://laclarc.com,https://laclarc.xaanabroza75.workers.dev
@@ -126,6 +128,41 @@ const secondShotLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, message
 //   (jwt.sign بلا حتى مصادقة). الـ limiter يشدّ السُحب الآلي — التحقق الجانبي للسحبة
 //   (سجل spin) راه فالمرحلة 2 (خارطة الطريق).
 const wheelLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { error: 'Too many wheel claims, please try again later.' } });
+
+// ═══ 🆕 F#55 AntiClone — حماية الكاطالوگ من الاستنساخ الجماعي (قرار المالك «أ» 11-10) ═══
+// المفتاح = cf-connecting-ip إجباري: خلف Cloudflare مع trust proxy=1 الـ req.ip كيولّي
+//   IP تاع كلاودفلير ماشي تاع الزائر — الlimiter بلاها كيخنق كل الزوار مرة وحدة (فخ F#55)
+const antiCloneIp = (req) => String(req.headers['cf-connecting-ip'] || req.ip || 'unknown');
+// حارس الأصل: Origin موجود ولازم يكون من قائمة cors المسموحة (+ apex/www مفروضين —
+//   www.laclarc.com كيخدم بنفسو بلا redirect — تحقق حي 11-10). الطلبات بلا Origin
+//   (SSR/سيرفر-لسيرفر) كتعدّ عادية — الحماية الحقيقية: الlimiter + طبقة Cloudflare
+const antiCloneOrigins = new Set([...allowedOrigins, 'https://laclarc.com', 'https://www.laclarc.com']);
+const productsOriginGuard = (req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && !antiCloneOrigins.has(origin)) {
+    console.warn(`🚫 [AntiClone] foreign origin: ${origin} ${antiCloneIp(req)}`);
+    res.set('Cache-Control', 'no-store');
+    return res.status(403).json({ error: 'Forbidden origin' });
+  }
+  next();
+};
+// 90 طلب/دقيقة/IP على مسارات /api/products كلهم — الزائر الحقيقي بعيد على الحد
+//   (صفحة منتج = ~3 نداءات · infinite feed كيدخل فوق 40/دقيقة حتى في التمرير السريع)
+//   معفى: minimal=1 (سايتماپ Google — كسرها = ضرر SEO · الpayload تاعها ids+dates برك)
+//   📌 المهاجم الراضي: 90×50 = 4,500 منتج/دقيقة كحد أقصى + 429 من بعد — مقابل سابقاً
+//   200× unlimited = كل الكاطالوگ في ثواني
+const productsLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 90,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: antiCloneIp,
+  skip: (req) => req.query.minimal === '1',
+  handler: (req, res, _next, options) => {
+    console.warn(`🚫 [AntiClone] rate-limit: ${antiCloneIp(req)} ${req.originalUrl}`);
+    res.status(options.statusCode).json(options.message);
+  },
+});
 
 const ALL_WORLD_COUNTRIES = ['AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'];
 
@@ -2319,6 +2356,11 @@ const mcFeedHandler = (cur) => async (req, res) => {
 app.get('/api/merchant-feed.xml', mcFeedHandler('DZD'));
 app.get('/api/merchant-feed-usd.xml', mcFeedHandler('USD'));
 
+// ═══ 🆕 F#55 AntiClone — التركيب فوق مسارات /api/products كلهم ═══
+//   (عقد الترتيب مثل FIX-SHADOW: يبقى فوق — by-ids وdeals و:id وrelated كامل تحتو ·
+//    feeds تاع merchant (فوق سطرين) خارجة عن الحماية بالتصميم — خاصية Google Shopping)
+app.use('/api/products', productsOriginGuard, productsLimiter);
+
 app.get('/api/products', async (req, res) => {
   try {
     const search = req.query.search || '';
@@ -2392,12 +2434,13 @@ app.get('/api/products', async (req, res) => {
 
     // 1. الطلب العام بدون بحث
     if (search === '' && category === 'All') {
-      // 🆕 الـ limit ولّى مطبَّق — HeroSection(12) و products/[id](100) عمرو ما استافدو بيه
+      // 🆕 F#55 AntiClone — HeroSection(12) ما يتأثرش · products/[id] كان يطلب 100 كيخد 50
+      //   (شبكة الاقتراحات بأقل عناصر — ما كاينش كسر · سقف 50 حسب قرار المالك «أ»)
       const limitParam = parseInt(req.query.limit, 10);
       if (Number.isFinite(limitParam) && limitParam > 0) {
         const q = await pool.query(
           `SELECT id, title, price, original_price, image_url, category, video_url${SW_SQL}, created_at FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC LIMIT $1`,
-          [Math.min(limitParam, 200)]
+          [Math.min(limitParam, 50)]  // 🆕 F#55 AntiClone — كان 200 (قرار المالك «أ»: سقف 50)
         );
         return res.json(withSwatches(q.rows));
       }
