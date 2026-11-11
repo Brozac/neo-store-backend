@@ -2392,6 +2392,11 @@ const parseColourParam = (v) => {
 };
 // كيبني fragments تاع WHERE (بلا AND) وكيخلي params يتعمراو بالترتيب —
 // LIMIT/OFFSET كيتزادو من بعد بـ params.length + 1 / + 2
+// ⚡ F#58 FILTERPERF — flag كيتقلب من بوت-اج (الـIIFE ديال FILTERPERF تحت، مور app.listen)
+// true = colour_names معمّر + مفهرس GIN trgm → فلاتر اللون فـmilliseconds
+// false (افتراضي) = المسار القديم EXISTS jsonb كيخدم بالحرف — صفر تغيير فالسلوك
+let colourFastReady = false;
+
 const buildCatalogFilters = (q, params) => {
   const frags = [];
   const minP = parsePriceParam(q.minPrice);
@@ -2401,11 +2406,21 @@ const buildCatalogFilters = (q, params) => {
   if (maxP !== null) { params.push(maxP); frags.push(`price <= $${params.length}`); }
   const colour = parseColourParam(q.colour);
   if (colour) {
-    params.push(escapeLikeSafe(colour));
-    frags.push(`EXISTS (
-      SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(variants) = 'array' THEN variants ELSE '[]'::jsonb END) cv(val)
-      WHERE regexp_replace(cv.val->>'variantKey', '-[^-]+$', '') ILIKE $${params.length}
-    )`);
+    if (colourFastReady) {
+      // ⚡ المسار السريع — نفس الدلالة القديمة بالحرف: مطابقة الاسم الدقيق (case-insensitive)
+      //    ديال الاستخراج SW_SQL (الاسم قبل آخر -). العمود مصغّر lower + مفهرس GIN trgm
+      //    → LIKE '%;name;%' indexed (المعازل ; كيمنعو فالصواب مع الأسماء اللي فيها فراغات "navy blue").
+      //    القديم كان jsonb parse كامل على 53k صف فكل طلب (12-21s مقيس إنتاجياً) — CPU كيحرق.
+      params.push(`%;${escapeLikeSafe(colour.toLowerCase())};%`);
+      frags.push(`colour_names LIKE $${params.length}`);
+    } else {
+      // المسار القديم بالحرف — كيخدم ملي الmigration ما كملتش (flag ما تقلبش)
+      params.push(escapeLikeSafe(colour));
+      frags.push(`EXISTS (
+        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(variants) = 'array' THEN variants ELSE '[]'::jsonb END) cv(val)
+        WHERE regexp_replace(cv.val->>'variantKey', '-[^-]+$', '') ILIKE $${params.length}
+      )`);
+    }
   }
   return frags;
 };
@@ -5157,6 +5172,95 @@ process.on('uncaughtException', async (err) => {
   clearTimeout(forceExit);
   process.exit(1);
 });
+
+// ==========================================
+// ⚡ F#58 FILTERPERF — فهارس الكاتالوگ (boot IIFE خلفية — كتجري مور listen، ما كيوقفش الإقلاع أبداً)
+// ==========================================
+// المقيس إنتاجياً (2026-11-11، قاعدة سخونة): count=1&colour=Red = 12-21s · maxPrice = 1-12s
+//   · colour: EXISTS jsonb parse كامل على 53,723 صف فكل طلب — CPU كيحرق وكيعطل الطلبات اللي من بعد
+//   · price/newest: seq scan على صفوف عريضة (variants/images TOAST) بلا فهارس
+// الحل: عمود colour_names نص مصغّر (نفس الاستخراج ديال SW_SQL بالحرف: الاسم قبل آخر -، المقاسات-
+//   فقط مستبعد) مولّد أوتوماتيكياً بـ trigger كيغطي كل مسارات sync (server.js + productImportService
+//   + massSync) بلا تعديل وحد منهم + GIN trgm (LIKE '%;name;%' indexed) + B-tree جزئية للثمن/الجديد.
+// الأمان: كل خطوة try/catch مستقلة — أي فشل → colourFastReady يبقى false → buildCatalogFilters
+//   كيخدم بالمسار القديم EXISTS jsonb بالحرف. صفر كسر متوقع فأي سيناريو.
+// Idempotent: ADD COLUMN IF NOT EXISTS · CREATE OR REPLACE · IF NOT EXISTS · backfill كيشوف
+//   colour_names = '' فقط → الإقلاعات اللي من بعد = أوتوماتيك خفيف.
+(async () => {
+  const t0 = Date.now();
+  // نفس SW_SIZE_ONLY_RX (server.js:2168) بالحرف — منقولة SQL باش العمود ما يتعمرش بالمقاسات
+  const SIZE_RX_SQL = '^(?:xxs|xs|s|m|l|xl|xxl|2xl|3xl|4xl|5xl|6xl|7xl|8xl|\\d{1,4})$';
+  let colOK = false, fnOK = false, trigOK = false, fillOK = false, ginOK = false;
+
+  try {
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS colour_names text NOT NULL DEFAULT ''`);
+    colOK = true;
+    console.log(`⚡ [FILTERPERF] 1/5 column colour_names ready (${Date.now() - t0}ms)`);
+  } catch (e) { logger.logError('FILTERPERF column', e); }
+
+  if (colOK) try { await pool.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm`); }
+  catch (e) { logger.logError('FILTERPERF pg_trgm (غير حرج — بلا GIN المسار السريع ما كيتفعّلش)', e); }
+
+  if (colOK) try {
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION set_colour_names() RETURNS trigger AS $fn$
+      BEGIN
+        SELECT COALESCE(';' || string_agg(DISTINCT lower(x.cname), ';' ORDER BY lower(x.cname)) || ';', ';')
+          INTO NEW.colour_names
+          FROM (
+            SELECT regexp_replace(cv.val->>'variantKey', '-[^-]+$', '') AS cname
+            FROM jsonb_array_elements(
+              CASE WHEN jsonb_typeof(NEW.variants) = 'array' THEN NEW.variants ELSE '[]'::jsonb END
+            ) cv(val)
+            WHERE COALESCE(cv.val->>'variantKey', '') <> ''
+          ) x
+          WHERE x.cname <> '' AND x.cname !~* '${SIZE_RX_SQL}';
+        RETURN NEW;
+      END;
+      $fn$ LANGUAGE plpgsql
+    `);
+    fnOK = true;
+    console.log(`⚡ [FILTERPERF] 2/5 function set_colour_names ready (${Date.now() - t0}ms)`);
+  } catch (e) { logger.logError('FILTERPERF function', e); }
+
+  if (fnOK) try {
+    await pool.query(`DROP TRIGGER IF EXISTS trg_products_colour_names ON products`);
+    await pool.query(`CREATE TRIGGER trg_products_colour_names BEFORE INSERT OR UPDATE OF variants ON products FOR EACH ROW EXECUTE FUNCTION set_colour_names()`);
+    trigOK = true;
+    console.log(`⚡ [FILTERPERF] 3/5 trigger trg_products_colour_names ready (${Date.now() - t0}ms)`);
+  } catch (e) { logger.logError('FILTERPERF trigger', e); }
+
+  if (trigOK) try {
+    const r = await pool.query(`
+      UPDATE products p
+      SET colour_names = COALESCE(
+        ';' || (SELECT string_agg(DISTINCT lower(x.cname), ';' ORDER BY lower(x.cname))
+                FROM (SELECT regexp_replace(cv.val->>'variantKey', '-[^-]+$', '') AS cname
+                      FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p.variants) = 'array' THEN p.variants ELSE '[]'::jsonb END) cv(val)
+                      WHERE COALESCE(cv.val->>'variantKey', '') <> '') x
+                WHERE x.cname <> '' AND x.cname !~* '${SIZE_RX_SQL}') || ';',
+        ';')
+      WHERE p.colour_names = ''
+    `);
+    fillOK = true;
+    console.log(`⚡ [FILTERPERF] 4/5 backfill: ${r.rowCount} صف فـ${Date.now() - t0}ms`);
+  } catch (e) { logger.logError('FILTERPERF backfill', e); }
+
+  if (fillOK) try {
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_colour_names_trgm ON products USING GIN (colour_names gin_trgm_ops)`);
+    ginOK = true;
+    console.log(`⚡ [FILTERPERF] 5/5 GIN trgm index ready (${Date.now() - t0}ms)`);
+  } catch (e) { logger.logError('FILTERPERF trgm index', e); }
+
+  colourFastReady = colOK && fnOK && trigOK && fillOK && ginOK;
+  console.log(`⚡ [FILTERPERF] colour fast-path: ${colourFastReady ? 'ON — فلاتر اللون فـmilliseconds' : 'OFF — EXISTS jsonb كيخدم بالحرف (القديم السليم)'}`);
+
+  // فهارس الثمن/الجديد — غير حرجة (log فقط): planner كيستغلهم أوتوماتيكياً بلا تغيير فالاستعلامات
+  try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_price_stock ON products (price) WHERE stock_status = true`); }
+  catch (e) { logger.logError('FILTERPERF price index', e); }
+  try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_created_stock ON products (created_at DESC) WHERE stock_status = true`); }
+  catch (e) { logger.logError('FILTERPERF created index', e); }
+})();
 
 // ==========================================
 // 🚀 تشغيل خادم HTTP (مرة واحدة فقط)
