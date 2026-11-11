@@ -2166,6 +2166,9 @@ app.get('/', (req, res) => res.send('Laclarc Dropshipping API is running on poin
 // withSwatches كيفلتر: المقاسات-فقط (XL/42...) + الصور المكررة · سقف 5 · swMore = الباقي
 // ⚡ صفر نقاط CJ — عملية DB محلية بحتة · الفرع الكامل (FULL_CAP=5000) بلا سواتشات عمداً (الأداء)
 const SW_SIZE_ONLY_RX = /^(?:xxs|xs|s|m|l|xl|xxl|2xl|3xl|4xl|5xl|6xl|7xl|8xl|\d{1,4})$/i;
+// 🆕 F#59 SIZEFACET — نفس القائمة بصيغة SQL regex — كتستعملها فالtrigger تاع size_names
+// وفالحرس تاع المسار القديم — مصدر واحد للحقيقة مشترك مع SW_SIZE_ONLY_RX فوق
+const SIZE_RX_SQL = '^(?:xxs|xs|s|m|l|xl|xxl|2xl|3xl|4xl|5xl|6xl|7xl|8xl|\\d{1,4})$';
 const SW_MAX = 5;
 const SW_SQL = `, COALESCE((
   SELECT json_agg(json_build_object('c', t.c, 'i', t.i, 'v', t.v) ORDER BY t.ord)
@@ -2372,6 +2375,13 @@ app.use('/api/products', productsOriginGuard, productsLimiter);
 //   · colour : الاسم قبل آخر '-' في variantKey — نفس استخراج SW_SQL (Kit 30) حرفياً
 //     → EXISTS على variants JSONB · ILIKE exact · escapeLikeSafe · سقف 40 حرف
 //     · مقاس-فقط (XL/42…) مرفوض من دلال — نفس SW_SIZE_ONLY_RX.
+//     🆕 F#59 — كتقبل قائمة مفصولة بفواصل («Black,Navy Blue») → OR-chain
+//     (المنتج كيجي إلا واحد منهم عاق) — قيمة واحدة = نفس السلوك القديم بالحرف.
+//   · size : 🆕 F#59 SIZEFACET — المقاس بعد آخر '-' في variantKey (CJ الرسمية
+//     "Color-Size" — مثال "Black-XXL" → "XXL") · whitelist صارمة SW_SIZE_ONLY_RX
+//     (XXS..8XL + أرقام) — حتى اسم ما كيدخلش غير بالمقاسات الحقيقية
+//     · نفس المعمارية تاع اللون بالحرف: size_names سريع / EXISTS jsonb قديم
+//     · قائمة فواصل («M,L,XL») → OR-chain · قيمة واحدة = متطابقة مع القديم.
 //   · sort : price-asc | price-desc | newest — whitelist صارمة (ماكاينش حقن ORDER BY)
 //     · created_at موجود وممتلئ (probed live 11-11) · id tiebreaker دايماً
 // scope مقصود: page-mode (category + mosaic) وcount=1 برك — limit/search/deals/
@@ -2386,16 +2396,55 @@ const parsePriceParam = (v) => {
   const n = parseFloat(String(v ?? ''));
   return Number.isFinite(n) && n >= 0 && n <= 1000000 ? Math.round(n * 100) / 100 : null;
 };
-const parseColourParam = (v) => {
-  const c = String(v ?? '').trim().slice(0, 40);
-  return c && !SW_SIZE_ONLY_RX.test(c) ? c : '';
+// 🆕 F#59 — مُنقّي القوائم: «Black, Navy Blue» → ['Black', 'Navy Blue']
+// · كل جزء كيتنقى وحدو: سقف 40 حرف · اللون ماكيشبهش مقاس · المقاس يدخل غير من
+//   whitelist SW_SIZE_ONLY_RX (ماكاينش حقن — الاسم المرفوض كيطير بصمت)
+// · التكرار كيتشال (Set) · سقف 8 قيم واقعي — حماية CPU على URL عبثي
+// · قيمة واحدة أو فارغة = نفس دلالة القديم بالحرف (عقد F#57-Phase2 واقف)
+const parseNamesParam = (v, isSize) => {
+  const raw = String(v ?? '');
+  if (!raw.trim()) return [];
+  const seen = new Set();
+  for (const part of raw.split(',')) {
+    const c = part.trim().slice(0, 40);
+    if (!c) continue;
+    if (isSize ? !SW_SIZE_ONLY_RX.test(c) : SW_SIZE_ONLY_RX.test(c)) continue;
+    seen.add(c);
+    if (seen.size >= 8) break;
+  }
+  return [...seen];
 };
+const parseColourParam = (v) => parseNamesParam(v, false);
+const parseSizeParam = (v) => parseNamesParam(v, true);
 // كيبني fragments تاع WHERE (بلا AND) وكيخلي params يتعمراو بالترتيب —
 // LIMIT/OFFSET كيتزادو من بعد بـ params.length + 1 / + 2
 // ⚡ F#58 FILTERPERF — flag كيتقلب من بوت-اج (الـIIFE ديال FILTERPERF تحت، مور app.listen)
 // true = colour_names معمّر + مفهرس GIN trgm → فلاتر اللون فـmilliseconds
 // false (افتراضي) = المسار القديم EXISTS jsonb كيخدم بالحرف — صفر تغيير فالسلوك
 let colourFastReady = false;
+// 🆕 F#59 SIZEFACET — نفس العقد بالحرف للمقاسات (size_names / EXISTS jsonb)
+let sizeFastReady = false;
+
+// 🆕 F#59 — كيبني fragment تاع OR على قائمة أسماء (لون ولا مقاس):
+// · المسار السريع: العمود المصغّر المفهرس — LIKE '%;name;%' (المعازل ; كيمنعو فالصواب
+//   مع الأسماء اللي فيها فراغات "navy blue" ولا المقاس اللي داخل فآخر "xxl")
+// · المسار القديم: EXISTS jsonb بالحرف — extractSql كيستخرج الاسم من variantKey،
+//   vocabGuard (اختياري) كيحصر المطابقة فالقاموس (المقاسات برك)
+// · قيمة واحدة = نفس الـSQL القديم بالحرف (backward compat) · جوج+ = (...) OR (...)
+const namesOrFrag = (names, params, { fastReady, column, extractSql, vocabGuard = '' }) => {
+  const ors = names.map((name) => {
+    if (fastReady) {
+      params.push(`%;${escapeLikeSafe(name.toLowerCase())};%`);
+      return `${column} LIKE $${params.length}`;
+    }
+    params.push(escapeLikeSafe(name));
+    return `EXISTS (
+      SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(variants) = 'array' THEN variants ELSE '[]'::jsonb END) cv(val)
+      WHERE ${extractSql} ILIKE $${params.length}${vocabGuard}
+    )`;
+  });
+  return ors.length === 1 ? ors[0] : `(${ors.join(' OR ')})`;
+};
 
 const buildCatalogFilters = (q, params) => {
   const frags = [];
@@ -2404,23 +2453,26 @@ const buildCatalogFilters = (q, params) => {
   if (minP !== null || maxP !== null) frags.push('price > 0'); // FIX-ZERO سيرفر-سايد
   if (minP !== null) { params.push(minP); frags.push(`price >= $${params.length}`); }
   if (maxP !== null) { params.push(maxP); frags.push(`price <= $${params.length}`); }
-  const colour = parseColourParam(q.colour);
-  if (colour) {
-    if (colourFastReady) {
-      // ⚡ المسار السريع — نفس الدلالة القديمة بالحرف: مطابقة الاسم الدقيق (case-insensitive)
-      //    ديال الاستخراج SW_SQL (الاسم قبل آخر -). العمود مصغّر lower + مفهرس GIN trgm
-      //    → LIKE '%;name;%' indexed (المعازل ; كيمنعو فالصواب مع الأسماء اللي فيها فراغات "navy blue").
-      //    القديم كان jsonb parse كامل على 53k صف فكل طلب (12-21s مقيس إنتاجياً) — CPU كيحرق.
-      params.push(`%;${escapeLikeSafe(colour.toLowerCase())};%`);
-      frags.push(`colour_names LIKE $${params.length}`);
-    } else {
-      // المسار القديم بالحرف — كيخدم ملي الmigration ما كملتش (flag ما تقلبش)
-      params.push(escapeLikeSafe(colour));
-      frags.push(`EXISTS (
-        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(variants) = 'array' THEN variants ELSE '[]'::jsonb END) cv(val)
-        WHERE regexp_replace(cv.val->>'variantKey', '-[^-]+$', '') ILIKE $${params.length}
-      )`);
-    }
+  // 🆕 F#59 — اللون: قيمة واحدة = نفس الـSQL القديم بالحرف · جوج+ = OR-chain
+  // (الشروح التفصيلية تاع FILTERPERF كاينة فوق فnamesOrFrag — نفس الدلالة حرفياً)
+  const colours = parseColourParam(q.colour);
+  if (colours.length) {
+    frags.push(namesOrFrag(colours, params, {
+      fastReady: colourFastReady,
+      column: 'colour_names',
+      extractSql: "regexp_replace(cv.val->>'variantKey', '-[^-]+$', '')",
+    }));
+  }
+  // 🆕 F#59 SIZEFACET — المقاس: suffix بعد آخر '-' + الحرس تاع القاموس فالمسار القديم
+  // (vocabGuard = حتى الـEXISTS ما كيماتش مع اسم ماشي مقاس — نفس نتيجة المسار السريع)
+  const sizes = parseSizeParam(q.size);
+  if (sizes.length) {
+    frags.push(namesOrFrag(sizes, params, {
+      fastReady: sizeFastReady,
+      column: 'size_names',
+      extractSql: "regexp_replace(cv.val->>'variantKey', '^.*-', '')",
+      vocabGuard: ` AND regexp_replace(cv.val->>'variantKey', '^.*-', '') ~* '${SIZE_RX_SQL}'`,
+    }));
   }
   return frags;
 };
@@ -5188,8 +5240,7 @@ process.on('uncaughtException', async (err) => {
 //   colour_names = '' فقط → الإقلاعات اللي من بعد = أوتوماتيك خفيف.
 (async () => {
   const t0 = Date.now();
-  // نفس SW_SIZE_ONLY_RX (server.js:2168) بالحرف — منقولة SQL باش العمود ما يتعمرش بالمقاسات
-  const SIZE_RX_SQL = '^(?:xxs|xs|s|m|l|xl|xxl|2xl|3xl|4xl|5xl|6xl|7xl|8xl|\\d{1,4})$';
+  // 🆕 F#59 — SIZE_RX_SQL ولّى module-level (جنب SW_SIZE_ONLY_RX) — مشترك مع الفلاتر
   let colOK = false, fnOK = false, trigOK = false, fillOK = false, ginOK = false;
 
   try {
@@ -5254,6 +5305,74 @@ process.on('uncaughtException', async (err) => {
 
   colourFastReady = colOK && fnOK && trigOK && fillOK && ginOK;
   console.log(`⚡ [FILTERPERF] colour fast-path: ${colourFastReady ? 'ON — فلاتر اللون فـmilliseconds' : 'OFF — EXISTS jsonb كيخدم بالحرف (القديم السليم)'}`);
+
+  // 🆕 F#59 SIZEFACET — نفس البناء تاع colour_names بالحرف لكن بالsuffix (بعد آخر '-')
+  // الفرق الوحيد: العمود كيتعمر غير بأسماء كيطابقو القاموس SW_SIZE_ONLY_RX (whitelist)
+  // — variantKey بلا '-' ("Red" كامل) كيعطي suffix "Red" ماشي مقاس → مرفوض (ما تلوطش)
+  let scolOK = false, sfnOK = false, strigOK = false, sfillOK = false, sginOK = false;
+
+  try {
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS size_names text NOT NULL DEFAULT ''`);
+    scolOK = true;
+    console.log(`⚡ [FILTERPERF] 6/10 column size_names ready (${Date.now() - t0}ms)`);
+  } catch (e) { logger.logError('FILTERPERF size column', e); }
+
+  if (scolOK) try { await pool.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm`); }
+  catch (e) { logger.logError('FILTERPERF size pg_trgm (غير حرج)', e); }
+
+  if (scolOK) try {
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION set_size_names() RETURNS trigger AS $sfn$
+      BEGIN
+        SELECT COALESCE(';' || string_agg(DISTINCT lower(x.sname), ';' ORDER BY lower(x.sname)) || ';', ';')
+          INTO NEW.size_names
+          FROM (
+            SELECT regexp_replace(cv.val->>'variantKey', '^.*-', '') AS sname
+            FROM jsonb_array_elements(
+              CASE WHEN jsonb_typeof(NEW.variants) = 'array' THEN NEW.variants ELSE '[]'::jsonb END
+            ) cv(val)
+            WHERE COALESCE(cv.val->>'variantKey', '') <> ''
+          ) x
+          WHERE x.sname <> '' AND x.sname ~* '${SIZE_RX_SQL}';
+        RETURN NEW;
+      END;
+      $sfn$ LANGUAGE plpgsql
+    `);
+    sfnOK = true;
+    console.log(`⚡ [FILTERPERF] 7/10 function set_size_names ready (${Date.now() - t0}ms)`);
+  } catch (e) { logger.logError('FILTERPERF size function', e); }
+
+  if (sfnOK) try {
+    await pool.query(`DROP TRIGGER IF EXISTS trg_products_size_names ON products`);
+    await pool.query(`CREATE TRIGGER trg_products_size_names BEFORE INSERT OR UPDATE OF variants ON products FOR EACH ROW EXECUTE FUNCTION set_size_names()`);
+    strigOK = true;
+    console.log(`⚡ [FILTERPERF] 8/10 trigger trg_products_size_names ready (${Date.now() - t0}ms)`);
+  } catch (e) { logger.logError('FILTERPERF size trigger', e); }
+
+  if (strigOK) try {
+    const r = await pool.query(`
+      UPDATE products p
+      SET size_names = COALESCE(
+        ';' || (SELECT string_agg(DISTINCT lower(x.sname), ';' ORDER BY lower(x.sname))
+                FROM (SELECT regexp_replace(cv.val->>'variantKey', '^.*-', '') AS sname
+                      FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p.variants) = 'array' THEN p.variants ELSE '[]'::jsonb END) cv(val)
+                      WHERE COALESCE(cv.val->>'variantKey', '') <> '') x
+                WHERE x.sname <> '' AND x.sname ~* '${SIZE_RX_SQL}') || ';',
+        ';')
+      WHERE p.size_names = ''
+    `);
+    sfillOK = true;
+    console.log(`⚡ [FILTERPERF] 9/10 size backfill: ${r.rowCount} صف فـ${Date.now() - t0}ms`);
+  } catch (e) { logger.logError('FILTERPERF size backfill', e); }
+
+  if (sfillOK) try {
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_size_names_trgm ON products USING GIN (size_names gin_trgm_ops)`);
+    sginOK = true;
+    console.log(`⚡ [FILTERPERF] 10/10 size GIN trgm index ready (${Date.now() - t0}ms)`);
+  } catch (e) { logger.logError('FILTERPERF size trgm index', e); }
+
+  sizeFastReady = scolOK && sfnOK && strigOK && sfillOK && sginOK;
+  console.log(`⚡ [FILTERPERF] size fast-path: ${sizeFastReady ? 'ON — فلاتر المقاس فـmilliseconds' : 'OFF — EXISTS jsonb كيخدم بالحرف (القديم السليم)'}`);
 
   // فهارس الثمن/الجديد — غير حرجة (log فقط): planner كيستغلهم أوتوماتيكياً بلا تغيير فالاستعلامات
   try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_price_stock ON products (price) WHERE stock_status = true`); }
