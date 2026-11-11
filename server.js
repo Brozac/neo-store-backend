@@ -2361,6 +2361,56 @@ app.get('/api/merchant-feed-usd.xml', mcFeedHandler('USD'));
 //    feeds تاع merchant (فوق سطرين) خارجة عن الحماية بالتصميم — خاصية Google Shopping)
 app.use('/api/products', productsOriginGuard, productsLimiter);
 
+// ═══ 🆕 F#57-Phase2 — فلاتر الكاتالوگ الحقيقية (سيرفر-سايد) ═══
+// المرحلة 1 (فرونتاند b8a75e3): price/sort كلاينت-سايد فوق المحمل برك.
+// هادي المرحلة 2: السيرفر كيفلتر ويفرز على الكاتالوگ كامل — والعدّاد (?count=1)
+// كيصطلح مع نفس الفلاتر = أرقام صادقة سيرفر-سايد.
+// العقد: 100% backward-compatible — بلا params = السلوك القديم بالحرف.
+//   · minPrice / maxPrice : دولار [0..1000000] — price عمود DECIMAL(10,2) (createTables.js:49)
+//     → مقارنة numeric مباشرة، بلا cast بلا garbage-risk. فيلتر سعر نشيط = price > 0
+//       دايماً (نفس قانون FIX-ZERO تاع الفرونت: $0.00 = بلا سعر = ما كيدخلش فلا فيلتر).
+//   · colour : الاسم قبل آخر '-' في variantKey — نفس استخراج SW_SQL (Kit 30) حرفياً
+//     → EXISTS على variants JSONB · ILIKE exact · escapeLikeSafe · سقف 40 حرف
+//     · مقاس-فقط (XL/42…) مرفوض من دلال — نفس SW_SIZE_ONLY_RX.
+//   · sort : price-asc | price-desc | newest — whitelist صارمة (ماكاينش حقن ORDER BY)
+//     · created_at موجود وممتلئ (probed live 11-11) · id tiebreaker دايماً
+// scope مقصود: page-mode (category + mosaic) وcount=1 برك — limit/search/deals/
+// by-ids والهوم (ROTATE-V1) ما كيتأثروش والو. Neon محمي: CDN s-maxage=60
+// كيخدم على الـ URL الكامل (الفلاتر ضمن المفتاح) — cache miss محدود.
+const CATALOG_SORTS = {
+  'price-asc': 'price ASC, id DESC',
+  'price-desc': 'price DESC, id ASC',
+  'newest': 'created_at DESC, id DESC',
+};
+const parsePriceParam = (v) => {
+  const n = parseFloat(String(v ?? ''));
+  return Number.isFinite(n) && n >= 0 && n <= 1000000 ? Math.round(n * 100) / 100 : null;
+};
+const parseColourParam = (v) => {
+  const c = String(v ?? '').trim().slice(0, 40);
+  return c && !SW_SIZE_ONLY_RX.test(c) ? c : '';
+};
+// كيبني fragments تاع WHERE (بلا AND) وكيخلي params يتعمراو بالترتيب —
+// LIMIT/OFFSET كيتزادو من بعد بـ params.length + 1 / + 2
+const buildCatalogFilters = (q, params) => {
+  const frags = [];
+  const minP = parsePriceParam(q.minPrice);
+  const maxP = parsePriceParam(q.maxPrice);
+  if (minP !== null || maxP !== null) frags.push('price > 0'); // FIX-ZERO سيرفر-سايد
+  if (minP !== null) { params.push(minP); frags.push(`price >= $${params.length}`); }
+  if (maxP !== null) { params.push(maxP); frags.push(`price <= $${params.length}`); }
+  const colour = parseColourParam(q.colour);
+  if (colour) {
+    params.push(escapeLikeSafe(colour));
+    frags.push(`EXISTS (
+      SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(variants) = 'array' THEN variants ELSE '[]'::jsonb END) cv(val)
+      WHERE regexp_replace(cv.val->>'variantKey', '-[^-]+$', '') ILIKE $${params.length}
+    )`);
+  }
+  return frags;
+};
+const sortSqlFor = (q) => CATALOG_SORTS[String(q.sort || '').trim().toLowerCase()] || null;
+
 app.get('/api/products', async (req, res) => {
   try {
     const search = req.query.search || '';
@@ -2396,11 +2446,17 @@ app.get('/api/products', async (req, res) => {
 
       // 🆕 category mode — فئات كبار بلا سقف (BL-CAT-SCROLL)
       if (cat && cat !== 'All') {
+        // 🆕 F#57-Phase2 — فلاتر سيرفر-سايد: بلا params = نفس SQL القديم بالحرف
+        const params = [`${escapeLikeSafe(cat)}%`];
+        const whereExtra = buildCatalogFilters(req.query, params);
+        const sortSql = sortSqlFor(req.query);
         const { rows } = await pool.query(
           `SELECT id, title, price, original_price, image_url, category, video_url${SW_SQL}
            FROM products WHERE stock_status = true AND category ILIKE $1
-           ORDER BY sort_order ASC, id DESC LIMIT $2 OFFSET $3`,
-          [`${escapeLikeSafe(cat)}%`, PER, (pageNum - 1) * PER]  // 🩹 FIX-LIKE
+           ${whereExtra.length ? 'AND ' + whereExtra.join(' AND ') : ''}
+           ${sortSql ? 'ORDER BY ' + sortSql : 'ORDER BY sort_order ASC, id DESC'}
+           LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          [...params, PER, (pageNum - 1) * PER]  // 🩹 FIX-LIKE
         );
         res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
         return res.json(withSwatches(rows));
@@ -2411,12 +2467,18 @@ app.get('/api/products', async (req, res) => {
       // 🩹 FIX-TIE — `, id DESC` tiebreaker: نظرياً md5 collision غير مستحيل رياضياً — الباب تسدّ
       // 📌 تكلفة موثقة: hash+sort كامل فوق الجدول في كل cache miss — البديل المستقبلي:
       //    عمود shuffle bucket يُحفظ عند massSync (يقتل الحساب الكامل)
+      // 🆕 F#57-Phase2 — فلاتر سيرفر-سايد على الـ mosaic؛ sort صريح كيبدل التدوير
+      // md5 (بلا sort = التدوير الحتمي كيبقى كما هو — ROTATE منطق ما تلمسش)
+      const mosaicParams = [];
+      const mosaicWhere = buildCatalogFilters(req.query, mosaicParams);
+      const mosaicSort = sortSqlFor(req.query);
       const { rows } = await pool.query(
         `SELECT id, title, price, original_price, image_url, category, video_url${SW_SQL}
          FROM products WHERE stock_status = true
-         ORDER BY md5(category || id::text), id DESC
-         LIMIT $1 OFFSET $2`,
-        [PER, (pageNum - 1) * PER]
+         ${mosaicWhere.length ? 'AND ' + mosaicWhere.join(' AND ') : ''}
+         ORDER BY ${mosaicSort || 'md5(category || id::text), id DESC'}
+         LIMIT $${mosaicParams.length + 1} OFFSET $${mosaicParams.length + 2}`,
+        [...mosaicParams, PER, (pageNum - 1) * PER]
       );
       res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
       return res.json(withSwatches(rows));
@@ -2425,10 +2487,19 @@ app.get('/api/products', async (req, res) => {
     // 🆕 عدّاد الفئة — للـ header ("3,528 products")
     if (req.query.count === '1') {
       const cat = (req.query.category || '').trim();
-      const sql = cat && cat !== 'All'
-        ? ['SELECT COUNT(*)::int AS n FROM products WHERE stock_status = true AND category ILIKE $1', [`${escapeLikeSafe(cat)}%`]]  // 🩹 FIX-LIKE
-        : ['SELECT COUNT(*)::int AS n FROM products WHERE stock_status = true', []];
-      const { rows } = await pool.query(sql[0], sql[1]);
+      // 🆕 F#57-Phase2 — العدّاد الصادق: نفس فلاتر page-mode (price/colour) —
+      // useInfiniteFeed كيجيب {count} حقيقي مع الفلاتر المطبقة (ماكاينش إخلاص)
+      const countParams = [];
+      const countWhere = buildCatalogFilters(req.query, countParams);
+      let sql, cParams;
+      if (cat && cat !== 'All') {
+        cParams = [`${escapeLikeSafe(cat)}%`, ...countParams];  // 🩹 FIX-LIKE
+        sql = `SELECT COUNT(*)::int AS n FROM products WHERE stock_status = true AND category ILIKE $1${countWhere.length ? ' AND ' + countWhere.join(' AND ') : ''}`;
+      } else {
+        cParams = countParams;
+        sql = `SELECT COUNT(*)::int AS n FROM products WHERE stock_status = true${countWhere.length ? ' AND ' + countWhere.join(' AND ') : ''}`;
+      }
+      const { rows } = await pool.query(sql, cParams);
       return res.json({ count: rows[0].n });
     }
 
