@@ -146,11 +146,16 @@ const productsOriginGuard = (req, res, next) => {
   }
   next();
 };
-// 90 طلب/دقيقة/IP على مسارات /api/products كلهم — الزائر الحقيقي بعيد على الحد
-//   (صفحة منتج = ~3 نداءات · infinite feed كيدخل فوق 40/دقيقة حتى في التمرير السريع)
-//   معفى: minimal=1 (سايتماپ Google — كسرها = ضرر SEO · الpayload تاعها ids+dates برك)
+// 🩹 F#62 CRAWLFIX — 90 طلب/دقيقة/IP على مسارات السحب الجماعي برك (الليستة/by-ids/deals):
+//   الزائر الحقيقي بعيد على الحد (صفحة منتج = نداءات عنصر-واحد معفاة · infinite feed
+//   كيدخل فوق 40/دقيقة حتى في التمرير السريع — الليستة هي اللي كيتحملها)
+//   معفى من الـ limiter كلياً: /api/products/:id و/related — القصة المثبتة بالأرقام:
+//   زحفة Merchant Center يوم 8/11 ضربت السطل المشترك تاع SSR → 429 بالجملة →
+//   الفرونت سلمت 404 دائمي → Google رفض 27.4K منتج «Product page unavailable»
+//   + معفى: minimal=1 (سايتماپ Google — كسرها = ضرر SEO · الpayload تاعها ids+dates برك)
 //   📌 المهاجم الراضي: 90×50 = 4,500 منتج/دقيقة كحد أقصى + 429 من بعد — مقابل سابقاً
-//   200× unlimited = كل الكاطالوگ في ثواني
+//   200× unlimited = كل الكاطالوگ في ثواني (العنصر الواحد ما يعطي والو للكلونر —
+//   الكاطالوگ كامل كيتسحب من الليستة برك، وهي اللي مازالة محمية)
 const productsLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 90,
@@ -2359,10 +2364,14 @@ const mcFeedHandler = (cur) => async (req, res) => {
 app.get('/api/merchant-feed.xml', mcFeedHandler('DZD'));
 app.get('/api/merchant-feed-usd.xml', mcFeedHandler('USD'));
 
-// ═══ 🆕 F#55 AntiClone — التركيب فوق مسارات /api/products كلهم ═══
+// ═══ 🆕 F#55 AntiClone → 🩹 F#62 CRAWLFIX — الحارس فوق الكل، الـ limiter على السحب الجماعي برك ═══
 //   (عقد الترتيب مثل FIX-SHADOW: يبقى فوق — by-ids وdeals و:id وrelated كامل تحتو ·
 //    feeds تاع merchant (فوق سطرين) خارجة عن الحماية بالتصميم — خاصية Google Shopping)
-app.use('/api/products', productsOriginGuard, productsLimiter);
+//   · productsOriginGuard → /api/products كاملهم (كلونر بأي Origin أجنبي = 403 فوراً)
+//   · productsLimiter (90/min) → كيركب يدوياً غير على الليستة/by-ids/deals تحت —
+//     العنصر الواحد (:id · :id/related) معفى = Googlebot وSSR ما كيدخلو للسطل المشترك
+//     تاع الـ egress IP تاع Worker (بلا cf-connecting-ip = req.ip واحد للجميع)
+app.use('/api/products', productsOriginGuard);
 
 // ═══ 🆕 F#57-Phase2 — فلاتر الكاتالوگ الحقيقية (سيرفر-سايد) ═══
 // المرحلة 1 (فرونتاند b8a75e3): price/sort كلاينت-سايد فوق المحمل برك.
@@ -2478,7 +2487,7 @@ const buildCatalogFilters = (q, params) => {
 };
 const sortSqlFor = (q) => CATALOG_SORTS[String(q.sort || '').trim().toLowerCase()] || null;
 
-app.get('/api/products', async (req, res) => {
+app.get('/api/products', productsLimiter, async (req, res) => {
   try {
     const search = req.query.search || '';
     const category = req.query.category || 'All';
@@ -2631,7 +2640,7 @@ app.get('/api/products', async (req, res) => {
 });
 
 // ═══ 🆕 Favorites by-ids — N+1 kill: الصفحة كيطلب غير المفضلة (KB بدل الكاتالوغ كامل) ═══
-app.get('/api/products/by-ids', async (req, res) => {
+app.get('/api/products/by-ids', productsLimiter, async (req, res) => {
   try {
     // 🩹 FIX-IDS-BOUND — حدّ int32: id أكبر من 2147483647 كان يفجّر cast $1::int[] → 500
     const ids = String(req.query.ids || '')
@@ -2655,7 +2664,7 @@ app.get('/api/products/by-ids', async (req, res) => {
   }
 });
 
-app.get('/api/products/deals', async (req, res) => {
+app.get('/api/products/deals', productsLimiter, async (req, res) => {
   try {
     const result = await pool.query("SELECT id, title, price, original_price, image_url FROM products WHERE stock_status = true AND is_sourced = true ORDER BY id DESC LIMIT 10");
     // 🩹 FIX-DEALSCACHE — كان بلا كاش: كل زائر deals = ضربة DB
