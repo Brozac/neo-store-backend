@@ -2313,22 +2313,76 @@ function mcItem(p, rate, cur) {
   ].filter(Boolean).join('\n');
 }
 
+// ═══ 🩹 F#65 FEEDCACHE (2026-11-13) — كاش الفيد ضد حرق Egress تاع Supabase ═══
+// المشكل (ثابت بالأرقام): كل جلب تاع MC = 44MB egress — فأزمة المراجعة كيجلب 5-20×/يوم
+//   للفيدان = 220-880MB/يوم على نفس المحتوى (الداشبورد: 3.58/5GB).
+// الحل: أول جلب كيتولّد حي وكيتسجل فـ /tmp — الجلبات الأخرى فـ TTL كيتقرو من الملف
+//   = صفر قراءة من الداتابيز. التجديد: أوتوماتيك من بعد كرون الـ 3ص (الأسعار/المخزون).
+// Kill-switch: FEED_CACHE='0' → توليد حي دايماً · TTL: FEED_CACHE_HOURS (default 24)
+// chunk= كيبقى حي دايماً (خطة بديلة) · متزامن: الجلب الثاني كيتولّد حي بلا ما يكتب الكاش
+const __feedFs = require('fs');
+const FEED_CACHE_TTL_MS = (Number(process.env.FEED_CACHE_HOURS) || 24) * 3600000;
+const feedCachePath = (cur) => `/tmp/feed-cache-${cur}.xml`;
+const __feedRegen = { DZD: false, USD: false }; // قفل: توليد واحد كاتب فنفس الوقت
+
+function mcFeedCacheValid(cur) {
+  try {
+    const st = __feedFs.statSync(feedCachePath(cur));
+    return (Date.now() - st.mtimeMs < FEED_CACHE_TTL_MS) ? st : null;
+  } catch (e) { return null; }
+}
+
 // v30: مصنع الهاندلر — نفس الجنيراتور للجوج العملات (chunk= كيبقى يخدم في الزوج)
 const mcFeedHandler = (cur) => async (req, res) => {
+  let ws = null, tmpFile = null, genComplete = false;
   try {
     const size = Math.min(Math.max(parseInt(req.query.size, 10) || 5000, 100), 20000);
     const chunkParam = parseInt(req.query.chunk, 10);
     const hasChunk = Number.isFinite(chunkParam) && chunkParam >= 0;
+    const cacheable = !hasChunk && process.env.FEED_CACHE !== '0';
 
     res.set('Content-Type', 'application/xml; charset=utf-8');
     res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400');
-    res.write('<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">\n<channel>\n<title>Laclarc Products</title>\n<link>https://laclarc.com</link>\n<description>Laclarc catalog — free worldwide express shipping</description>\n');
+
+    // 🩹 F#65 HIT — الفيد كامل من الملف = صفر egress من الداتابيز
+    if (cacheable) {
+      const st = mcFeedCacheValid(cur);
+      if (st) {
+        res.set('X-Feed-Cache', 'HIT');
+        const stream = __feedFs.createReadStream(feedCachePath(cur));
+        stream.on('error', () => { try { res.status(500).end(); } catch (e) {} });
+        stream.pipe(res);
+        console.log(`[merchant-feed] FEEDCACHE HIT feed=${cur} age=${Math.round((Date.now() - st.mtimeMs) / 3600000)}h size=${Math.round(st.size / 1048576)}MB`);
+        return;
+      }
+      res.set('X-Feed-Cache', 'MISS');
+    }
 
     const rate = cur === 'USD' ? 1 : await mcRate(); // 🆕 v30: الدولار = بلا تحويل بلا fetch
     const BATCH = 5000;
     let offset = hasChunk ? chunkParam * size : 0;
     const cap = hasChunk ? offset + size : Infinity;
     let written = 0;
+
+    // 🩹 F#65 — التوليد الحي كيتكتب بالتوازي فالملف (أول واحد برك كيكتب — القفل)
+    const useCache = cacheable && !__feedRegen[cur];
+    if (useCache) {
+      __feedRegen[cur] = true;
+      tmpFile = `${feedCachePath(cur)}.${Date.now()}.tmp`;
+      ws = __feedFs.createWriteStream(tmpFile);
+      ws.on('close', () => { // كيوقع فالنجاح والفشل بجوج — بلاصة وحدة للحسم
+        try {
+          if (genComplete && __feedFs.existsSync(tmpFile) && __feedFs.statSync(tmpFile).size > 100) {
+            __feedFs.renameSync(tmpFile, feedCachePath(cur));
+            console.log(`[merchant-feed] FEEDCACHE SAVED feed=${cur}`);
+          } else { try { __feedFs.unlinkSync(tmpFile); } catch (e) {} }
+        } catch (e) { console.warn('FEEDCACHE finalize:', e.message); }
+        __feedRegen[cur] = false;
+      });
+    }
+    const w2 = (s) => { if (ws) ws.write(s); return res.write(s); };
+
+    w2('<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">\n<channel>\n<title>Laclarc Products</title>\n<link>https://laclarc.com</link>\n<description>Laclarc catalog — free worldwide express shipping</description>\n');
 
     while (offset < cap) {
       const limit = Math.min(BATCH, hasChunk ? cap - offset : BATCH);
@@ -2340,7 +2394,7 @@ const mcFeedHandler = (cur) => async (req, res) => {
       const batchXml = rows.map((p) => mcItem(p, rate, cur)).filter(Boolean).join('\n');
       if (batchXml) {
         // backpressure — نستناو drain باش الذاكرة ما تطيحش مع كليان بطيء
-        if (!res.write(batchXml + '\n')) {
+        if (!w2(batchXml + '\n')) {
           await new Promise((resolve) => res.once('drain', resolve));
         }
         written += batchXml.split('<item>').length - 1;
@@ -2349,10 +2403,14 @@ const mcFeedHandler = (cur) => async (req, res) => {
       if (rows.length < limit) break;
     }
 
+    genComplete = true;
     res.end('</channel>\n</rss>');
-    console.log(`[merchant-feed] feed=${cur} written=${written} rate=${rate} mode=${hasChunk ? `chunk=${chunkParam}` : 'ALL'}`);
+    try { if (ws) ws.end('</channel>\n</rss>\n'); } catch (e) { try { ws.destroy(); } catch (e2) {} }
+    console.log(`[merchant-feed] feed=${cur} written=${written} rate=${rate} mode=${hasChunk ? `chunk=${chunkParam}` : 'ALL'}${useCache ? ' +FEEDCACHE' : cacheable ? ' (regen busy — live)' : ''}`);
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ merchant-feed error:', err);
+    genComplete = false;
+    try { if (ws) ws.destroy(); } catch (e) {}
     try { res.end('</channel>\n</rss>'); } catch (e) { /* socket راح */ }
   }
 };
@@ -3887,6 +3945,9 @@ cron.schedule('0 3 * * *', async () => {
       } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} console.error('🔴 [PriceSync] product ' + (p && p.id) + ' FAILED: ' + e.message); }
     }
     clearProductsCache();
+    // 🩹 F#65 — فالكاش تاع الفيد باش يتجدد من بعد تحديث الأسعار/المخزون اليومي
+    try { __feedFs.unlinkSync(feedCachePath('DZD')); } catch (e) {}
+    try { __feedFs.unlinkSync(feedCachePath('USD')); } catch (e) {}
     console.log('✅ [Auto-Cron] Daily product update completed!');
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ [Auto-Cron] Error updating products:', err.message);
