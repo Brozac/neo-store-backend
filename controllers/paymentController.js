@@ -3,7 +3,7 @@
 //   • REMOVED /api/payment/stripe (dead — all 4 frontend callers use /api/create-checkout-session)
 //   • REMOVED /api/payment/gateways (dead — PaymentModal uses paymentGateways router)
 //   • NOWPAYMENTS 503-gate (crypto route fails loud & clean when key missing)
-//   • Paysera callback: amount verification + timingSafeEqual
+//   • F#68: Paysera REMOVED entirely (checkout + callback) — Stripe هو البوابة المعتمدة
 //   • Crypto callback: address-guard (paid without shipping address → manual, never ships to N/A)
 //   • checkoutLimiter on all payment entry routes
 //   • coupon cache DB-backed (FIX#12 — matches server.js)
@@ -209,146 +209,7 @@ function getOptionalUser(req) {
 }
 
 // ==========================================
-// 2. Paysera Checkout & Callback
-// ==========================================
-router.post('/paysera', checkoutLimiter, async (req, res) => {
-  try {
-    const { items: clientItems, couponCode } = req.body;
-    const utm = extractUtm(req.body);
-    const optionalUser = getOptionalUser(req);
-
-    const { secureItems, serverTotal } = await prepareSecureItems(pool, clientItems);
-    const { total: chargeTotal } = await applyCouponToTotal(pool, couponCode, serverTotal);
-
-    const orderResult = await pool.query(
-      `INSERT INTO orders (customer_name, customer_email, shipping_address, total_amount, status, payment_method, user_id, utm_source, utm_medium, utm_campaign, click_id)
-       VALUES ($1, $2, $3, $4, $5, 'Paysera', $6, $7, $8, $9, $10) RETURNING id, order_number`,
-      ['Pending Paysera', 'pending@laclarc.com', 'Pending', chargeTotal, 'pending', optionalUser ? optionalUser.id : null, utm.source, utm.medium, utm.campaign, utm.clickId]
-    );
-    const orderId = orderResult.rows[0].id;
-    const orderNumber = orderResult.rows[0].order_number;
-
-    for (const item of secureItems) {
-      await pool.query(
-        "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, vid) VALUES ($1, $2, $3, $4, $5)",
-        [orderId, item.id, item.quantity, item.price, item.vid]
-      );
-    }
-
-    const data = {
-      projectid: process.env.PAYSERA_PROJECT_ID,
-      // 🩹 FIX 18-B — orderid واحد فقط (كان مكرر: JS كياخد الأخير = LC-...) — Task 18
-      amount: Math.round(chargeTotal * 100),
-      currency: 'USD',
-      accepturl: `${process.env.FRONTEND_URL}/success?method=paysera`,
-      cancelurl: `${process.env.FRONTEND_URL}/cart`,
-      callbackurl: `${process.env.BACKEND_URL}/api/payment/paysera/callback`,
-      test: process.env.NODE_ENV === 'production' ? 0 : 1,
-      orderid: orderNumber || String(orderId),
-    };
-
-    const encodedData = Buffer.from(
-      Object.entries(data).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&')
-    ).toString('base64');
-
-    const sign = crypto.createHash('md5')
-      .update(encodedData + process.env.PAYSERA_PASSWORD)
-      .digest('hex');
-
-    const payseraUrl = `https://www.paysera.com/pay/?data=${encodedData}&sign=${sign}`;
-    res.json({ url: payseraUrl });
-  } catch (error) {
-    logger.logError('Paysera Error', error);
-    res.status(500).json({ error: 'Payment processing failed' });
-  }
-});
-
-router.get('/paysera/callback', async (req, res) => {
-  try {
-    const { data, ss1 } = req.query;
-    if (!data || !ss1) return res.status(400).send('Bad parameters');
-
-    const expectedSign = crypto.createHash('md5')
-      .update(data + process.env.PAYSERA_PASSWORD)
-      .digest('hex');
-
-    const a = Buffer.from(expectedSign), b = Buffer.from(String(ss1));
-    const signOk = a.length === b.length && crypto.timingSafeEqual(a, b);
-    if (!signOk) return res.status(400).send('Bad signature');
-
-    const decodedStr = Buffer.from(data, 'base64').toString('utf8');
-    const params = new URLSearchParams(decodedStr);
-    const orderId = params.get('orderid');
-    const status = params.get('status');
-
-    // 🩹 FIX 18-B2 — orderid من Payserا يمكن يكون LC-... (الطلبات الحية) ولا رقم — حلول آمن للاتنين
-    let orderDbId = null, orderRow = null;
-    if (/^\d+$/.test(String(orderId))) {
-      orderDbId = parseInt(orderId, 10);
-      const byId = await pool.query('SELECT id, total_amount FROM orders WHERE id = $1', [orderDbId]);
-      orderRow = byId.rows[0] || null;
-    } else {
-      const byNum = await pool.query('SELECT id, total_amount FROM orders WHERE order_number = $1 LIMIT 1', [String(orderId)]);
-      if (byNum.rows.length > 0) { orderDbId = byNum.rows[0].id; orderRow = byNum.rows[0]; }
-    }
-    if (!orderRow || !orderDbId) { res.send('OK'); return; }
-
-    if (status === '1') {
-      const paidCents = parseInt(params.get('amount'), 10) || 0;
-      const expectedCents = Math.round(Number(orderRow.total_amount) * 100);
-
-      if (paidCents + 50 < expectedCents) {
-        await pool.query(
-          "UPDATE orders SET status = 'manual', manual_since = NOW() WHERE id = $1 AND status = 'pending'",
-          [orderDbId]
-        );
-        await auditEvent('PAYSERA_AMOUNT_MISMATCH', orderDbId, { paidCents, expectedCents }, 'critical');
-        logger.logError('Paysera Callback: amount mismatch', new Error(`paid=${paidCents} expected=${expectedCents}`));
-        res.send('OK');
-        return;
-      }
-
-      const updateRes = await pool.query(
-        "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING *",
-        [orderDbId]
-      );
-
-      if (updateRes.rows.length > 0) {
-        const order = updateRes.rows[0];
-        res.send('OK');
-
-        (async () => {
-          try {
-            const itemsRes = await pool.query(`SELECT oi.*, p.title, p.image_url FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`, [orderDbId]);
-            const items = itemsRes.rows;
-
-            const cjResponse = await fulfillCJOrder(orderDbId, order.customer_name, {
-              address: { line1: order.shipping_address || 'Online Store Purchase', country: 'US' }
-            }, items);
-
-            if (cjResponse && cjResponse.success) {
-              console.log(`📤 [Paysera] #${orderId} مقبول فـ CJ (${cjResponse.orderNumber}) — ننتظر ORDER/SHIPPED webhook`);
-            }
-
-            if (order.customer_email) {
-              await sendOrderConfirmationEmail(order.customer_email, orderDbId, order.total_amount, items);
-            }
-          } catch (bgErr) {
-            logger.logError('Paysera Fulfillment (Background)', bgErr);
-          }
-        })();
-        return;
-      }
-    }
-    res.send('OK');
-  } catch (error) {
-    logger.logError('Paysera Callback Error', error);
-    res.status(500).send('Error');
-  }
-});
-
-// ==========================================
-// 3. Crypto (NowPayments) Checkout & IPN
+// 2. Crypto (NowPayments) Checkout & IPN
 // 🆕 v2 — بيانات الزبون تُجمع قبل الفاتورة → fulfillment آلي حقيقي
 // ==========================================
 router.post('/crypto', checkoutLimiter, async (req, res) => {
@@ -693,7 +554,7 @@ router.post('/crypto/verify', checkoutLimiter, async (req, res) => {
 });
 
 // ==========================================
-// 4. BaridiMob / CCP (Manual Upload - Algeria)
+// 3. BaridiMob / CCP (Manual Upload - Algeria)
 // 🆕 v2 — يقبل verified_amount/declared_amount/mismatch من الواجهة (audit trail)
 //         receipts في Cloudinary ✓ (anti-ephemeral — مؤكد)
 // ==========================================

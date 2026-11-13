@@ -4,7 +4,7 @@
 //          gold #C9A96A (stars) · roseText #B05C5C (prices/discount) · green #7C9E85 (free) · greenBright #88C83C (trust)
 // Brand word: Marcellus serif uppercase (site .font-brand) — body: system sans (Tailwind default)
 // Header = نسخة طبق الأصل من Navbar: شريط إعلانات #2E4057 + غراديان #2E4057→#5B7EA6→#2E4057 + لوجو icon-512 في بوك أبيض
-// Footer = نسخة طبق الأصل من Footer.tsx: #22303F + روابط Storefront/Trust + © Powered by Stripe, Paysera, and NowPayments
+// Footer = نسخة طبق الأصل من Footer.tsx: #22303F + روابط Storefront/Trust + © Powered by Stripe and NowPayments (F#68: Paysera تحيدت)
 // Table-based layout · inline CSS only · 600px · Outlook/Gmail-safe (no flex, no grid, no background-image text)
 
 'use strict';
@@ -184,7 +184,7 @@ function siteFooter() {
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="border-top:1px solid ${C.footerLine};">
                       <tr>
                         <td align="center" style="padding:14px 0 0;">
-                          <p style="margin:0;font-family:${F_BODY};font-size:10px;color:${C.footerTx};line-height:1.8;">&copy; ${year} <strong style="color:#FFFFFF;">Laclarc</strong>. All rights reserved. Powered by Stripe, Paysera, and NowPayments.</p>
+                          <p style="margin:0;font-family:${F_BODY};font-size:10px;color:${C.footerTx};line-height:1.8;">&copy; ${year} <strong style="color:#FFFFFF;">Laclarc</strong>. All rights reserved. Powered by Stripe and NowPayments.</p>
                           <p style="margin:6px 0 0;font-family:${F_BODY};font-size:10px;font-weight:bold;color:${C.footerTx};letter-spacing:0.5px;">Visa &amp; MasterCard &nbsp;&middot;&nbsp; Apple Pay &nbsp;&middot;&nbsp; USDT &amp; Crypto</p>
                         </td>
                       </tr>

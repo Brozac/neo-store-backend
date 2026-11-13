@@ -4328,6 +4328,7 @@ cron.schedule('0 * * * *', async () => {
 
   try {
     // تنظيف طلبات Stripe, Paysera, Crypto المعلقة لأكثر من ساعتين
+    // F#68: 'Paysera' باقة هنا عمداً (LEGACY) — باش الطلبات القديمة المعلقة تتمسح، ما كيصنعش جداد
     const result = await pool.query(`
       UPDATE orders
       SET status = 'expired'

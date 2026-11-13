@@ -717,7 +717,8 @@ async function financialGate(orderId) {
       return { allow: true };
     }
 
-    // ─── Paysera ───
+    // ─── Paysera (LEGACY — F#68: البوابة تحيدت نهائياً؛ الفرع خدام برك باش الطلبات القديمة
+    //      اللي خلاصو قبل الحيد يبقاو يتوفرو ما يطيحوش فـ Unknown→DENY — ما كيصنعش طلبات جداد) ───
     if (/paysera/i.test(method)) {
       const ok = o.payment_status === 'paid' || String(o.status) === 'paid';
       console.log(`[FinGate] #${orderId} PAYSERA db_status=${o.status}/${o.payment_status} => ${ok ? 'ALLOW (callback-signed)' : 'DENY'}`);
