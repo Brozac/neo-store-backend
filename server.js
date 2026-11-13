@@ -35,6 +35,14 @@ const logger = require('./logger');
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
 const templates = require('./emails/templates'); // 🎨 SERENE email design system (F#84) — all customer emails in English
 const shipTruth = require('./services/shipTruth'); // كان مستعمل بلا require → ReferenceError → 500 دايماً
+
+// 🧼 F70-descfix: فك الـ double-encoding تاع HTML entities الجاية من CJ — &amp;nbsp; تولي space، و&amp;X; تولي &X; (single-encoded صحيح)
+function decodeDoubleEntities(s) {
+  if (typeof s !== 'string') return s;
+  return s
+    .replace(/&amp;nbsp;/gi, ' ')
+    .replace(/&amp;([a-zA-Z]+|#\d+|x[0-9a-fA-F]+);/g, '&$1;');
+}
 const multer = require('multer');
 const path = require('path');
 const cloudinary = require('cloudinary').v2;
@@ -1002,7 +1010,7 @@ app.post('/api/admin/add-product', async (req, res) => {
 
     // 🩹 قرار 2: material بلا شعار مجاني · description بلا filler
     const safeMaterial = (material && String(material).trim()) || '';
-    const safeDescription = (description && String(description).trim()) || '';
+    const safeDescription = decodeDoubleEntities((description && String(description).trim()) || '');
 
     await pool.query(
       `INSERT INTO products (title, price, original_price, image_url, images, variants, colors, sizes, stock_status, cj_product_id, description, material, category)
@@ -1685,7 +1693,7 @@ app.post('/api/admin/sync-single-product', async (req, res) => {
          image_url=EXCLUDED.image_url, images=EXCLUDED.images, variants=EXCLUDED.variants,
          colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status,
          description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category, is_sourced=true`,
-      [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, details.description, material, categorySlug]
+      [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, decodeDoubleEntities(details.description), material, categorySlug]
     );
 
     clearProductsCache();
@@ -1775,7 +1783,7 @@ async function runCjProductSync(keyword) {
              colors=EXCLUDED.colors, sizes=EXCLUDED.sizes, stock_status=EXCLUDED.stock_status,
              description=EXCLUDED.description, material=EXCLUDED.material, category=EXCLUDED.category,
              video_url=EXCLUDED.video_url, cj_category_id=EXCLUDED.cj_category_id`,
-          [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, details.description, material, categorySlug, videoUrl, cjCategoryId]
+          [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, decodeDoubleEntities(details.description), material, categorySlug, videoUrl, cjCategoryId]
         );
 
         importedCount++;
@@ -3484,7 +3492,7 @@ app.put('/api/admin/update-product/:id', async (req, res) => {
     // ⚠️ موثق: يفرغ الحقول الغائبة — Backlog: dynamic SET للأعمدة المرسلة فقط
     await pool.query(
       `UPDATE products SET title = $1, price = $2, original_price = $3, image_url = $4, images = $5, description = $6, material = $7, colors = $8, sizes = $9, category = $10 WHERE id = $11`,
-      [String(title).trim(), parsedPrice, safeOriginal, image_url || null, images || null, description || null, material || null, colors || null, sizes || null, category || 'other', id]
+      [String(title).trim(), parsedPrice, safeOriginal, image_url || null, images || null, decodeDoubleEntities(description || null), material || null, colors || null, sizes || null, category || 'other', id]
     );
     clearProductsCache();
     res.json({ message: 'Product updated successfully' });
@@ -4636,7 +4644,7 @@ cron.schedule('0 5 * * *', async () => {
               ON CONFLICT (cj_product_id) DO NOTHING
             `, [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage,
                 details.productImageSet, JSON.stringify(details.variants || []),
-                parsedData.colors, parsedData.sizes, details.pid, details.description,
+                parsedData.colors, parsedData.sizes, details.pid, decodeDoubleEntities(details.description),
                 'Premium Quality', categorySlug, videoUrl, details.categoryId]);
 
             imported++;
@@ -4787,7 +4795,7 @@ cron.schedule('0 5 * * *', async () => {
               p.bigImage,
               [], // images تُستكمل في Product Details fetch
               pid,
-              p.description || 'High quality product from Laclarc Global Catalog.',
+              decodeDoubleEntities(p.description || 'High quality product from Laclarc Global Catalog.'),
               categorySlug.toLowerCase().replace(/\s+/g, '-'),
               // 🩹 FIX [sales_count-int] — كان هنا `true` (is_sourced) بلا placeholder: الـ SQL يجتاز is_sourced
               //    كـ literal أصلاً → هاد true طاح على $9 = sales_count (INTEGER) →
