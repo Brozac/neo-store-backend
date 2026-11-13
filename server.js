@@ -2144,7 +2144,7 @@ app.get('/api/search', async (req, res) => {
   if (q.length < 1) return res.json([]);
 
   try {
-    const result = await pool.query("SELECT id, title, price, image_url FROM products WHERE stock_status = true AND (title ILIKE $1 OR description ILIKE $1) ORDER BY id DESC LIMIT 5", [`%${q}%`]);
+    const result = await pool.query("SELECT id, title, price, image_url FROM products WHERE stock_status = true AND title ILIKE $1 ORDER BY id DESC LIMIT 5", [`%${q}%`]);
     res.json(result.rows);
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
@@ -2721,7 +2721,7 @@ app.get('/api/products', productsLimiter, async (req, res) => {
     let paramIndex = 1;
 
     if (search) {
-      query += ` AND (title ILIKE $${paramIndex} OR description ILIKE $${paramIndex})`;
+      query += ` AND title ILIKE $${paramIndex}`;
       params.push(`%${escapeLikeSafe(search)}%`);  // 🩹 FIX-LIKE — wildcards مقفولة
       paramIndex++;
     }
