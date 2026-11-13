@@ -697,7 +697,9 @@ async function flushStockUpdates() {
     try {
       const available = totalQty > 0;
       const res = await pool.query(
-        'UPDATE products SET stock_status = $1 WHERE cj_product_id = $2 RETURNING id',
+        // 🩹 F#69 — حارس الـ no-op: إلا المخزون ما تبدلش → بلا rewrite بلا dead tuples.
+        // RETURNING كيرجع صف غير فالانتقال الحقيقي — نفس دلالة hidden الأصلية بالضبط
+        'UPDATE products SET stock_status = $1 WHERE cj_product_id = $2 AND stock_status IS DISTINCT FROM $1 RETURNING id',
         [available, pid]
       );
       if (res.rows.length > 0 && !available) {

@@ -921,10 +921,60 @@ let productsCache = null;
 let cacheTime = 0;
 const CACHE_TTL = 60000;
 
+// ═══ 🩹 F#69 EGRESSGUARD — LRU كاش للـ PDP والـ related ضد حرق Egress تاع Supabase ═══
+// الثابت من pg_stat_statements (13/11/2026):
+//   · 167,138 نداء related ×196ms متوسط = 9.1 ساعة CPU + ~350MB egress
+//   · 166k نداء SELECT * منتج كامل (الوصف/الصور/الvariants) = ~0.6-1GB egress
+// السبب الجذري: كاش KV (ISR) تاع Cloudflare معطّل عملياً — free KV = 1,000 كتابة/يوم
+// وكل صفحة منتج باردة كتحاول تكتب 3 مفاتيح (الصفحة + product fetch + related fetch)
+// → الكوتا كتموت فأول ~333 صفحة/يوم → كل الزيارة كتولّد من جديد وكتضرب الباك.
+// الحل هنا (بلا ما نمسّ الفرونت): LRU فذاكرة الباك قدّام الداتابيز:
+//   · __pdpCache  — SELECT * صف كامل — TTL 10 دقايق · سقف 1,000 منتج (~8-15MB RAM)
+//     الطزاجة محفوظة: شراء كيقرا حي من prepareSecureItems (عقد stock_status=true)،
+//     والأدمن/الكرونات/Webhooks كينقّيو عبر clearProductsCache (20 نقطة موجودة)
+//   · __relCache  — 8 منتجات مقترحة — TTL 6 ساعات · سقف 3,000 منتج (~6MB RAM)
+// null كيتكاشى حتّا هو (منتجات محيوفة — Googlebot كيحاول يزحف عليهم بلا همة)
+const __lruMake = (max, ttlMs) => {
+  const map = new Map();
+  const inflight = new Map();
+  let gen = 0;
+  return {
+    async get(key, loader) {
+      const hit = map.get(key);
+      if (hit) {
+        if (Date.now() < hit.exp) { // LRU touch — المفتاح المطلوب كيطلع للـ MRI
+          map.delete(key); map.set(key, hit); return hit.v;
+        }
+        map.delete(key);
+      }
+      const pending = inflight.get(key);
+      if (pending) return pending; // single-flight — burst على نفس المفتاح = ضربة DB وحدة
+      const myGen = gen;
+      const p = (async () => {
+        try {
+          const v = await loader();
+          if (myGen === gen) { // ما تبدلش فالانت، إلا تنقّى الكاش فالوسط النتيجة الجديدة هي اللي تدخل
+            if (map.size >= max) map.delete(map.keys().next().value); // أقدم مفتاح (LRU eviction)
+            map.set(key, { v, exp: Date.now() + ttlMs });
+          }
+          return v;
+        } finally { inflight.delete(key); }
+      })();
+      inflight.set(key, p);
+      return p;
+    },
+    clear() { gen++; map.clear(); },
+  };
+};
+const __pdpCache = __lruMake(1000, 10 * 60 * 1000);       // صفحة منتج — 10 دقايق
+const __relCache = __lruMake(3000, 6 * 60 * 60 * 1000);   // مقترحات المنتج — 6 ساعات
+
 function clearProductsCache() {
   productsCache = null;
   cacheTime = 0;
-  console.log('🧹 Products cache cleared.');
+  __pdpCache.clear();  // 🩹 F#69 — النقاء كيمشي مع كل 20 نقطة تعديل موجودة بلا استدعاء جديد
+  __relCache.clear();
+  console.log('🧹 Products cache cleared (pdp + related LRU incl.).');
 }
 
 app.post('/api/admin/add-product', async (req, res) => {
@@ -2755,16 +2805,23 @@ app.get('/api/products/:id', async (req, res) => {
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    const result = await pool.query('SELECT * FROM products WHERE id = $1', [pid]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
-
-    let product = result.rows[0];
-    if (product.images && typeof product.images === 'string') {
-      try { product.images = JSON.parse(product.images); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
-        // 🩹 FIX-SILENT — Tenet: catch بلا صوت ممنوع
-        console.warn(`⚠️ [product] images JSON parse failed for #${pid} — serving raw string`);
+    // 🩹 F#69 EGRESSGUARD — SELECT * كان 166k نداء فالمرصود — دابا LRU 10 دقايق
+    // (الصف كامل مع الوصف/الصور/الvariants = أكبر بند egress على Supabase)
+    let product = await __pdpCache.get(`p${pid}`, async () => {
+      const result = await pool.query('SELECT * FROM products WHERE id = $1', [pid]);
+      if (result.rows.length === 0) return null;
+      const p = result.rows[0];
+      if (p.images && typeof p.images === 'string') {
+        try { p.images = JSON.parse(p.images); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
+          // 🩹 FIX-SILENT — Tenet: catch بلا صوت ممنوع
+          console.warn(`⚠️ [product] images JSON parse failed for #${pid} — serving raw string`);
+        }
       }
-    }
+      return p;
+    });
+    if (product === null) return res.status(404).json({ error: 'Product not found' });
+    // i18n كيبدل title/description لكل زائر — نسخة سطحية باش الكاش ما يتلمسش
+    product = { ...product };
 
     // 🩹 FIX-IDCACHE — صفحة الفلوس كانت الضربة الأكبر: كل مشاهدة منتج = استعلام SELECT *
     // 60s طازج + 300s stale — نفس عقد طلاقة الفيد (massSync يصل ≤60s)
@@ -2806,45 +2863,52 @@ app.get('/api/products/:id/related', async (req, res) => {
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    const productRes = await pool.query('SELECT category FROM products WHERE id = $1', [pid]);
-    if (productRes.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
+    // 🩹 F#69 EGRESSGUARD — related كان 167,138 نداء ×196ms (بلا فهرس category)
+    // دابا: LRU 6 ساعات + الفهرس idx_products_cat_id_desc كيخدم غير فالـ MISS (~<1ms)
+    const relatedRows = await __relCache.get(`r${pid}`, async () => {
+      const productRes = await pool.query('SELECT category FROM products WHERE id = $1', [pid]);
+      if (productRes.rows.length === 0) return null;
 
-    const category = productRes.rows[0].category;
-    const baseCategory = category ? category.split('-')[0] : '';
+      const category = productRes.rows[0].category;
+      const baseCategory = category ? category.split('-')[0] : '';
 
-    let relatedRes = await pool.query(
-      `SELECT id, title, price, image_url, category FROM products
-       WHERE id != $1 AND category = $2 AND stock_status = true
-       ORDER BY id DESC LIMIT 8`, [pid, category]
-    );
-
-    if (relatedRes.rows.length < 8 && baseCategory) {
-      const existingIds = relatedRes.rows.map(r => r.id);
-      existingIds.push(pid);
-      const moreRes = await pool.query(
+      let relatedRes = await pool.query(
         `SELECT id, title, price, image_url, category FROM products
-         WHERE id != ALL($1::int[]) AND category ILIKE $2 AND stock_status = true
-         ORDER BY id DESC LIMIT $3`, [existingIds, `${baseCategory}%`, 8 - relatedRes.rows.length]
+         WHERE id != $1 AND category = $2 AND stock_status = true
+         ORDER BY id DESC LIMIT 8`, [pid, category]
       );
-      relatedRes.rows = [...relatedRes.rows, ...moreRes.rows];
-    }
 
-    if (relatedRes.rows.length < 8) {
-      const existingIds = relatedRes.rows.map(r => r.id);
-      existingIds.push(pid);
-      // 📌 تكلفة موثقة: random() = scan+sort كامل — مسار نادر (فئة فيها <4 منتجات متوفرة)
-      //    backlog: TABLESAMPLE أو اختيار من نطاق id عشوائي
-      const randomRes = await pool.query(
-        `SELECT id, title, price, image_url, category FROM products
-         WHERE id != ALL($1::int[]) AND stock_status = true
-         ORDER BY random() LIMIT $2`, [existingIds, 8 - relatedRes.rows.length]
-      );
-      relatedRes.rows = [...relatedRes.rows, ...randomRes.rows];
-    }
+      if (relatedRes.rows.length < 8 && baseCategory) {
+        const existingIds = relatedRes.rows.map(r => r.id);
+        existingIds.push(pid);
+        const moreRes = await pool.query(
+          `SELECT id, title, price, image_url, category FROM products
+           WHERE id != ALL($1::int[]) AND category ILIKE $2 AND stock_status = true
+           ORDER BY id DESC LIMIT $3`, [existingIds, `${baseCategory}%`, 8 - relatedRes.rows.length]
+        );
+        relatedRes.rows = [...relatedRes.rows, ...moreRes.rows];
+      }
+
+      if (relatedRes.rows.length < 8) {
+        const existingIds = relatedRes.rows.map(r => r.id);
+        existingIds.push(pid);
+        // 📌 تكلفة موثقة: random() = scan+sort كامل — مسار نادر (فئة فيها <4 منتجات متوفرة)
+        //    backlog: TABLESAMPLE أو اختيار من نطاق id عشوائي
+        const randomRes = await pool.query(
+          `SELECT id, title, price, image_url, category FROM products
+           WHERE id != ALL($1::int[]) AND stock_status = true
+           ORDER BY random() LIMIT $2`, [existingIds, 8 - relatedRes.rows.length]
+        );
+        relatedRes.rows = [...relatedRes.rows, ...randomRes.rows];
+      }
+      return relatedRes.rows;
+    });
+
+    if (relatedRows === null) return res.status(404).json({ error: 'Product not found' });
 
     // 🩹 FIX-RELCACHE — المرتبطون ثابتون نسبياً → كاش CDN
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
-    res.json(relatedRes.rows);
+    res.json(relatedRows);
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ /api/products/:id/related:', err);
     res.set('Cache-Control', 'no-store');  // 🩹 FIX-ERRCACHE
@@ -3941,7 +4005,12 @@ cron.schedule('0 3 * * *', async () => {
         sellingPrice = Math.max(9.99, Math.floor(sellingPrice) - 0.01);
         const safePrice = parseFloat(sellingPrice.toFixed(2));
 
-        await pool.query("UPDATE products SET price = $1, stock_status = $2 WHERE id = $3", [safePrice, details.isGlobalShipping !== false, p.id]);
+        // 🩹 F#69 — حارس الـ no-op: إلا السعر والمخزون ما تبدلوش → ما كاين لا rewrite لا dead tuples
+        // (bloat الجدول هو اللي كبّر DB من 435MB لـ 543MB — كل UPDATE كيركب صف جديد كامل)
+        await pool.query(
+          "UPDATE products SET price = $1, stock_status = $2 WHERE id = $3 AND (price IS DISTINCT FROM $1 OR stock_status IS DISTINCT FROM $2)",
+          [safePrice, details.isGlobalShipping !== false, p.id]
+        );
       } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} console.error('🔴 [PriceSync] product ' + (p && p.id) + ' FAILED: ' + e.message); }
     }
     clearProductsCache();
@@ -3984,8 +4053,10 @@ cron.schedule('30 2 * * *', async () => {
 
           // 3. تحديث حقل variants في قاعدة البيانات بالبيانات الجديدة (الأسعار والمقاسات)
           // ملاحظة: نحتفظ بنفس الهيكل الذي تتوقعه دالة prepareSecureItems
+          // 🩹 F#69 — حارس الـ no-op: المقارنة على JSONB الكانوني (ترتيب المفاتيح ما يهمش)
+          // إلا كانت variants هي هي → بلا rewrite بلا dead tuples
           await pool.query(
-            "UPDATE products SET variants = $1 WHERE id = $2",
+            "UPDATE products SET variants = $1::jsonb WHERE id = $2 AND variants IS DISTINCT FROM $1::jsonb",
             [JSON.stringify(cjVariants), p.id]
           );
 
@@ -5450,6 +5521,10 @@ process.on('uncaughtException', async (err) => {
   catch (e) { logger.logError('FILTERPERF price index', e); }
   try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_created_stock ON products (created_at DESC) WHERE stock_status = true`); }
   catch (e) { logger.logError('FILTERPERF created index', e); }
+  // 🩹 F#69 EGRESSGUARD — فهرس related: الاستعلام الأساسي كان 196ms متوسط ×167k نداء
+  // (= 9.1 ساعة CPU ديال الداتابيز فالمرصود) — (category, id DESC) + partial stock = <1ms
+  try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_cat_id_desc ON products (category, id DESC) WHERE stock_status = true`); }
+  catch (e) { logger.logError('EGRESSGUARD related index', e); }
 })();
 
 // ==========================================
