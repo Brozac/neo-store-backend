@@ -60,10 +60,17 @@ function dedupeTitle(t) {
 
 // تنظيف الوصف قبل التخزين — الواجهة تعرضه كـ HTML: سكريبت/هاندلرز/JS-URIs ما يعبروش (P2-6)
 function sanitizeDescription(html) {
+  // 🩹 F#74 L3 — تحصين إضافي على P2-6:
+  //   · `\son\w+` كان كيغطي غير الفاصل مسافة → `<svg/onload=alert(1)>` (slash) كان يخطيه
+  //     → الفصل ولا الكلاس [\s\/"'`] مع القيمة كاملة
+  //   · iframe/object/embed/svg كيتمشطو كتل + وسوم فرادية (srcdoc / ناقص الإغلاق)
+  //   المخرجات كتنعرض نص عادي في الواجهة عموماً (stripHtml) — هادي دفاع في العمق
   return String(html || '')
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/<(iframe|object|embed|form|svg)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
+    .replace(/<(iframe|object|embed|form|svg)\b[^>]*\/?>/gi, '')
+    .replace(/(^|[\s\/"'`])on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '$1')
     .replace(/javascript:/gi, '');
 }
 

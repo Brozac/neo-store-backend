@@ -58,49 +58,81 @@ setInterval(() => processedMessages.clear(), 60 * 60 * 1000); // تنظيف كل
 // ⚠️ مؤقتاً: ماكاينش قائمة سوداء — إلا فشل كلشي كنرفضو + SIGN DEBUG + تنبيه
 //    الأدمن (MAKEUP حدث مالي). الـ calibrator كيحسم الألغوريتم من أول زوج.
 // ==========================================
+// 🔐 F#74 C1 — إصلاح ثغرة تزوير التوقيع (P0-21 كان مُبطَل من الداخل):
+//   القديم: المفتاح = eventOpenId من *جسم الطلب* (`eventOpenId ?? env`) — المهاجم
+//   كيحط openId ديالو فالجسم وكيحسب HMAC بنفسو → MAKEUP/WALLET مزوّرين كيدوزو
+//   على التحقق. الدوك الرسمي (Webhook → Signature Authentication): المفتاح =
+//   openId تاع *الحساب ديالك* المحفوظ عندك — عمرك ما تاخده من الطلب.
+//   الآن: المفتاح = env (CJ_WEBHOOK_OPEN_ID/CJ_OPEN_ID) ولا openId مُجلوب
+//   أوتوماتيكياً من setting/get (كاش 24h) + فحص تساوي صلب event.openId === المتوقع.
+let _expectedOpenIdCache = null;
+async function resolveExpectedOpenId() {
+  const envOid = String(process.env.CJ_WEBHOOK_OPEN_ID || process.env.CJ_OPEN_ID || '').trim();
+  if (envOid) return envOid;
+  if (_expectedOpenIdCache && Date.now() - _expectedOpenIdCache.at < 24 * 60 * 60 * 1000) return _expectedOpenIdCache.v;
+  try {
+    const r = await cjRequest((token, config) =>
+      axios.get(`${CJ_BASE}/setting/get`, { ...config, headers: { 'CJ-Access-Token': token }, timeout: 15000 })
+    );
+    const oid = String(r?.data?.data?.openId ?? '').trim();
+    if (oid) {
+      _expectedOpenIdCache = { v: oid, at: Date.now() };
+      console.log('🔐 [Webhook] openId متوقع مُجلوب من setting/get — كاش 24h (نصيحة: ثبّتو فـ Render env بـ CJ_WEBHOOK_OPEN_ID)');
+      return oid;
+    }
+  } catch (e) {
+    console.error('🔐 [Webhook] setting/get فشل — ما قدرناش نجيبو openId:', e.message);
+  }
+  return '';
+}
+
 function _tsEq(a, b) {
   const ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
   return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
 }
 
-function _candidateSigns(rawBody, eventOpenId) {
+function _candidateSigns(rawBody, keyOpenId) {
   const apiKey = process.env.CJ_API_KEY || process.env.CJ_API_TOKEN || '';
-  const openId = String(eventOpenId ?? process.env.CJ_WEBHOOK_OPEN_ID ?? process.env.CJ_OPEN_ID ?? '');
-  const openIdBuf = Buffer.from(openId);
   const out = [];
-
-  for (const key of [apiKey, openId]) {
+  // 🔑 المفتاح من السيرفر برك (apiKey / openId المتوقع) — eventOpenId ما كيدخلش هنا عمرو
+  for (const key of [apiKey, keyOpenId]) {
     if (!key) continue;
     const hmac = (alg, msg) => crypto.createHmac(alg, key).update(msg);
-    for (const msg of [rawBody, ...(openId ? [Buffer.concat([openIdBuf, rawBody])] : [])]) {
+    for (const msg of [rawBody, ...(keyOpenId ? [Buffer.concat([Buffer.from(keyOpenId), rawBody])] : [])]) {
       out.push(
         hmac('sha256', msg).digest('hex'),
         hmac('sha256', msg).digest('hex').toUpperCase(),
-        hmac('sha256', msg).digest('base64'),
+        hmac('sha256', msg).digest('base64'),      // ← الشكل الرسمي بالدوك (Base64 قياسي، padding محفوظ)
         hmac('sha256', msg).digest('base64url'),
         hmac('md5', msg).digest('hex'),
         hmac('md5', msg).digest('hex').toUpperCase()
       );
     }
   }
-
-  for (const combo of [
-    Buffer.concat([rawBody, Buffer.from(apiKey)]),
-    Buffer.concat([Buffer.from(apiKey), rawBody]),
-    ...(openId ? [Buffer.concat([openIdBuf, rawBody, Buffer.from(apiKey)])] : []),
-  ]) {
-    out.push(
-      crypto.createHash('sha256').update(combo).digest('hex'),
-      crypto.createHash('md5').update(combo).digest('hex')
-    );
+  // legacy combos (apiKey فقط) — توافقية مع المحاولات القديمة
+  if (apiKey) {
+    for (const combo of [
+      Buffer.concat([rawBody, Buffer.from(apiKey)]),
+      Buffer.concat([Buffer.from(apiKey), rawBody]),
+    ]) {
+      out.push(
+        crypto.createHash('sha256').update(combo).digest('hex'),
+        crypto.createHash('md5').update(combo).digest('hex')
+      );
+    }
   }
   return out;
 }
 
-function verifySignatureFlexible(rawBody, signHeader, eventOpenId) {
+// 🔐 التوقيع إجباري على المواضيع المالية — بلا أسرار سيرفر ولا مفتاح متوقع = رفض كلي (fail-closed)
+//   الوسيط الثالث (= openId المتوقع من resolveExpectedOpenId) إجباري عملياً؛ الوسيط القديم
+//   eventOpenId ما كيتستعملش كيما كان — الاسم تبدل للتوثيق.
+function verifySignatureFlexible(rawBody, signHeader, expectedOpenId) {
   const received = String(signHeader || '').trim();
   if (!received) return false;
-  return _candidateSigns(rawBody, eventOpenId).some(expected => _tsEq(expected, received));
+  const keyOpenId = String(expectedOpenId || '').trim();
+  if (!keyOpenId && !(process.env.CJ_API_KEY || process.env.CJ_API_TOKEN)) return false;
+  return _candidateSigns(rawBody, keyOpenId).some(expected => _tsEq(expected, received));
 }
 
 // ==========================================
@@ -1005,15 +1037,19 @@ async function cjWebhookHandler(req, res) {
       const signHeader = req.headers['sign'];
       const signedTopic = type === 'MAKEUP' || type === 'PRIVATE_ORDER' || type === 'WALLET'; // v37 H5 — wallet موضوع مالي
       if (signedTopic) {
-        if (!signHeader || !verifySignatureFlexible(rawBody, signHeader, event.openId)) {
+        // 🔐 F#74 C1 — المفتاح من السيرفر (env ولا setting/get) — event.openId ما كيدخلش فالحساب
+        //   + فحص تساوي صلب: openId فالجسم خاصو يطابق المتوقع إلا كان معروف.
+        const expectedOid = await resolveExpectedOpenId();
+        const openIdMismatch = !!expectedOid && String(event.openId ?? '') !== expectedOid;
+        if (!signHeader || openIdMismatch || !verifySignatureFlexible(rawBody, signHeader, expectedOid)) {
           // 🧪 تسريب تشخيصي (مرة/10د) — زوج (body, sign) جاهز للـ calibrator
           if (!global._cjSignFailAt || Date.now() - global._cjSignFailAt > 10 * 60 * 1000) {
             global._cjSignFailAt = Date.now();
             console.warn(
-              `🔐 [SIGN DEBUG] ${type} rejected — sign missing or invalid\n` +
+              `🔐 [SIGN DEBUG] ${type} rejected — sign missing/invalid${openIdMismatch ? ' + openId mismatch' : ''}\n` +
               `🔐 [SIGN DEBUG] sign(${String(signHeader).length})=${String(signHeader)}\n` +
               `🔐 [SIGN DEBUG] body(${rawBody.length})=${rawBody.toString('utf8')}\n` +
-              `🔐 [SIGN DEBUG] openId=${event.openId} → node tools/cj-sign-calibrator.js '<body>' '<sign>' ${event.openId}`
+              `🔐 [SIGN DEBUG] openId=${event.openId} expected=${expectedOid || '(غير معروف — زيد CJ_WEBHOOK_OPEN_ID فـ Render)'} → node tools/cj-sign-calibrator.js '<body>' '<sign>' '${expectedOid || '<expectedOpenId>'}'`
             );
           }
           // 💳 MAKEUP = حدث مالي — الأدمن خاصو يعرف حتى إلا تسقات

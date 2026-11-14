@@ -32,6 +32,7 @@ const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
 const { selfHealStuckOrders, disputeWatchdogCron, auditEvent, querySourcingList, pickSourcingAlert, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress, queryOrderTrackHistory } = require('./services/cjService');
 const logger = require('./logger');
+const { verifyGoogleIdToken } = require('./lib/googleIdToken'); // 🔐 F#74 C2 — تحقق توكن Google (RS256/JWKS، صفر deps)
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
 const templates = require('./emails/templates'); // 🎨 SERENE email design system (F#84) — all customer emails in English
 const shipTruth = require('./services/shipTruth'); // كان مستعمل بلا require → ReferenceError → 500 دايماً
@@ -539,15 +540,37 @@ const upload = multer({ storage: storage, limits: { fileSize: 5 * 1024 * 1024 } 
 // ==========================================
 // ═══ 🔐 SOCIAL LOGIN (Google OAuth) — identity موثقة من Google، JWT تاع laclarc ═══
 app.post('/api/auth/social', authLimiter, async (req, res) => {
+  // 🔐 F#74 C2 — الهوية كتتحقق من توكن Google (RS256 ضد JWKS الرسمي + iss/exp/aud/email_verified).
+  //   القديم: الإيميل خام من الطلب → أي حد معروف بالإيميل كيصدر JWT تاعو = ATO كامل
+  //   (orders + passkeys + profile — بلا password وبلا معرفة Google).
+  //   الفرونتend كيصيفط account.id_token من NextAuth signIn (server-side، من Google).
+  //   Fail-closed: بلا GOOGLE_CLIENT_ID فالباكند ولا بلا توكن = رفض (503/401).
+  //   📋 نشر: زيد GOOGLE_CLIENT_ID فـ Render env (نفس القيمة تاع الفرونت) · طبق patch الفرونت
+  //   الأول (كيصيفط idToken زايد والباكند القديم كيتهرّس منو) → من بعد هاد الpatch.
+  const clientId = String(process.env.GOOGLE_CLIENT_ID || '').trim();
+  if (!clientId) {
+    logger.logError('Social Auth', new Error('GOOGLE_CLIENT_ID ما مُعدّش فالباكند — social login مقفول (fail-closed)'));
+    return res.status(503).json({ error: 'Social sign-in is not configured' });
+  }
+  const idToken = String(req.body?.idToken || '');
+  if (!idToken) return res.status(401).json({ error: 'Google ID token required' });
+  let identity;
   try {
-    const { email, name, provider } = req.body;
-    if (!email || !provider) return res.status(400).json({ error: 'email and provider required' });
-    if (!['google'].includes(provider)) return res.status(400).json({ error: 'Unsupported provider' });
-
-    const cleanEmail = normalizeEmail(email);
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    identity = await verifyGoogleIdToken(idToken, { audience: clientId });
+  } catch (ve) {
+    try { Sentry.captureException(ve); } catch (__laclarcGuard) {}
+    logger.logError('Social Auth: idToken rejected', ve);
+    return res.status(401).json({ error: 'Invalid Google identity' });
+  }
+  try {
+    const email = identity.email;    // ✅ من التوكن المُتحقق منو — عمرو ما من الطلب
+    const name = identity.name;      // ✅ من التوكن
+    const provider = 'google';       // ✅ مثبت — provider ما كيتقبلش من الطلب
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: 'Invalid email format' });
     }
+
+    const cleanEmail = normalizeEmail(email);
 
     // موجود؟ → login · جديد → register (provider موثق الإيميل أصلاً — بلا password)
     let userRes = await pool.query('SELECT id, name, email FROM users WHERE email = $1', [cleanEmail]);

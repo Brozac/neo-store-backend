@@ -129,7 +129,7 @@ function parseCjCommentsText(txt) {
 //    والراوت GET /reviews/:pid مباشرة. الاستجابة:
 //    { total, page, size, reviews: [{ id, name, score, date, text, images, country, flag }] }
 async function fetchCjReviews(pid, opts = {}) {
-  const page = Math.max(parseInt(opts.page, 10) || 1, 1);
+  const page = Math.min(Math.max(parseInt(opts.page, 10) || 1, 1), 200); // 🛡️ F#74 — سقف الصفحات
   const size = Math.min(Math.max(parseInt(opts.size, 10) || 20, 1), 50);
   const scoreN = parseInt(opts.score, 10) || 0;
   const score = scoreN >= 1 && scoreN <= 5 ? scoreN : null;
@@ -200,9 +200,29 @@ function cacheSet(map, key, data) {
   }
 }
 
-// ── Rate limiter مبني — 20 بحث/10 دقائق/IP — كيتطبق غير على MISS (الكاش حر)
-//    التطبيق داخل /search بعد فحص الكاش — شوف الكتلة "limiter — فقط على MISS" ──
-const buckets = new Map();
+// ── Rate limiters مبنية — كتطبق غير على MISS (الكاش حر) ──
+// 🛡️ F#74 H2 — المفتاح: cf-connecting-ip || req.ip (trust proxy=1) — القديم كان clientIp()
+//    = أول قيمة فـ X-Forwarded-For = كيتحكم فيها الزبون → تزوير IP = bypass كامل للحد
+//    (حرق نقاط CJ + سحب كاطالوگ). نفس نمط antiCloneIp فـ server.js.
+const buckets = new Map(); // "kind|ip" → [timestamps]
+const BRIDGE_LIMITS = {
+  search:  { max: 20, windowMs: 10 * 60 * 1000 }, // listV2 50pt — نفس السقف القديم
+  product: { max: 60, windowMs: 10 * 60 * 1000 }, // query ~1pt + freight 10pt (كاش 10د — تصفح طبيعي بعيد على السقف)
+  reviews: { max: 40, windowMs: 10 * 60 * 1000 }, // productComments (كاش 6h)
+};
+function bridgeIp(req) {
+  return String(req.headers['cf-connecting-ip'] || req.ip || (req.socket && req.socket.remoteAddress) || 'unknown');
+}
+function allowHit(req, kind) {
+  const { max, windowMs } = BRIDGE_LIMITS[kind];
+  const key = `${kind}|${bridgeIp(req)}`;
+  const now = Date.now();
+  const b = (buckets.get(key) || []).filter(t => now - t < windowMs);
+  if (b.length >= max) { buckets.set(key, b); return false; }
+  b.push(now); buckets.set(key, b);
+  if (buckets.size > 5000) for (const [k, v] of buckets) if (v.every(t => now - t > windowMs)) buckets.delete(k);
+  return true;
+}
 
 // ════════════════════════════════════════════════════════════
 // 🌍 GET /api/cj-live/geo — كشف البلد + باب الـ 250
@@ -218,7 +238,7 @@ router.get('/geo', async (req, res) => {
       source: g.source,
       registryCount: geo.registryCount(),
       freightReady: g.supported, // الشحن الحقيقي ممكن فقط للدول المدعومة
-      ip: g.ip,
+      // 🔒 F#74 L1 — عنوان IP ما كيرجعش للعميل (privacy — ما عندو حتى استهلاك)
     });
   } catch (e) {
     console.error('[cj-live/geo]', e.message);
@@ -234,8 +254,8 @@ router.get('/geo', async (req, res) => {
 // ════════════════════════════════════════════════════════════
 router.get('/search', async (req, res) => {
   try {
-    const q = String(req.query.q || '').trim();
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const q = String(req.query.q || '').trim().slice(0, 80);                     // 🛡️ F#74 M3 — سقف الطول
+    const page = Math.min(Math.max(1, parseInt(req.query.page, 10) || 1), 300);  // 🛡️ F#74 M3 — سقف الصفحات
     if (q.length < 2) return res.json({ geo: {}, products: [], page, hasMore: false });
 
     // 🌍 البلد: override → CDN → IP lookup → default (كاش IP داخلي 24h)
@@ -248,17 +268,8 @@ router.get('/search', async (req, res) => {
     const cached = cacheGet(searchCache, ckey, SEARCH_TTL);
     if (cached) return res.json({ ...cached, cached: true });
 
-    // 🛡️ limiter — فقط على الطلبات اللي غادي تضرب CJ فعلاً
-    const limited = new Promise((resolve) => {
-      const ip = geo.clientIp(req) || 'unknown';
-      const now = Date.now();
-      const b = (buckets.get(ip) || []).filter(t => now - t < 10 * 60 * 1000);
-      if (b.length >= 20) return resolve(false);
-      b.push(now); buckets.set(ip, b);
-      if (buckets.size > 5000) for (const [k, v] of buckets) if (v.every(t => now - t > 10 * 60 * 1000)) buckets.delete(k);
-      resolve(true);
-    });
-    if (!(await limited)) {
+    // 🛡️ limiter — فقط على الطلبات اللي غادي تضرب CJ فعلاً (F#74 H2: IP حقيقي، ماشي XFF مزوّر)
+    if (!allowHit(req, 'search')) {
       return res.status(429).json({ error: 'Too many searches. Try again later.' });
     }
 
@@ -292,7 +303,7 @@ router.get('/search', async (req, res) => {
       return res.status(502).json({
         error: 'CJ unavailable',
         cjCode: envCode ?? null,
-        cjMessage: String(r?.data?.message || '') || null,
+        // 🔒 F#74 L2 — رسالة CJ الداخلية ما كتمشيش للعميل (اللوج كامل سيرفر-side)
       });
     }
 
@@ -318,7 +329,7 @@ router.get('/search', async (req, res) => {
       return {
         pid: String(p.id || p.pid || ''),
         title: p.nameEn || p.productNameEn || '',
-        price: cost,                                // كلفة CJ (داخلي)
+        // 🔒 F#74 H1 — كلفة CJ (`price`) ما كتمشيش للعميل — least-data (كانت تتجمع حيّاً)
         laclarcPrice: safePrice,                    // 💰 السعر المعروض
         image: p.bigImage || p.productImage || '',
         ordersCount: parseInt(p.listedNum ?? p.ordersCount, 10) || 0,
@@ -348,7 +359,10 @@ router.get('/search', async (req, res) => {
 router.get('/product/:pid', async (req, res) => {
   try {
     const pid = String(req.params.pid || '').trim();
-    if (!pid || pid.length < 5) return res.status(400).json({ error: 'Bad pid' });
+    // 🛡️ F#74 M3 — pid = معرف snowflake من CJ — charset/طول محصورين
+    if (!pid || !/^[A-Za-z0-9_-]{5,32}$/.test(pid)) return res.status(400).json({ error: 'Bad pid' });
+    // 🛡️ F#74 M1 — limiter (كان بلا حد → حرق نقاط query/freight بـ pids عشوائيين)
+    if (!allowHit(req, 'product')) return res.status(429).json({ error: 'Too many requests. Try again later.' });
 
     const r = await cjRequest((token, config) =>
       axios.get(`${CJ_API}/product/query`, {
@@ -366,7 +380,7 @@ router.get('/product/:pid', async (req, res) => {
       return res.status(502).json({
         error: 'CJ unavailable',
         cjCode: envCodeQ ?? null,
-        cjMessage: String(r?.data?.message || '') || null,
+        // 🔒 F#74 L2 — رسالة CJ الداخلية ما كتمشيش للعميل
       });
     }
     const d = r?.data?.data;
@@ -407,8 +421,7 @@ router.get('/product/:pid', async (req, res) => {
     const cost0 = parseMaxNumber(v0.variantSellPrice) || parseMaxNumber(d.sellPrice) || 0;
     let shipping = { source: 'unavailable', amount: 0, currency: 'USD' };
     let freightUsd = 0;
-    let emptyDiag = null; // أسباب 1.3 ملي CJ كيرجع 200 بقنوات خاوية
-    const wantDebug = String(req.query.debug || '') === '1';
+    let emptyDiag = null; // أسباب 1.3 ملي CJ كيرجع 200 بقنوات خاوية (سيرفر-side برك — F#74)
     const dbg = { dest: dest || null, srcAreaCode: null, weight: null, volumeCm3: null, productProp: null, row: null, envCode: null, rawType: null, channelCount: null, validCount: 0, fromCache: false, diag: null };
 
     if (dest) {
@@ -507,15 +520,14 @@ router.get('/product/:pid', async (req, res) => {
 
     if (shipping.source !== 'cj-live') {
       // 🛟 fallback — تقدير v3.1 القديم (نفس المعادلة) مع علامة المصدر
-      //    cjError = خطأ envelope · unavailable = أسباب 1.3 (تشخيصي فقط)
-      const cjErr = shipping.source === 'cj-error'
-        ? { cjCode: shipping.cjCode ?? null, cjMessage: shipping.cjMessage ?? null } : null;
+      //    cjError = كود CJ (تشخيصي — بلا رسالة داخلية · F#74 L2)
+      const cjErr = shipping.source === 'cj-error' ? { cjCode: shipping.cjCode ?? null } : null;
       shipping = {
         source: 'estimate',
         amount: +(5 + Math.max(weight, 50) / 1000 * 4).toFixed(2),
         currency: 'USD',
         ...(cjErr ? { cjError: cjErr } : {}),
-        ...(Array.isArray(emptyDiag) && emptyDiag.length ? { unavailable: emptyDiag.slice(0, 5) } : {}),
+        // 🔒 F#74 — أسباب 1.3 (unavailable) ما كتمشيش للعميل — الفرونتend ما كيستهلكهاش
       };
     }
 
@@ -528,7 +540,7 @@ router.get('/product/:pid', async (req, res) => {
       return {
         vid: v.vid,
         variantKey: v.variantKey || '',
-        variantSellPrice: vCost, // كلفة CJ للـ variant
+        // 🔒 F#74 H1 — كلفة الـ variant (variantSellPrice = wholesale CJ) ما كتمشيش للعميل
         laclarcVariantPrice: calculateSellingPrice(vCost, vWeight, vFreight).safePrice,
         inventoryCountries: (Array.isArray(v.inventories) ? v.inventories : [])
           .filter(i => (parseInt(i.totalInventory, 10) || 0) > 0)
@@ -546,15 +558,14 @@ router.get('/product/:pid', async (req, res) => {
       bigImage: d.bigImage || '',
       images: parseImageList(d, { includeVariantImages: false, max: 12 }),
       variants,
-      sellPrice: parseMaxNumber(d.sellPrice),
+      // 🔒 F#74 H1 — sellPrice/weightGrams/productProp (كلفة CJ + بيانات تشغيلية) ما كيمشيش
+      //    للعميل — المكونات كيستهلكو غير laclarcPrice/laclarcVariantPrice/shipping/estimatedShipUsd
       laclarcPrice: safePrice,     // 💰 السعر الرسمي — فريت حقيقي إن توفر، وإلا تقدير
       original_price: null,        // قرار 1 — بلا strikethrough مولّد
       estimatedShipUsd: shipping.amount, // توافقية خلفية + القيمة الحقيقية إن توفرت
       shipping,                    // 🆕 الثمن المباشر الكامل
-      ...(wantDebug ? { freightDebug: dbg } : {}), // 🔬 ?debug=1 — تشخيص الفريت
       geo: geoInfo,                // 🆕 بلد الزائر المستعملة
-      weightGrams: weight,
-      productProp,
+      // 🔬 F#74 M2 — ?debug=1 (freightDebug) تحيد من الطريق العام — التشخيص فاللوج سيرفر-side
     });
   } catch (e) {
     console.error('[cj-live/product]', e.message);
@@ -569,9 +580,11 @@ router.get('/product/:pid', async (req, res) => {
 router.get('/reviews/:pid', async (req, res) => {
   try {
     const pid = String(req.params.pid || '').trim();
-    if (!pid || pid.length < 5) return res.status(400).json({ error: 'Bad pid' });
+    // 🛡️ F#74 M1/M3 — validation + limiter (كان بلا حد → حرق نقاط CJ بـ pids عشوائيين)
+    if (!pid || !/^[A-Za-z0-9_-]{5,32}$/.test(pid)) return res.status(400).json({ error: 'Bad pid' });
+    if (!allowHit(req, 'reviews')) return res.status(429).json({ error: 'Too many requests. Try again later.' });
     const data = await fetchCjReviews(pid, {
-      page: req.query.page, size: req.query.size, score: req.query.score,
+      page: Math.min(Math.max(1, parseInt(req.query.page, 10) || 1), 200), size: req.query.size, score: req.query.score,
     });
     return res.json(data);
   } catch (e) {
