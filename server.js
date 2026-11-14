@@ -4208,6 +4208,22 @@ cron.schedule('0 */2 * * *', async () => {
   try { await selfHealStuckOrders(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('SelfHeal Scheduler', e); }
 });
 
+// ═══ 🩹 F#77 — Tracking Heal — الدوك logistic 2.2 getOrderTrackHistory ═══
+//     رقم التتبع كيبدل عند CJ والويبهوك ما وصلش → الزبون كيشوف رحلة مجمّدة
+//     غالباً على "Returned to sender" (دوك 2.2 حرفياً). مرتين فاليوم:
+//     كتكتشف الأرقام المجمّدة (>10 أيام بلا حدث + ما توصّلش) → 2.2 بالقديم
+//     → إلا تبدل: نفس مسار الويبهوك بالضبط (handleTrackReplacement:
+//     تحقق P0-20 + UPDATE + إيميل + واتساب + لوح الأدمن + أحداث الجديد).
+//     التكلفة: 10 نقاط/نداء (حتى 10 أرقام) · كاش 10د · guard 24h/رقم =
+//     جولة عادية بلا مرضى = صفر نداءات.
+//     Kill-switch: SHIP_HEAL_CRON='0' · العتبة: TRACK_HEAL_STALE_DAYS (default 10)
+{
+  const healCron = process.env.SHIP_HEAL_CRON === '0' ? null : (process.env.SHIP_HEAL_CRON || '0 5,17 * * *');
+  if (healCron) cron.schedule(healCron, async () => {
+    try { await shipTruth.healReplacedTracking(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('TrackHeal Scheduler', e); }
+  });
+}
+
 // ═══ 📮 Sourcing Watchdog — v33 (F#44 دوك 5.3): كيسول CJ على نتائج السورسنغ مرتين فالنهار (04:30 و 16:30)
 //     صفر نداءات إلا كان شي طلب pending — نقاط: GET واحد (نقطة) لكل 100 طلب
 async function runSourcingWatch() {
