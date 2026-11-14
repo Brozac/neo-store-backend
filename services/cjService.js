@@ -1845,7 +1845,7 @@ async function selfHealStuckOrders() {
     }
 
     const { rows: candidates } = await pool.query(`
-      SELECT id, cj_order_number, total_amount, customer_name, customer_email, created_at
+      SELECT id, cj_order_number, cj_parent_order_number, total_amount, customer_name, customer_email, created_at
       FROM orders
       WHERE status = 'paid'
         AND cj_order_number IS NOT NULL AND cj_order_number != ''
@@ -1855,8 +1855,12 @@ async function selfHealStuckOrders() {
     `);
     if (candidates.length === 0) { console.log('🩺 [SelfHeal] clean — no candidates.'); return; }
 
+    // 🩹 F#79 — الوالد أولاً: بعد الدمج كود الطفل مات عند CJ (1.16 كيتخطاه بصمت)
+    //   — والاستجواب كيتدار على detail تاع الأب. cjLookupKeys يصلح حتى bug الsplit
+    //   (cj_order_number = "SD1, SD2" كانت كتستعمل كسلسلة واحدة = مفتاح غلط دايماً).
     let detailsMap = new Map();
-    const codes = candidates.map(c => c.cj_order_number);
+    const { cjLookupKeys } = require('./mergeTracker');
+    const codes = [...new Set(candidates.flatMap(c => cjLookupKeys(c).all))].slice(0, 50);
     try {
       const batch = await cjRequest((token) =>
         axios.post(`${CJ_API}/shopping/order/getOrderDetailBatch`, { orderIds: codes },
@@ -1891,11 +1895,14 @@ async function selfHealStuckOrders() {
         continue;
       }
 
-      let info = detailsMap.get(String(code));
+      // 🩹 F#79 — الاستجواب على الوالد (إلا كاين) وإلا الطفل الأول (split = أول كود)
+      const probeKey = String(cand.cj_parent_order_number || '').trim()
+        || String(cand.cj_order_number || '').split(',')[0].trim();
+      let info = detailsMap.get(String(probeKey)) || detailsMap.get(String(code));
       if (!info) {
         try {
-          const probe = await probeOrderStatus(code, 'SelfHeal');
-          info = { orderStatus: probe.status, cjOrderCode: probe.realCj || code, paymentDate: null };
+          const probe = await probeOrderStatus(probeKey, 'SelfHeal');
+          info = { orderStatus: probe.status, cjOrderCode: probe.realCj || probeKey, paymentDate: null };
         } catch (e) {
           console.warn(`🩺 [SelfHeal] #${oid} probe failed: ${e.message} — skipped this cycle`);
           continue;
@@ -1918,7 +1925,13 @@ async function selfHealStuckOrders() {
       }
 
       // 🔴 DEAD مؤكد — تصحيح + إعادة fulfillment نظيفة
+      // 🩹 F#79 — الطلب المدموج: ما كنحيدوش الأب (kill siblings!) — تدخل بشري
       if (DEAD_CJ_STATUSES.includes(cjStatus)) {
+        if (String(cand.cj_parent_order_number || '').trim()) {
+          console.warn(`🩺 [SelfHeal] #${oid} DEAD-but-merged (${cjStatus}) — الأب ${cand.cj_parent_order_number} عندو أطفال آخرين — بلا حذف آلي`);
+          await auditEvent('SELFHEAL_MERGED_SKIP_DELETE', oid, { code, parent: cand.cj_parent_order_number, cjStatus }, 'warning');
+          continue;
+        }
         console.warn(`🩺 [SelfHeal] #${oid} DEAD at CJ (${cjStatus}) — clearing code, re-fulfilling fresh...`);
         await pool.query("UPDATE orders SET cj_order_number = '' WHERE id = $1", [oid]);
         const r1 = await attemptRefulfill(oid, cand, 'dead-order');
@@ -1927,7 +1940,13 @@ async function selfHealStuckOrders() {
       }
 
       // 🧟 زومبي CREATED مؤكد — L1
+      // 🩹 F#79 — الطلب المدموج ما كيتحيدش آلياً (L1 delete على الأب = قتل الأشقاء)
       console.log(`🩺 [SelfHeal] #${oid} zombie CREATED (${code}) — L1: delete → re-fulfill (attempt ${att.count + 1}/${HEAL_MAX_ATTEMPTS})`);
+      if (String(cand.cj_parent_order_number || '').trim()) {
+        console.warn(`🩺 [SelfHeal] #${oid} merged (${cand.cj_parent_order_number}) — بلا delete آلي، بلا re-fulfill — تدخل بشري`);
+        await auditEvent('SELFHEAL_MERGED_SKIP_ZOMBIE', oid, { code, parent: cand.cj_parent_order_number }, 'warning');
+        continue;
+      }
       const del = await deleteCJOrder(code, `STORE-${oid}`);
       if (del.ok) {
         console.log(`🧹 [SelfHeal] #${oid} zombie deleted — re-fulfilling...`);
@@ -1963,10 +1982,14 @@ async function selfHealStuckOrders() {
         continue;
       }
 
-      const pay = await payCJOrderBalance(code, `STORE-${oid}`);
+      // 🩹 F#79 — الطلب المدموج = payBalanceV2 بshipmentOrderId (الدوك 2.2:
+      //   "cannot use this API to pay by a single orderId")
+      const pay = String(cand.cj_parent_order_number || '').trim()
+        ? await payCJOrderBalanceV2(info.orderId || cand.cj_parent_order_number)
+        : await payCJOrderBalance(code, `STORE-${oid}`);
       if (pay.ok) {
         healed2++;
-        await auditEvent('SELFHEAL_PAYBALANCE', oid, { code, amount: cand.total_amount }, 'warning');
+        await auditEvent('SELFHEAL_PAYBALANCE', oid, { code, amount: cand.total_amount, via: pay.via || 'payBalance' }, 'warning');
         console.log(`💳 [SelfHeal] #${oid} payBalance OK — SHIPPED webhook قادم`);
         att.count++; att.lastAt = Date.now(); healAttempts.set(oid, att);
         continue;
@@ -2186,7 +2209,77 @@ async function payCJOrderBalance(...candidates) {
 }
 
 // ==========================================
+// 💳 payCJOrderBalanceV2 — F#79 (دوك shopping 2.3)
+//   الأوامر الأباء المدموجة ما كيتخلصوش ب2.2 payBalance (الدوك حرفياً:
+//   "When a parent order contains multiple sub-orders, you cannot use
+//   this API to pay by a single orderId") → V2 بshipmentOrderId.
+//   candidates: orderId الرقمي من detail الأب، ثم كود الأب (الصيغتان
+//   جاءو بيهم الدوك: "12" فمثال V2 · "CJ26..." فمثال saveGenerateParentOrder)
+// ==========================================
+async function payCJOrderBalanceV2(...candidates) {
+  let lastReason = 'no_candidates';
+  for (const v of candidates.filter(Boolean)) {
+    try {
+      const res = await cjRequest((token) =>
+        axios.post(CJ_API + '/shopping/pay/payBalanceV2',
+          { shipmentOrderId: String(v) },
+          { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+        )
+      );
+      if (res.data?.code === 200 && res.data?.result !== false) return { ok: true, via: 'payBalanceV2' };
+      lastReason = (res.data?.message || 'code_' + res.data?.code);
+    } catch (e) {
+      lastReason = (e.response && e.response.data && e.response.data.message) || e.message;
+    }
+  }
+  return { ok: false, reason: lastReason };
+}
+
+// ==========================================
+// 🧾 queryBillingHistory — F#79 (دوك shopping 2.4) — فواتير المحفظة
+//   {id, cjOrderId, createDate, typeDesc, tradeType, copeMoney, status,
+//    afterTransactionMoney} — الحقيقة المالية، reconService كيقارنها بDB
+// ==========================================
+async function queryBillingHistory({ pageNum = 1, pageSize = 100, startDay, endDay, tradeTypeList } = {}) {
+  const body = { pageNum, pageSize };
+  if (startDay) body.startDay = startDay;
+  if (endDay) body.endDay = endDay;
+  if (Array.isArray(tradeTypeList) && tradeTypeList.length) body.tradeTypeList = tradeTypeList;
+  const res = await cjRequest((token) =>
+    axios.post(CJ_API + '/shopping/wallet/billingHistory', body,
+      { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+    )
+  );
+  const env = res.data || {};
+  const ok = env.code === 200 || env.code === 0 || env.success === true;
+  if (!ok || env.result === false) throw new Error(`billingHistory envelope ${env.code}: ${env.message || 'unknown'}`);
+  const d = env.data || {};
+  return { total: Number(d.total) || 0, list: Array.isArray(d.list) ? d.list : [] };
+}
+
+// ==========================================
+// 📜 queryOrderLog — F#79 (دوك shopping 1.19) — مجاني (صفر نقاط)
+//   fullTimeline=true = timeline كامل (debug + أدلة disputes)
+//   1603100 = غير موجود/ماشي ديالك · 1600000 = عاود من بعد
+// ==========================================
+async function queryOrderLog(orderCode, fullTimeline = false) {
+  const res = await cjRequest((token) =>
+    axios.post(CJ_API + '/shopping/order/queryOrderLog',
+      { orderCode: String(orderCode || '').trim(), fullTimeline: !!fullTimeline },
+      { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
+    )
+  );
+  const env = res.data || {};
+  if (env.code !== 200 || env.result === false) {
+    const err = new Error(env.message || `queryOrderLog code ${env.code}`);
+    err.cjCode = env.code;
+    throw err;
+  }
+  return Array.isArray(env.data) ? env.data : [];
+}
+// ==========================================
 // 📤 التصديرات — 🩹 إجباري: probeOrderStatus + classifyDuplicate + auditEvent
 //    cjWebhookService v2.1 (P0-20 anti-spoof) يعتمدهما — بلاهما أول webhook يرمي undefined
+//    🩹 F#79: + payCJOrderBalanceV2 (2.3 للأباء) · queryBillingHistory (2.4) · queryOrderLog (1.19)
 // ==========================================
-module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate, querySourcingList, pickSourcingAlert, getCjVariantStock, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress, queryOrderTrackHistory };
+module.exports = { fulfillCJOrder, getCJToken, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance, payCJOrderBalanceV2, queryBillingHistory, queryOrderLog, financialGate, selfHealStuckOrders, checkStripeDispute, disputeWatchdogCron, auditEvent, zeroTouchRecovery, probeOrderStatus, classifyDuplicate, querySourcingList, pickSourcingAlert, getCjVariantStock, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress, queryOrderTrackHistory };

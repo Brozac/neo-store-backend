@@ -329,10 +329,12 @@ async function handleOrderUpdate(params = {}) {
   // 🩹 P2-24 — حارس Mission#8 نُقل للأعلى (كان بعد الرد الإخباري — اتساق أمني):
   //    الرفض المبكر: CJ لا يوقّع ORDER/LOGISTIC، فالـ "هوية" الحدث = وجود الطلب في DB.
   const orderId = storeMatch ? Number(storeMatch[1]) : null;
+  // 🩹 F#79 — الويبهوك بعد الدمج كيجي برقم الأب — نطابقو الأب حتى هو
   const knownRes = await pool.query(
     `SELECT id FROM orders
      WHERE ($1::int IS NOT NULL AND id = $1)
         OR (NULLIF($2,'') IS NOT NULL AND cj_order_number = $2)
+        OR (NULLIF($2,'') IS NOT NULL AND cj_parent_order_number = $2)
      LIMIT 1`,
     [orderId, cjOrderId || null]
   );
@@ -348,6 +350,7 @@ async function handleOrderUpdate(params = {}) {
     `SELECT * FROM orders
      WHERE ($1::int IS NOT NULL AND id = $1)
         OR (NULLIF($2,'') IS NOT NULL AND cj_order_number = $2)
+        OR (NULLIF($2,'') IS NOT NULL AND cj_parent_order_number = $2)
      LIMIT 1`,
     [orderId, cjOrderId || null]
   );
@@ -365,9 +368,11 @@ async function handleOrderUpdate(params = {}) {
   //    كل حدث مُغيّر-للحالة يُستجوب من CJ مباشرة قبل قبوله.
   //    الكلفة: نداء CJ واحد لكل SHIPPED/DELIVERED — حدث يحدث مرة في عمر الطلب.
   if (mapped !== 'paid') {
-    const targetNum = (order.cj_order_number && !/^STORE-/i.test(order.cj_order_number))
-      ? order.cj_order_number
-      : `STORE-${order.id}`;
+    // 🩹 F#79 — الاستجواب على الوالد أولاً (كود الطفل مات بعد الدمج)
+    const targetNum = String(order.cj_parent_order_number || '').trim()
+      || ((order.cj_order_number && !/^STORE-/i.test(order.cj_order_number))
+        ? order.cj_order_number
+        : `STORE-${order.id}`);
     const probe = await probeOrderStatus(targetNum, 'WebhookVerify');
     const kind = classifyDuplicate(probe);
     const verified = kind === 'alive' && probe.matched;
@@ -493,10 +498,12 @@ async function handleLogistic(params = {}) {
   if (!trackingNumber && !cjOrderId) return;
 
   // 🛡️ Mission #8 Hardening — نفس منطق الرفض المبكر
+  // 🩹 F#79 — الويبهوك كيجي برقم الأب بعد الدمج
   const knownRes = await pool.query(
     `SELECT id FROM orders
      WHERE tracking_number = $1
         OR (NULLIF($2,'') IS NOT NULL AND cj_order_number = $2)
+        OR (NULLIF($2,'') IS NOT NULL AND cj_parent_order_number = $2)
      LIMIT 1`,
     [trackingNumber, cjOrderId]
   );
@@ -519,6 +526,7 @@ async function handleLogistic(params = {}) {
     `SELECT * FROM orders
      WHERE tracking_number = $1
         OR (NULLIF($2,'') IS NOT NULL AND cj_order_number = $2)
+        OR (NULLIF($2,'') IS NOT NULL AND cj_parent_order_number = $2)
      LIMIT 1`,
     [trackingNumber, cjOrderId]
   );

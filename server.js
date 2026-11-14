@@ -30,7 +30,10 @@ const { secondShotConversion } = require('./services/conversionService');
 const { fulfillCJOrder, cjRequest, parseNumeric, autoRepairLogistics, sendAdminAlert, deleteCJOrder, payCJOrderBalance } = require('./services/cjService');
 const { syncCategoriesFromCJ, getCategoryTree, resolveCategoryByCjId } = require('./services/categoryService');
 const { buildProductRow, upsertProductRow } = require('./services/productImportService');
-const { selfHealStuckOrders, disputeWatchdogCron, auditEvent, querySourcingList, pickSourcingAlert, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress, queryOrderTrackHistory } = require('./services/cjService');
+const { selfHealStuckOrders, disputeWatchdogCron, auditEvent, querySourcingList, pickSourcingAlert, queryOrderPackingPhotos, pickMakeupRows, queryWalletBalance, pickWalletAlert, queryProofOfDelivery, updateOrderShippingAddress, queryOrderTrackHistory, payCJOrderBalanceV2, queryOrderLog } = require('./services/cjService');
+// 🩹 F#79 — Merge Tracker (5.4 sync result + parent propagation) + Recon Suite (2.4 wallet · 1.6 orphan)
+const mergeTracker = require('./services/mergeTracker');
+const reconService = require('./services/reconService');
 const logger = require('./logger');
 const { verifyGoogleIdToken } = require('./lib/googleIdToken'); // 🔐 F#74 C2 — تحقق توكن Google (RS256/JWKS، صفر deps)
 const { sendOrderTrackingWhatsApp } = require('./services/whatsappService');
@@ -3547,8 +3550,74 @@ app.post('/api/admin/merge/match', async (req, res) => {
 app.post('/api/admin/merge/submit', async (req, res) => {
   try {
     const { orders } = req.body;
-    const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/submitMergeOrderBatchV3', orders, { headers: { 'CJ-Access-Token': token } }));
+    if (!Array.isArray(orders) || !orders.length) return res.status(400).json({ error: 'orders (mergeShopOrderVOList) مطلوبة' });
+    // 🩹 F#79 — نفس مسار الكرون بالضبط: propagation الأباء + audit الفشل الموثق.
+    //    البانل كان كيصيفط ويطيح بالرد — الأباء ما كيتسجلو حتى هنا.
+    const out = await mergeTracker.submitMergeGroup({ mergeShopOrderVOList: orders });
+    res.json({
+      cj: out.ok ? out.data : { message: out.message || 'submit failed' },
+      propagation: {
+        ok: out.ok,
+        parents: out.parents || [],
+        linkedOrders: out.linked || [],
+        failures: out.failures || [],
+        skippedMultiParent: !!out.skippedMultiParent,
+        note: out.ok
+          ? (out.linked.length ? `الأب مربوط بـ ${out.linked.length} طلب/طلبات فDB` : 'ما كاين حتى طلب فDB مطابق للأكواد المدموجة')
+          : 'الفشل كتسجل فaudit — بلا propagation',
+      },
+    });
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+});
+
+// 🩹 F#79 — Makeup Pay Order (دوك shopping 9.3) — فواتير BT (فرق البوستاج...)
+//    إنشاء أمر دفع فقط (بلا دفع آلي) — الأدمن كيخلص عبر cjPayUrl ولا payBalanceV2
+//    يدوياً. human-in-the-loop — نقطة القرار البشري محفوظة (نفس قرار MCP).
+app.post('/api/admin/makeup/pay', async (req, res) => {
+  try {
+    const { orderCodes, type, diffUseType } = req.body || {};
+    if (!Array.isArray(orderCodes) || !orderCodes.length) {
+      return res.status(400).json({ error: 'orderCodes مطلوبة — أكواد فواتير BT من /api/admin/makeup/list (data.list[].orderCode)' });
+    }
+    if (orderCodes.length > 50) return res.status(400).json({ error: 'أقصى 50 فاتورة فالنداء' });
+    const body = { orderCodes: orderCodes.map(String) };
+    if (type != null) body.type = Number(type);
+    if (diffUseType != null && Number(type) === 1) body.diffUseType = Number(diffUseType); // إجباري مع type=1 (الدوك 9.3)
+    const response = await cjRequest((token) => axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/makeup/createPayOrder', body, { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }));
+    // audit — إنشاء أمر دفع قرارات مالية، كله يترك أثر
+    auditEvent('MAKEUP_PAYORDER_CREATED', null, {
+      orderCodes: orderCodes.slice(0, 20),
+      payId: response.data?.data?.payId || null,
+      amount: response.data?.data?.amount || null,
+    }, 'warning').catch(() => {});
     res.json(response.data);
+  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
+});
+
+// 🩹 F#79 — Query Order Log (دوك shopping 1.19) — مجاني (صفر نقاط)
+//    Timeline كامل لأي أمر CJ — debug disputes + أدلة (operator/nodeName/createDate)
+app.post('/api/admin/cj-order-log', async (req, res) => {
+  try {
+    const { orderCode, fullTimeline } = req.body || {};
+    const code = String(orderCode || '').trim();
+    if (!code) return res.status(400).json({ error: 'orderCode مطلوب (SD/DP/DR/HB/J/GX/SH…D/ZF/YJ/SY — BF مرفوض من الدوك)' });
+    const rows = await queryOrderLog(code, fullTimeline !== false);
+    res.json({ orderCode: code, count: rows.length, data: rows });
+  } catch (err) {
+    try { Sentry.captureException(err); } catch (__laclarcGuard) {}
+    logger.logError('Route Handler', err);
+    if (err.cjCode === 1603100) return res.status(404).json({ error: 'الأمر غير موجود ولا ماشي ديالك (1603100)' });
+    if (err.cjCode === 1600000) return res.status(503).json({ error: 'CJ ما كيتحققش من الملكية دابا — عاود من بعد (1600000)' });
+    res.status(502).json({ error: 'CJ order-log query failed: ' + err.message });
+  }
+});
+
+// 🩹 F#79 — تقارير الrecon (wallet/orphan) — للأدمن
+app.get('/api/admin/recon/reports', async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 50);
+    const rows = await reconService.recentReconReports(limit);
+    res.json({ count: rows.length, data: rows });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} logger.logError('Route Handler', err); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -4141,32 +4210,47 @@ cron.schedule('30 2 * * *', async () => {
 // });
 
 // 3. دمج الطلبات على CJ تلقائياً (كل ساعة)
-cron.schedule('0 * * * *', async () => {
-  try {
-    const matchRes = await cjRequest((token) =>
-      axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/autoMatchMergeOrderListV3',
-        { filterOrder: true, orderStatus: 100 },
-        { headers: { 'CJ-Access-Token': token } }
-      )
-    );
+// 🩹 F#79 — كان fire-and-forget أعمى: الرد المتزامن (5.4) كيرجع newOrderCodeList +
+//    failGroupCount (11001-11100) وكان كيتطاح → الطلبات المدموجة كيتوهون فDB
+//    (كود الطفل مات عند CJ،cj_order_number بقى بكود ميت، sync/tracking معطلين).
+//    دابا: mergeTracker.submitMergeGroup كيقرا الرد، كيربط الأباء
+//    (orders.cj_parent_order_number)، وكيسجل الفشل الموثق + تنبيه أدمن.
+//    Kill-switch: MERGE_CRON='0'
+{
+  const mergeCron = process.env.MERGE_CRON === '0' ? null : (process.env.MERGE_CRON || '0 * * * *');
+  if (mergeCron) cron.schedule(mergeCron, async () => {
+    try {
+      const matchRes = await cjRequest((token) =>
+        axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/autoMatchMergeOrderListV3',
+          { filterOrder: true, orderStatus: 100 },
+          { headers: { 'CJ-Access-Token': token } }
+        )
+      );
 
-    if (matchRes.data.code === 200 && matchRes.data.data?.result?.length > 0) {
-      const groups = matchRes.data.data.result;
-      for (const group of groups) {
-        try {
-          await new Promise(r => setTimeout(r, 1500));
-          await cjRequest((token) =>
-            axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/submitMergeOrderBatchV3',
-              group.mergeShopOrderVOList,
-              { headers: { 'CJ-Access-Token': token } }
-            )
-          );
-        } catch (mergeErr) { try { Sentry.captureException(mergeErr); } catch (__laclarcGuard) {} console.error('🔴 [Auto-Merge] group submission FAILED: ' + mergeErr.message); }
+      if (matchRes.data.code === 200 && matchRes.data.data?.result?.length > 0) {
+        const groups = matchRes.data.data.result;
+        let okGroups = 0, failGroups = 0, linkedTotal = 0;
+        for (const group of groups) {
+          try {
+            await new Promise(r => setTimeout(r, 1500));
+            const out = await mergeTracker.submitMergeGroup(group);
+            if (out.ok) { okGroups++; linkedTotal += out.linked.length; failGroups += out.failures.length; }
+            else failGroups++;
+          } catch (mergeErr) { try { Sentry.captureException(mergeErr); } catch (__laclarcGuard) {} console.error('🔴 [Auto-Merge] group submission FAILED: ' + mergeErr.message); failGroups++; }
+        }
+        // لوج حقيقي — ما بقاش "✅ completed" كاذب
+        console.log(`🔗 [Auto-Merge] done — groups ok=${okGroups}/${groups.length} · failures=${failGroups} · parents linked=${linkedTotal}`);
+        if (failGroups > 0) {
+          sendAdminAlert(
+            `🔗 [Laclarc] Auto-Merge — ${failGroups} مجموعة/أمر فاشل`,
+            `<p>الدمج الأوتوماتيكي اليومي: ${okGroups} مجموعات نجحو، ${failGroups} فشلو (أكواد الدوك 11001-11007/11100 — العنوان ماشي متطابق، لوجستيك ما كايناش...).</p>
+             <p>الأباء المرتبطين أوتوماتيكياً: ${linkedTotal}. التفاصيل فجدول audit (MERGE_GROUP_FAILED).</p>`
+          ).catch(() => {});
+        }
       }
-      console.log('✅ Auto-merge completed successfully!');
-    }
-  } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} console.error('🔴 [Auto-Merge] cron FAILED: ' + err.message); }
-});
+    } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {} console.error('🔴 [Auto-Merge] cron FAILED: ' + err.message); }
+  });
+}
 
 // 4. فحص وتنظيف المنتجات المحذوفة من CJ (أسبوعياً)
 cron.schedule('0 1 * * 0', async () => {
@@ -4221,6 +4305,35 @@ cron.schedule('0 */2 * * *', async () => {
   const healCron = process.env.SHIP_HEAL_CRON === '0' ? null : (process.env.SHIP_HEAL_CRON || '0 5,17 * * *');
   if (healCron) cron.schedule(healCron, async () => {
     try { await shipTruth.healReplacedTracking(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('TrackHeal Scheduler', e); }
+  });
+}
+
+// ═══ 🔍 F#79 — Wallet Recon (دوك shopping 2.4) — الحقيقة المالية أسبوعياً ═══
+//     فواتير المحفظة مقابل DB: دفع على أمر ما معروفش · دفع مزدوج · سلسلة
+//     الرصيد مقطوعة (معاملات مخفاية). قراءة فقط + تقرير فcj_recon_reports
+//     + تنبيه أدمن. صفر كتابة خطرة — القرار بشري دايماً.
+//     Kill-switch: WALLET_RECON_CRON='0' · النافذة: WALLET_RECON_DAYS (default 8)
+{
+  const reconCron = process.env.WALLET_RECON_CRON === '0' ? null : (process.env.WALLET_RECON_CRON || '0 6 * * 1');
+  if (reconCron) cron.schedule(reconCron, async () => {
+    try {
+      const out = await reconService.runWalletRecon({ days: Number(process.env.WALLET_RECON_DAYS) || 8 });
+      console.log('🔍 [WalletRecon Scheduler] ' + JSON.stringify(out).slice(0, 200));
+    } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('WalletRecon Scheduler', e); }
+  });
+}
+
+// ═══ 🧟 F#79 — Orphan Sweep (دوك shopping 1.6 listOrder) — أسبوعياً بعد الwallet recon ═══
+//     أوامر كاينين فCJ ما معروفينش فDB (عكس الزومبي) + تضارب الحالات
+//     (CJ CANCELLED وDB paid). قراءة فقط + تقرير + تنبيه.
+//     Kill-switch: ORPHAN_SWEEP_CRON='0'
+{
+  const sweepCron = process.env.ORPHAN_SWEEP_CRON === '0' ? null : (process.env.ORPHAN_SWEEP_CRON || '0 7 * * 1');
+  if (sweepCron) cron.schedule(sweepCron, async () => {
+    try {
+      const out = await reconService.runOrphanSweep({ days: Number(process.env.WALLET_RECON_DAYS) || 8 });
+      console.log('🧟 [OrphanSweep Scheduler] ' + JSON.stringify(out).slice(0, 200));
+    } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('OrphanSweep Scheduler', e); }
   });
 }
 
@@ -4888,7 +5001,7 @@ cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 30 * (كل ساع�
   console.log('⏳ [CJ Logistics v3] Batch tracking (1 call / up to 50 orders)...');
   try {
     const { rows: pendingTrackingOrders } = await pool.query(`
-      SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number, created_at
+      SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number, cj_parent_order_number, created_at
       FROM orders
       WHERE status IN ('paid', 'fulfilled')
         AND (tracking_number IS NULL OR tracking_number = '')
@@ -4898,15 +5011,18 @@ cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 30 * (كل ساع�
     if (pendingTrackingOrders.length === 0) return;
 
     // ⭐ 1.16 قبل: رقم CJ (SD...) / رقم المتجر (STORE-x) / order id
+    // 🩹 F#79 — الوالد أولاً (الطفل مات بعد الدمج) + فك الsplit comma-joined
+    //   (السلسلة كاملة كانت مفتاح غلط دايماً — 1.16 كيتخطاها بصمت)
+    await mergeTracker.ensureMergeColumns(pool);
     const keys = pendingTrackingOrders.map(o => {
-      const stored = String(o.cj_order_number || '').trim();
-      const key = stored && !/^STORE-/i.test(stored) ? stored : `STORE-${o.id}`;
-      return { order: o, key };
+      const { all } = mergeTracker.cjLookupKeys(o);
+      return { order: o, keys: all.slice(0, 2) };  // والد + طفل أول — أقصى 2 مفتاح/طلب
     });
+    const flatKeys = [...new Set(keys.flatMap(k => k.keys))].slice(0, 50); // حد الدوك 1.16
 
     const batchRes = await cjRequest((token) =>
       axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetailBatch',
-        { orderIds: keys.map(k => k.key) },
+        { orderIds: flatKeys },
         { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
       )
     );
@@ -4931,8 +5047,10 @@ cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 30 * (كل ساع�
       if (d.cjOrderCode) byKey.set(String(d.cjOrderCode).toLowerCase(), d);
     }
 
-    for (const { order, key } of keys) {
-      const d = byKey.get(key.toLowerCase());
+    for (const { order, keys: orderKeys } of keys) {
+      // 🩹 F#79 — أول مفتاح كيلقى detail هو المستعمل (والد > طفل > STORE)
+      let d = null;
+      for (const k of orderKeys) { d = byKey.get(String(k).toLowerCase()) || null; if (d) break; }
       if (!d) continue; // CJ تخطاه بصمت — نستنى الدورة الجاية
 
       const status = String(d.orderStatus || '').toUpperCase();
@@ -4946,7 +5064,7 @@ cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 30 * (كل ساع�
            WHERE id = $2 AND status = 'paid'
              AND (tracking_number IS NULL OR tracking_number = '')
            RETURNING id`,
-          [track, order.id, d.cjOrderCode || key]
+          [track, order.id, d.cjOrderCode || orderKeys[0]]
         );
         if (upd.rows.length) {
           console.log(`🚀 [CJ Dispatched] #${order.id}: ${track} (${d.logisticName || '?'})`);
@@ -4984,7 +5102,7 @@ cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 30 * (كل ساع�
 cron.schedule('17,47 * * * *', async () => {
   try {
     const { rows: stuck } = await pool.query(`
-      SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number, created_at
+      SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number, cj_parent_order_number, created_at
       FROM orders
       WHERE status IN ('paid', 'fulfilled')
         AND (tracking_number IS NULL OR tracking_number = '')
@@ -4994,14 +5112,16 @@ cron.schedule('17,47 * * * *', async () => {
     `);
     if (!stuck.length) return;
 
+    // 🩹 F#79 — مفاتيح موحدة مع tracking cron (والد > طفل > STORE) — نفس mergeTracker.cjLookupKeys
+    await mergeTracker.ensureMergeColumns(pool);
     const keys = stuck.map(function (o) {
-      const stored = String(o.cj_order_number || '').trim();
-      return { order: o, key: (stored && !/^STORE-/i.test(stored)) ? stored : ('STORE-' + o.id) };
+      const { all } = mergeTracker.cjLookupKeys(o);
+      return { order: o, keys: all.slice(0, 2), parent: String(o.cj_parent_order_number || '').trim() };
     });
 
     const res = await cjRequest((token) =>
       axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetailBatch',
-        { orderIds: keys.map(function (k) { return k.key; }) },
+        { orderIds: [...new Set(keys.flatMap(function (k) { return k.keys; }))].slice(0, 50) },
         { headers: { 'CJ-Access-Token': token, 'Content-Type': 'application/json' } }
       )
     );
@@ -5013,16 +5133,28 @@ cron.schedule('17,47 * * * *', async () => {
       if (d.cjOrderCode) byKey.set(String(d.cjOrderCode).toLowerCase(), d);
     }
 
-    for (const { order, key } of keys) {
-      const d = byKey.get(key.toLowerCase());
+    for (const { order, keys: orderKeys, parent } of keys) {
+      let d = null;
+      for (const k of orderKeys) { d = byKey.get(String(k).toLowerCase()) || null; if (d) break; }
       if (!d) continue;
+      const primary = orderKeys[0];
       const status = String(d.orderStatus || '').toUpperCase();
       const hasLogi = !!d.logisticName;
       const paid = !!d.paymentDate;
 
       // 1) CREATED عالق بلا شحن بلا دفع → السلّم
+      // 🩹 F#79 — الطلب المدموج: بلا repair/delete/recreate على الأب (أشقاء يعيشو فيه!)
       if (status === 'CREATED' && !hasLogi && !paid) {
-        const rep = await autoRepairLogistics(d.cjOrderCode || key);
+        if (parent) {
+          console.warn('[AutoHeal] #' + order.id + ' merged (' + parent + ') — CREATED بلا لوجستيك؟ شك متضارب — تنبيه بلا لمس');
+          if (!global['_cjMergedConflict_' + order.id] || Date.now() - global['_cjMergedConflict_' + order.id] > 86400000) {
+            global['_cjMergedConflict_' + order.id] = Date.now();
+            sendAdminAlert('[CJ] Merged order #' + order.id + ' shows CREATED/no-logistics via parent ' + parent,
+              '<p>الأب كيبان CREATED بلا لوجستيك — شك متضارب مع دمج. افحص يدوياً فCJ — ما تلمسناش آلياً (حذف الأب كيقتل الأشقاء).</p>').catch(function () {});
+          }
+          continue;
+        }
+        const rep = await autoRepairLogistics(d.cjOrderCode || primary);
         if (rep.repaired) {
           console.log('[AutoHeal] #' + order.id + ' logistics bound: ' + rep.logisticsName + ' ($' + rep.postage + ')');
           continue;
@@ -5030,7 +5162,7 @@ cron.schedule('17,47 * * * *', async () => {
         if (!global['_cjRecreate_' + order.id]) {
           global['_cjRecreate_' + order.id] = true; // محاولة recreate واحدة برك لكل session
           console.warn('[AutoHeal] #' + order.id + ' repair failed (' + rep.reason + ') - delete + recreate...');
-          const del = await deleteCJOrder(d.orderId, d.cjOrderCode, key);
+          const del = await deleteCJOrder(d.orderId, d.cjOrderCode, primary);
           if (!del.ok) {
             console.warn('[AutoHeal] delete failed #' + order.id + ': ' + del.reason);
             sendAdminAlert('[CJ] Stuck order #' + order.id + ' - auto-repair & delete failed', '<p>repair: ' + rep.reason + ' | delete: ' + del.reason + '</p>').catch(function () {});
@@ -5060,12 +5192,15 @@ cron.schedule('17,47 * * * *', async () => {
         continue;
       }
 
-      // 2) شحن محدد لكن غير مدفوع عند CJ → autopay من المحفظة (2.2)
+      // 2) شحن محدد لكن غير مدفوع عند CJ → autopay من المحفظة
+      // 🩹 F#79 — المدموج بpayBalanceV2 بshipmentOrderId (الدوك 2.2 كترفض orderId واحد للأب)
       if (hasLogi && !paid && (status === 'UNPAID' || status === 'CREATED')) {
         if (!global['_cjPayTry_' + order.id] || Date.now() - global['_cjPayTry_' + order.id] > 3600000) {
           global['_cjPayTry_' + order.id] = Date.now();
-          const pay = await payCJOrderBalance(d.orderId, d.cjOrderCode, key);
-          console.log('[AutoHeal] payBalance #' + order.id + ':', pay.ok ? 'PAID' : 'failed: ' + pay.reason);
+          const pay = parent
+            ? await payCJOrderBalanceV2(d.orderId || parent, parent)
+            : await payCJOrderBalance(d.orderId, d.cjOrderCode, primary);
+          console.log('[AutoHeal] payBalance #' + order.id + (parent ? ' [V2 parent=' + parent + ']' : '') + ':', pay.ok ? 'PAID' : 'failed: ' + pay.reason);
         }
       }
     }
