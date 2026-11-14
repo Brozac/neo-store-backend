@@ -428,6 +428,9 @@ app.use(require('./routes/paymentGateways'));
 const paymentRoutes = require('./controllers/paymentController');
 app.use('/api/cj-live', require('./routes/cjLiveBridge'));
 app.use('/api/payment', paymentRoutes);
+
+// 🔐 F#73 PASSKEYS — WebAuthn endpoints (register/login/manage) — أدلة modern-web-guidance/passkeys
+app.use(require('./routes/webauthn'));
 // ==========================================
 // 🩹 M#29 — Status Labels (human-readable, unified)
 // ==========================================
