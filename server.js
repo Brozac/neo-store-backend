@@ -86,6 +86,22 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
 const cron = require('node-cron');
 
+// ──── [LACLARC::CRON-SAFE] v1 (F#95) ────
+// 🩹 F#95 (LACLARC-SERVER-5) — crons ديال env كيمرو لـ node-cron بلا تحقق:
+//   تعبير مستحيل (مثال حي 2026-10-18: يوم 31 فشهر 2 = "31 2 is an impossible
+//   day of month") كيرمي من node-cron وقت الجدولة — Sentry fatal.
+//   helper: التعبير الخايب ما يطيحش الجدولة، كيتسجل صوت قوي + warning فـ Sentry.
+function safeScheduleCron(expr, label, fn) {
+  try {
+    cron.schedule(expr, fn);
+    console.log(`⏰ [CRON] ${label} scheduled: ${expr}`);
+  } catch (e) {
+    console.error(`❌ [CRON] تعبير غير صالح لـ ${label}: "${expr}" — ${e.message}`);
+    try { Sentry.captureMessage(`Invalid cron expression for ${label}: ${expr} (${e.message})`, 'warning'); } catch (__laclarcGuard) {}
+  }
+}
+// ──── [/LACLARC::CRON-SAFE] ────
+
 // 🩹 FIX 18-C1 — CJ_API كان غير معرّف فـ server.js (معرّف غير داخل services/*) → ReferenceError
 //   كايقبل كرونات TopSellers (0 5 * * *) كل يوم 5ص بصمت — الميزة كانت ميتة من الولادة (Task 18)
 const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
@@ -3188,7 +3204,11 @@ app.post('/api/payment/verify-session', async (req, res) => {
     let session;
     try {
       session = await stripe.checkout.sessions.retrieve(session_id);
-    } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
+    } catch (e) {
+      // 🩹 F#95 (LACLARC-SERVER-S) — جلسات cs_probe_* ديال audits ديالنا = ضجيج فالداشبورد؛
+      //   كيرجعو 404 نظيف بلا ما يوصلو لـ Sentry (الغلطة الحقيقية ديال كلاينت كتبقى كتلقط)
+      const isProbe = typeof session_id === 'string' && session_id.startsWith('cs_probe_');
+      if (!isProbe) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} }
       // session_id غير صالح/منتهي → 404 نظيف بدل 500
       return res.status(404).json({ success: false, error: 'Invalid checkout session' });
     }
@@ -4240,7 +4260,7 @@ cron.schedule('30 2 * * *', async () => {
 //    Kill-switch: MERGE_CRON='0'
 {
   const mergeCron = process.env.MERGE_CRON === '0' ? null : (process.env.MERGE_CRON || '0 * * * *');
-  if (mergeCron) cron.schedule(mergeCron, async () => {
+  if (mergeCron) safeScheduleCron(mergeCron, 'MergeTracker', async () => {
     try {
       const matchRes = await cjRequest((token) =>
         axios.post('https://developers.cjdropshipping.com/api2.0/v1/shopping/mergeOrder/autoMatchMergeOrderListV3',
@@ -4325,7 +4345,7 @@ cron.schedule('0 */2 * * *', async () => {
 //     Kill-switch: SHIP_HEAL_CRON='0' · العتبة: TRACK_HEAL_STALE_DAYS (default 10)
 {
   const healCron = process.env.SHIP_HEAL_CRON === '0' ? null : (process.env.SHIP_HEAL_CRON || '0 5,17 * * *');
-  if (healCron) cron.schedule(healCron, async () => {
+  if (healCron) safeScheduleCron(healCron, 'TrackHeal', async () => {
     try { await shipTruth.healReplacedTracking(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('TrackHeal Scheduler', e); }
   });
 }
@@ -4337,7 +4357,7 @@ cron.schedule('0 */2 * * *', async () => {
 //     Kill-switch: WALLET_RECON_CRON='0' · النافذة: WALLET_RECON_DAYS (default 8)
 {
   const reconCron = process.env.WALLET_RECON_CRON === '0' ? null : (process.env.WALLET_RECON_CRON || '0 6 * * 1');
-  if (reconCron) cron.schedule(reconCron, async () => {
+  if (reconCron) safeScheduleCron(reconCron, 'WalletRecon', async () => {
     try {
       const out = await reconService.runWalletRecon({ days: Number(process.env.WALLET_RECON_DAYS) || 8 });
       console.log('🔍 [WalletRecon Scheduler] ' + JSON.stringify(out).slice(0, 200));
@@ -4351,7 +4371,7 @@ cron.schedule('0 */2 * * *', async () => {
 //     Kill-switch: ORPHAN_SWEEP_CRON='0'
 {
   const sweepCron = process.env.ORPHAN_SWEEP_CRON === '0' ? null : (process.env.ORPHAN_SWEEP_CRON || '0 7 * * 1');
-  if (sweepCron) cron.schedule(sweepCron, async () => {
+  if (sweepCron) safeScheduleCron(sweepCron, 'OrphanSweep', async () => {
     try {
       const out = await reconService.runOrphanSweep({ days: Number(process.env.WALLET_RECON_DAYS) || 8 });
       console.log('🧟 [OrphanSweep Scheduler] ' + JSON.stringify(out).slice(0, 200));
@@ -4429,7 +4449,7 @@ async function runWalletWatch() {
 }
 {
   const walletCron = process.env.CJ_WALLET_CRON === '0' ? null : (process.env.CJ_WALLET_CRON || '20 9 * * *');
-  if (walletCron) cron.schedule(walletCron, async () => {
+  if (walletCron) safeScheduleCron(walletCron, 'WalletWatch', async () => {
     try { await runWalletWatch(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('WalletWatch Scheduler', e); }
     try { await runWebhookSilenceGuard(); } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} logger.logError('WebhookSilenceGuard Scheduler', e); } // v37 H4
   });
@@ -5022,6 +5042,10 @@ cron.schedule('0 5 * * *', async () => {
 cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 30 * (كل ساعة على :30) → انتقل لـ :00 باش يتجمع مع الباقي في صحوة وحدة
   console.log('⏳ [CJ Logistics v3] Batch tracking (1 call / up to 50 orders)...');
   try {
+    // 🩹 F#95 (LACLARC-SERVER-9) — الـ SELECT كيقرا cj_parent_order_number — خاص الضمان الذاتي
+    //   قبل الاستعلام (كان بعدو → عملية جديدة = "column does not exist" كل ساعة → Sentry).
+    //   ensureMergeColumns كاشة بـ flag — ALTER وحدة فالعملية، صفر تكلفة بعد الأول.
+    await mergeTracker.ensureMergeColumns(pool);
     const { rows: pendingTrackingOrders } = await pool.query(`
       SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number, cj_parent_order_number, created_at
       FROM orders
@@ -5123,6 +5147,8 @@ cron.schedule('0 * * * *', async () => { // CRON-THIN: كان 30 * (كل ساع�
 // ==========================================
 cron.schedule('17,47 * * * *', async () => {
   try {
+    // 🩹 F#95 (LACLARC-SERVER-9) — نفس الدرس: الضمان قبل الـ SELECT اللي كيقرا cj_parent_order_number
+    await mergeTracker.ensureMergeColumns(pool);
     const { rows: stuck } = await pool.query(`
       SELECT id, status, customer_name, customer_email, customer_phone, total_amount, cj_order_number, cj_parent_order_number, created_at
       FROM orders
@@ -5370,11 +5396,16 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
     });
 
     const formattedHistory = Array.isArray(history)
-      ? history.slice(-4).map(h => ({
-          role: h.sender === 'user' ? 'user' : 'model',
-          parts: [{ text: h.text }]
-        }))
+      ? history.slice(-4)
+          .map(h => ({
+            role: h.sender === 'user' ? 'user' : 'model',
+            parts: [{ text: h.text }]
+          }))
+          .filter(h => h.parts[0].text) // 🩹 F#95 — خلايا فارغة كترفض من Gemini
       : [];
+    // 🩹 F#95 (LACLARC-SERVER-3) — Gemini كيطلب أول content = role 'user':
+    //   slice(-4) كيقدر يقص النافذة بعد رد الموديل → "First content should be with role 'user', got model"
+    while (formattedHistory.length && formattedHistory[0].role === 'model') formattedHistory.shift();
 
     const chat = model.startChat({
       history: formattedHistory,

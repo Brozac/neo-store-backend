@@ -18,6 +18,9 @@ let cachedCjToken = null;
 let cachedCjTokenExpiry = null;
 let cachedCjRefreshToken = null;
 let tokenRefreshPromise = null; // ✨ Mutex — حماية ضد تسابق التوكن
+// 🩹 F#95 (LACLARC-SERVER-9) — flag الضمان الذاتي تاع selfHealStuckOrders
+//   (ما يقدرش يستعمل mergeTracker.ensureMergeColumns هنا — mergeTracker كيطلب cjService = circular)
+let selfHealColsEnsured = false;
 
 // ==========================================
 // 1. نظام إدارة وتجديد التوكن المحصن (Thread-Safe)
@@ -1844,6 +1847,14 @@ async function selfHealStuckOrders() {
       console.error(`🩺 [SelfHeal] L0 error: ${e.message}`);
     }
 
+    // 🩹 F#95 (LACLARC-SERVER-9) — نفس الضمان الذاتي (نمط F54/F#77): الـ SELECT كيقرا
+    //   cj_parent_order_number — بلا ضمان = "column does not exist" فكل عملية جديدة.
+    //   ALTER ... IF NOT EXISTS = idempotent، وflag = مرة وحدة فالعملية.
+    if (!selfHealColsEnsured) {
+      await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS cj_parent_order_number TEXT NOT NULL DEFAULT ''`);
+      await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS parent_merged_at TIMESTAMPTZ`);
+      selfHealColsEnsured = true;
+    }
     const { rows: candidates } = await pool.query(`
       SELECT id, cj_order_number, cj_parent_order_number, total_amount, customer_name, customer_email, created_at
       FROM orders

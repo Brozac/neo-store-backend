@@ -107,6 +107,61 @@ function logError(context, err) {
   logger.logError(context, err);
 }
 
+// ──── [LACLARC::WEBAUTHN-ENSURE] v1 (F#95) ────
+// 🩹 F#95 (LACLARC-SERVER-14) — "relation webauthn_credentials does not exist" فالإنتاج:
+//   migration 003 كانت فيها باغ SQL (SET lock_timeout = "5s" بعلامات مزدوجة → syntax error)
+//   → الجداول عمرو ما تخلقو فالإنتاج حتى لا التسجيل ولا اللوجين بالبصمة كانوا كيرميو.
+//   الضمان الذاتي (نمط F54/F#79): CREATE TABLE IF NOT EXISTS + flag-promise —
+//   مرة وحدة فالعملية، صفر تكلفة بعد الأول، آمن مع spin-down/restart ديال Render.
+let _webauthnEnsured = null;
+function ensureWebauthnTables() {
+  if (!_webauthnEnsured) {
+    _webauthnEnsured = (async () => {
+      await pool.query(`SET lock_timeout = '5s'`);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS webauthn_credentials (
+          id            TEXT PRIMARY KEY,
+          user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          public_key    TEXT NOT NULL,
+          counter       BIGINT NOT NULL DEFAULT 0,
+          transports    TEXT[] NOT NULL DEFAULT '{}',
+          device_type   TEXT,
+          backed_up     BOOLEAN NOT NULL DEFAULT FALSE,
+          aaguid        TEXT,
+          name          TEXT NOT NULL DEFAULT 'Passkey',
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          last_used_at  TIMESTAMPTZ
+        );
+      `);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id);`);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS webauthn_challenges (
+          id          TEXT PRIMARY KEY,
+          challenge   TEXT NOT NULL UNIQUE,
+          type        TEXT NOT NULL CHECK (type IN ('registration', 'authentication')),
+          user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          uv          TEXT NOT NULL DEFAULT 'preferred',
+          conditional BOOLEAN NOT NULL DEFAULT FALSE,
+          created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          expires_at  TIMESTAMPTZ NOT NULL
+        );
+      `);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_expiry ON webauthn_challenges(expires_at);`);
+      console.log('✅ [F#95] webauthn_credentials + webauthn_challenges ready (self-heal)');
+    })().catch((e) => {
+      _webauthnEnsured = null; // فشل → المحاولة الجاية تعاود (DB ناقص فالصحوة)
+      throw e;
+    });
+  }
+  return _webauthnEnsured;
+}
+// middleware: كل endpoint passkey كيدوز على الضمان قبل أي query
+router.use(async (req, res, next) => {
+  try { await ensureWebauthnTables(); next(); }
+  catch (e) { logError('WebAuthn ensure-tables', e); res.status(500).json({ error: 'Passkey storage unavailable' }); }
+});
+// ──── [/LACLARC::WEBAUTHN-ENSURE] ────
+
 // ══════════════════════════════════════════════════════════════════════════
 // التسجيل — POST /api/auth/passkey/register/options (يتطلب Bearer JWT)
 // body اختياري: { promotion?: bool, conditional?: bool }

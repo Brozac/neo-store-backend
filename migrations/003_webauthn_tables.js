@@ -23,7 +23,9 @@ const run = async () => {
   const client = await pool.connect();
   try {
     console.log('⏳ F#73 — WebAuthn tables setup...');
-    await client.query('SET lock_timeout = "5s"');
+    // 🩹 F#95 — كانت \"5s\" بعلامات تنصياق مزدوجة = SQL غير صالح فPostgreSQL (identifier ماشي literal)
+    //   → الميغراسيون كانت كتفشل ديما → webauthn_credentials عمرو ما تخلق فالإنتاج (LACLARC-SERVER-14)
+    await client.query(`SET lock_timeout = '5s'`);
     await client.query('BEGIN');
 
     // 1. البصمات المسجلة — id هو الbase64url credential ID (lookup key وحيد)
