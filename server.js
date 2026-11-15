@@ -182,7 +182,17 @@ const wheelLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { e
 // ═══ 🆕 F#55 AntiClone — حماية الكاطالوگ من الاستنساخ الجماعي (قرار المالك «أ» 11-10) ═══
 // المفتاح = cf-connecting-ip إجباري: خلف Cloudflare مع trust proxy=1 الـ req.ip كيولّي
 //   IP تاع كلاودفلير ماشي تاع الزائر — الlimiter بلاها كيخنق كل الزوار مرة وحدة (فخ F#55)
-const antiCloneIp = (req) => String(req.headers['cf-connecting-ip'] || req.ip || 'unknown');
+// 🩹 F#96 — صياغة صحيحة لـ express-rate-limit v8 (فالإنتاج كان كيطلع ERR_ERL_KEY_GEN_IPV6 وقت boot):
+//   1) cf-connecting-ip كيتقبل غير إلا كان شكل IP صحيح (IPv4 ولا فيه ':') — إلا لا نرجع لـ req.ip
+//      (تزوير الـ header بقيم عشوائية كان كيهزم الـ limiter بالكامل — توّا كيرجع للـ IP الحقيقي)
+//   2) ipKeyGenerator كيعصر IPv6 على /56 — الـ rotation داخل الـ subnet ما يهزمش الحد
+//      (IPv4 وقيم أخرى كيتعداو كما هما — البرهان الحي: ipKeyGenerator('junk') = 'junk')
+const antiCloneIp = (req) => {
+  const cf = String(req.headers['cf-connecting-ip'] || '');
+  const validCf = /^\d{1,3}(\.\d{1,3}){3}$/.test(cf) || cf.includes(':');
+  const raw = validCf ? cf : String(req.ip || 'unknown');
+  return rateLimit.ipKeyGenerator(raw);
+};
 // حارس الأصل: Origin موجود ولازم يكون من قائمة cors المسموحة (+ apex/www مفروضين —
 //   www.laclarc.com كيخدم بنفسو بلا redirect — تحقق حي 11-10). الطلبات بلا Origin
 //   (SSR/سيرفر-لسيرفر) كتعدّ عادية — الحماية الحقيقية: الlimiter + طبقة Cloudflare
