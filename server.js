@@ -8,6 +8,37 @@ function escapeLikeSafe(s) {
 
 require('dotenv').config();
 
+// ──── [LACLARC::SENTRY-INIT] v2 (F#94) ────
+// 👁️ Sentry Phase 1 — عيون الموقع (Tenet: 记录即真相 / catch 中禁止沉默).
+//    DSN كيجي من البيئة (Render → SENTRY_DSN). بلا DSN = no-op آمن:
+//    النشر كيمشي قبل ما تضبط المفاتيح — صفر خطأ، تفعيل لحظة ما تزيد الـ var.
+//
+//    🩹 F#94 — v1→v2: كان البلوك هناك فالسطر ~70 (بعد require('express')) — والنتيجة
+//    فالإنتاج (Render logs 2026-11-13): "[Sentry] express is not instrumented".
+//    الجذر (مثبت من سورس SDK 10.76.2 — integrations/tracing/express.js):
+//      expressIntegration كتّپاتش modules فـ require-time عبر require-in-the-middle
+//      → أي module تحمّل قبل init = ما تّپاتشاش → صفر spans ديال الـ requests،
+//      و ensureIsWrapped(app.use, "express") كتطلع الـ warning فكل بوت.
+//    الحل: هادا أول require فالملف (من بعد dotenv حيت DSN كيجي من env المحلي).
+//    v10: expressIntegration ضمن defaults ملي hasSpansEnabled (tracesSampleRate
+//    معرّف حتى بـ 0) → ما محتاجينش integrations يدوية.
+const Sentry = require('@sentry/node');
+
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  environment: process.env.NODE_ENV || 'production',
+  release: 'laclarc-server@' + (process.env.RENDER_GIT_COMMIT || 'dev'),
+  tracesSampleRate: 0, // مرحلة 1 = أخطاء فقط (مجاني 5K/شهر)
+  beforeSend(event) {
+    // Privacy scrub — معطيات المستخدمين ما كتمشيش لـ Sentry
+    // 🩹 F#94: query_string زايدة فالتنقية — كتقدر تحمل توكنات/مفاتيح فالاستعلامات
+    if (event.user) delete event.user;
+    if (event.request) { delete event.request.cookies; delete event.request.headers; delete event.request.query_string; }
+    return event;
+  },
+});
+// ──── [/LACLARC::SENTRY-INIT] ────
+
 const express = require('express');
 const cors = require('cors');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -62,26 +93,7 @@ const CJ_API = 'https://developers.cjdropshipping.com/api2.0/v1';
 // ✨ Pool واحد مشترك من db.js
 const pool = require('./db');
 
-// ──── [LACLARC::SENTRY-INIT] v1 (Task 16) ────
-// 👁️ Sentry Phase 1 — عيون الموقع (Tenet: 记录即真相 / catch 中禁止沉默).
-//    DSN كيجي من البيئة (Render → SENTRY_DSN). بلا DSN = no-op آمن:
-//    النشر كيمشي قبل ما تضبط المفاتيح — صفر خطأ، تفعيل لحظة ما تزيد الـ var.
-//    ⚠️ هاد البلوك قبل أي route — نفس درس first-line injection (Task 14-c).
-const Sentry = require('@sentry/node');
-
-Sentry.init({
-  dsn: process.env.SENTRY_DSN,
-  environment: process.env.NODE_ENV || 'production',
-  release: 'laclarc-server@' + (process.env.RENDER_GIT_COMMIT || 'dev'),
-  tracesSampleRate: 0, // مرحلة 1 = أخطاء فقط (مجاني 5K/شهر)
-  beforeSend(event) {
-    // Privacy scrub — معطيات المستخدمين ما كتمشيش لـ Sentry
-    if (event.user) delete event.user;
-    if (event.request) { delete event.request.cookies; delete event.request.headers; }
-    return event;
-  },
-});
-// ──── [/LACLARC::SENTRY-INIT] ────
+// 🩹 F#94 — بلوك SENTRY-INIT انتقل للفوق (قبل require('express')) — الشرح الكامل هناك.
 
 const app = express();
 
@@ -99,10 +111,20 @@ if (Sentry.Handlers && typeof Sentry.Handlers.requestHandler === 'function') {
 }
 // ──── [/LACLARC::SENTRY-REQ] ────
 
-// ──── [LACLARC::SENTRY-TEST] v1 (Task 16) ────
+// ──── [LACLARC::SENTRY-TEST] v2 (F#94) ────
 // 🔬 marker endpoint — البرهان الحي (منهجية Task 14-c):
-//    curl "https://<host>/__sentry_test?go=1"  →  الحدث فـ dashboard ≤60s
+//    curl "https://<host>/__sentry_test?go=1&key=<SENTRY_TEST_KEY>"  →  الحدث فـ dashboard ≤60s
+//
+//    🩹 F#94 — كان مفتوح للعامة: أي حد فالإنترنت يقدر يطلق ?go=1 بلا حدود
+//    → حرق الكوتا (مجاني 5K/شهر) + سبام فالداشبورد. v2: فالإنتاج كيتطلب
+//    SENTRY_TEST_KEY (Render env). بلا مفتاح مضبوط = 403 ديما (فشل آمن).
+//    محلياً (NODE_ENV ≠ production) باقي مفتوح للتجربة السريعة.
 app.get('/__sentry_test', (req, res) => {
+  const isProd = (process.env.NODE_ENV || 'production') === 'production';
+  const testKey = process.env.SENTRY_TEST_KEY || '';
+  if (isProd && (!testKey || req.query.key !== testKey)) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
   if (req.query.go === '1') {
     Sentry.captureMessage('LACLARC-SENTRY-OK :: test event from ' + (req.ip || 'unknown'), 'info');
     return res.json({ ok: true, marker: 'LACLARC-SENTRY-OK', note: 'Check your Sentry dashboard within ~60 seconds' });
