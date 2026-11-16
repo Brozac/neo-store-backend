@@ -853,13 +853,19 @@ app.get('/api/reviews/:productId', async (req, res) => {
   try {
     const { productId } = req.params;
     // 🩹 FIX — أعمدة محددة (كان SELECT * يخرج user_id الداخلي في رد عام)
-    const result = await pool.query('SELECT id, product_id, author, rating, content, country, images, created_at FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [productId]);
+    // 🩹 F105-EGRESS R2 — LIMIT 50 + عدّ متوازٍ (كان بلا سقف: كل الريفيوزات كيمشيو فالرد)
+    const [result, countsRes] = await Promise.all([
+      pool.query('SELECT id, product_id, author, rating, content, country, images, created_at FROM reviews WHERE product_id = $1 ORDER BY created_at DESC LIMIT 50', [productId]),
+      pool.query('SELECT COUNT(*)::int AS n FROM reviews WHERE product_id = $1', [productId]),
+    ]);
+    const countLocal = countsRes.rows[0].n;
     // ⭐ [cj-reviews] — المحليون أولاً (زبائن حقيقيون) ثم ريفيوزات CJ (كاش 6 ساعات)
     const cj = await getCjMergedReviews(productId); // [cj-reviews v2] { rows, total }
     const merged = [...result.rows, ...cj.rows];
 
     // ⭐ [cj-reviews v2] — ?v2=1 → { reviews, meta }: meta.total = الإجمالي الحقيقي
     //    (المحليون + total تاع CJ) ماشي غير المحمّل. بلا ?v2 → array القديم (توافق رجعي كامل).
+    res.set('Cache-Control', 'public, s-maxage=120, stale-while-revalidate=600'); // 🩹 F105-EGRESS R2
     if (req.query.v2 === '1' || req.query.v2 === 'true') {
       const counts = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
       for (const r of merged) {
@@ -869,10 +875,10 @@ app.get('/api/reviews/:productId', async (req, res) => {
       return res.json({
         reviews: merged,
         meta: {
-          total: result.rows.length + (cj.total || cj.rows.length),
+          total: countLocal + (cj.total || cj.rows.length), // 🩹 F105-EGRESS R2 — العدد الحقيقي المحلي
           loaded: merged.length,
           counts,
-          local: result.rows.length,
+          local: countLocal, // 🩹 F105-EGRESS R2
           cj: cj.rows.length,
           hasMore: cj.total > cj.rows.length, // CJ عندها أكثر مما حُمّل → عرض جزئي صادق
         },
@@ -1054,7 +1060,58 @@ const __lruMake = (max, ttlMs) => {
 const __pdpCache = __lruMake(1000, 10 * 60 * 1000);       // صفحة منتج — 10 دقايق
 const __relCache = __lruMake(3000, 6 * 60 * 60 * 1000);   // مقترحات المنتج — 6 ساعات
 
+// ═══ 🩹 F105-EGRESS R1 — PDP/Related LRU cache + schema-aware projection ═══
+// الحرق الحقيقي (pg_stat_statements): SELECT * × ~304k/شهر (2.9KB/صف ≈ 880MB) + /related × 299k نداء × 2 استعلام
+const PDP_CACHE_MAX = 300;
+const PDP_CACHE_TTL = 10 * 60 * 1000; // 10 دقائق — أقصر من ISR (24h) فالداتا كتبقى أحدث
+const pdpCache = new Map(); // id -> { exp, val }
+const relCache = new Map(); // id -> { exp, val } — كاش /related (R3)
+
+function __cacheGet(map, key) {
+  const e = map.get(key);
+  if (!e) return null;
+  if (Date.now() > e.exp) { map.delete(key); return null; }
+  map.delete(key); map.set(key, e); // LRU touch
+  return e.val;
+}
+function __cacheSet(map, key, val) {
+  if (map.size >= PDP_CACHE_MAX) map.delete(map.keys().next().value);
+  map.set(key, { exp: Date.now() + PDP_CACHE_TTL, val });
+}
+function pdpCacheGet(key) { return __cacheGet(pdpCache, key); }
+function pdpCacheSet(key, val) { __cacheSet(pdpCache, key, val); }
+function relCacheGet(key) { return __cacheGet(relCache, key); }
+function relCacheSet(key, val) { __cacheSet(relCache, key, val); }
+
+// projection: أعمدة مضمونة (19 — كلهم verified information_schema) + اختياريين تُكتشفو مرة واحدة
+//cj_product_id ضروري للـ DeliveryEstimator · seo_* ضروريين لـ generateMetadata (page.tsx)
+const PDP_COLS_GUARANTEED = ['id','title','description','price','original_price','image_url','images','variants','colors','sizes','category','video_url','material','stock_status','cj_product_id','is_sourced','created_at','seo_title','seo_meta_description'];
+const PDP_COLS_OPTIONAL = ['patterns','colour_names','size_names','pattern','origin','composition'];
+let __pdpOptionalCols = null;
+async function getPdpOptionalColumns() {
+  if (__pdpOptionalCols) return __pdpOptionalCols;
+  try {
+    const r = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name='products' AND column_name = ANY($1)", [PDP_COLS_OPTIONAL]);
+    __pdpOptionalCols = r.rows.map(x => x.column_name);
+  } catch (e) {
+    __pdpOptionalCols = []; // فشل الكشف → الأعمدة المضمونة فقط (الـ SELECT ديالنا مضمون 100%)
+  }
+  return __pdpOptionalCols;
+}
+// بديل SELECT * — إلا فشلشي حاجة كيترجع للأعمدة المضمونة، عمرو ما كيدير 500
+async function fetchProductProjected(pid) {
+  const optional = await getPdpOptionalColumns();
+  const cols = PDP_COLS_GUARANTEED.concat(optional).join(', ');
+  try {
+    return await pool.query('SELECT ' + cols + ' FROM products WHERE id = $1', [pid]);
+  } catch (e) {
+    console.warn('[F105] projected select failed (' + e.message + ') -> guaranteed-only fallback');
+    return pool.query('SELECT ' + PDP_COLS_GUARANTEED.join(', ') + ' FROM products WHERE id = $1', [pid]);
+  }
+}
+
 function clearProductsCache() {
+  try { pdpCache.clear(); relCache.clear(); } catch (__f105e) {} // 🩹 F105-EGRESS R1 — نفس الزناد كينقّي كل الكاشات
   productsCache = null;
   cacheTime = 0;
   __pdpCache.clear();  // 🩹 F#69 — النقاء كيمشي مع كل 20 نقطة تعديل موجودة بلا استدعاء جديد
@@ -2893,7 +2950,10 @@ app.get('/api/products/:id', async (req, res) => {
     // 🩹 F#69 EGRESSGUARD — SELECT * كان 166k نداء فالمرصود — دابا LRU 10 دقايق
     // (الصف كامل مع الوصف/الصور/الvariants = أكبر بند egress على Supabase)
     let product = await __pdpCache.get(`p${pid}`, async () => {
-      const result = await pool.query('SELECT * FROM products WHERE id = $1', [pid]);
+      // 🩹 F105-EGRESS R4 — cache-first + projection (SELECT * كان 2.9KB × ~304k مشاهدة/شهر ≈ 880MB)
+      const __pdpHit = pdpCacheGet(pid);
+      const result = __pdpHit ? { rows: [__pdpHit] } : await fetchProductProjected(pid);
+      if (!__pdpHit && result.rows.length > 0) pdpCacheSet(pid, result.rows[0]);
       if (result.rows.length === 0) return null;
       const p = result.rows[0];
       if (p.images && typeof p.images === 'string') {
@@ -2946,6 +3006,13 @@ app.get('/api/products/:id/related', async (req, res) => {
     const pid = parseInt(id, 10);
     if (!Number.isInteger(pid) || pid <= 0) {
       return res.status(404).json({ error: 'Product not found' });
+    }
+
+    // 🩹 F105-EGRESS R3 — كاش المرتبطين (كان 600k استعلام/شهر = أكبر مستهلك: CPU ~9.3h + ~750MB egress)
+    const __relHit = relCacheGet(pid);
+    if (__relHit) {
+      res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+      return res.json(__relHit);
     }
 
     // 🩹 F#69 EGRESSGUARD — related كان 167,138 نداء ×196ms (بلا فهرس category)
