@@ -112,6 +112,8 @@ const pool = require('./db');
 // 🩹 F#94 — بلوك SENTRY-INIT انتقل للفوق (قبل require('express')) — الشرح الكامل هناك.
 
 const app = express();
+// F#105-EGRESS (F105-PATCH-MODULE v2) — gzip + response cache + CDN headers. Remove this line + f105-egress-patch.js to uninstall.
+try { require('./f105-egress-patch')(app); } catch (e) { console.error('[F105] module failed, server continues without it:', e.message); }
 
 // ──── [LACLARC::SENTRY-REQ] v2 (Task 16-b hotfix) ────
 // request context — v2: تصحيح باغ الإنتاج (TypeError: app.use() requires a middleware function)
