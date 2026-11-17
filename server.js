@@ -1087,7 +1087,20 @@ app.get('/api/upload', async (req, res) => {
     try {
       const key = 'test/selftest-' + Date.now() + '.txt';
       const url = await f105R2PutObject(key, Buffer.from('F105 selftest ' + new Date().toISOString()), 'text/plain');
-      return res.json({ ok: true, selftest: url, bucket: cfg.bucket, publicBase: cfg.pub });
+      // F#105-P2 — تحقق من القراءة العامة: الرفع بوحدو ما يكفيش — لازم public access مفعّل
+      let publicRead = false, readStatus = 0;
+      try {
+        const check = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        readStatus = check.status;
+        publicRead = check.ok;
+      } catch (_) { readStatus = -1; }
+      return res.json({
+        ok: true, selftest: url, bucket: cfg.bucket, publicBase: cfg.pub,
+        publicRead, readStatus,
+        hint: publicRead
+          ? 'السلسلة كاملة خدامة: رفع + قراءة عامة'
+          : 'الرفع نجح لكن القراءة العامة فشلت — فعّل public access (R2.dev) تاع laclarc-media في Cloudflare dashboard'
+      });
     } catch (e) { return res.status(500).json({ ok: false, error: String(e.message || e).slice(0, 300) }); }
   }
   return res.json({ ok: true, storage: 'R2', bucket: cfg.bucket, publicBase: cfg.pub });
