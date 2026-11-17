@@ -1,477 +1,433 @@
 #!/usr/bin/env node
-/* ═══════════════════════════════════════════════════════════════════════════
-   apply-f105.js — F#105 EGRESS FIX KIT  v2.1
-   ═══════════════════════════════════════════════════════════════════════════
-   الهدف: تخفيض egress ديال Supabase (6.57GB/شهر ← تحت 5GB)
-
-   الإصلاحات:
-     R1  PDP SELECT * → projection متحقق من قاعدة البيانات + LEFT(description,4000)
-         (~880MB/شهر من الـ egress — الاستعلامات بـ id=$1 فقط، مسارات admin كتتخطى)
-     R2  /related in-memory cache (600k استدعاء/شهر كانوا بلا أي تخزين مؤقت)
-     R4  f105-truncate-descriptions.sql — قص الوصف الزائد (يدوي، بلا تنفيذ آلي)
-     R3  (backlog — بلا كود): feed md5 query 11.7s — يحتاج تحسين يدوي
-
-   الاستعمال:
-     node apply-f105.js server.js              ← DRY-RUN: فحص + تقرير، بلا تعديل
-     node apply-f105.js server.js --apply      ← تطبيق فعلي (مع backup)
-     node apply-f105.js server.js --apply --db "postgres://..."   ← فرض رابط DB
-
-   المخرجات (فـ مجلد server.js):
-     f105-scan-report.txt             ← دوماً (حتى فـ dry-run)
-     f105-truncate-descriptions.sql   ← دوماً (تنفيذه يدوي فـ Supabase SQL Editor)
-     server.js.pre-f105.bak           ← فقط مع --apply
-
-   كل إصلاح مستقل: فشل واحد ما كيوقفش الباقي.
-   ═══════════════════════════════════════════════════════════════════════════ */
 'use strict';
+/*
+====================================================================
+ F#105 EGRESS KIT v2 — apply-f105.js
+ الهدف: تخفيض Supabase DB egress (6.57GB/شهر => تحت الـ 5GB)
+
+ R1  column projection : SELECT * => قائمة أعمدة صريحة (استعلامات LIST)
+     — كيحذف description + variants من استعلامات القوائم فقط
+     — PDP / :slug / :id / admin كيبقى كامل (صحة الواجهة قبل كلش)
+     — القائمة كيتحسبها أوتوماتيك من الـ DB (information_schema)
+       إلا ما وصلش للـ DB: استعمل --cols=a,b,c
+ R2  /related cache    : middleware f105Cached(TTL 6h) بمفتاح X-F105-Cache
+     — /related = ~600K استدعاء/شهر بلا كاش (حسب pg_stat_statements)
+ R4  truncate desc     : description > 2000 حرف => LEFT(description,2000)
+     — 15,524 منتج (أقصى 89,112 حرف) — UPDATE على دفعات 1000
+     — الفحص/العدّ يدير أوتوماتيك؛ التنفيذ يتطلب --db-apply
+
+ الاستعمال:
+   node apply-f105.js server.js              تطبيق R1+R2 + عدّ R4
+   node apply-f105.js server.js --db-apply   + تنفيذ R4 UPDATE فالـ DB
+   node apply-f105.js server.js --dry-run    فحص فقط — بلا أي كتابة
+   node apply-f105.js server.js --restore    رجوع لآخر backup
+
+ أعلام:
+   --cols=a,b,c          فرض قائمة الأعمدة يدوي (إلا الـ DB ماشي reachable)
+   --desc-limit=N        حد قص الـ description (default 2000)
+   --related-ttl-min=N   مدة كاش /related بالدقائق (default 360 = 6 سوايع)
+   --keep-desc           خلّي description حتى فقوائم LIST (rollback سريع)
+
+ الأمان:
+   backup تلقائي server.js.f105-backup-<timestamp>.js قبل أي كتابة
+   node --check بعد الكتابة — إلا فشل كيرجّع الأصلي أوتوماتيك
+   تقرير f105-scan-report.txt كيتكتب ديما
+   => إلا فشل شي إصلاح (Anchor not found / classification غالطة)
+      صيفط الملف f105-scan-report.txt كامل للمعايرة
+====================================================================
+*/
+
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
+const { spawnSync } = require('child_process');
 
-const KIT_VERSION = '2.1';
-const MARK_R1 = 'F105:[R1]';
-const MARK_R2 = 'F105:[R2]';
-const MARK_TOP = 'F#105 egress kit';
-const DESC_CAP = 4000;          // LEFT(description, N)
-const FAT_EXCLUDE_BYTES = 8192; // نص بحجم متوسط أكبر من هادا → يتقصى من projection (ماشي فـ FORCE)
-const FORCE_COLUMNS = new Set([
-  'id', 'slug', 'name', 'title', 'price', 'sale_price', 'compare_price', 'old_price',
-  'category', 'subcategory', 'images', 'variants', 'colors', 'sizes', 'brand',
-  'rating', 'rating_average', 'reviews_count', 'stock', 'inventory', 'active',
-  'is_active', 'published', 'created_at', 'updated_at',
-  'cj_product_id', 'seo_title', 'seo_meta_description',
-]);
-const SAMPLE_TYPES = ['text', 'character varying', 'character', 'json', 'jsonb'];
+const VERSION = 'v2.0';
+const REPORT_NAME = 'f105-scan-report.txt';
+const DROPLIST = ['description', 'variants'];
+const SQL_KEYWORDS = new Set(['WHERE','GROUP','ORDER','LIMIT','OFFSET','JOIN','LEFT','RIGHT','INNER',
+  'OUTER','FULL','CROSS','UNION','ON','SET','VALUES','RETURNING','FOR','AND','OR','NOT','AS','BY',
+  'HAVING','INTO','USING','NATURAL','CASE','WHEN','THEN','ELSE','END','SELECT','FROM','DISTINCT']);
 
-/* ── CLI ─────────────────────────────────────────────────────────────────── */
-function parseArgs(argv) {
-  const args = { target: 'server.js', apply: false, db: null };
-  for (const a of argv) {
-    if (a === '--apply') args.apply = true;
-    else if (a.startsWith('--db=')) args.db = a.slice(5);
-    else if (a === '--db') { /* next arg handled below */ }
-    else if (!a.startsWith('--')) args.target = a;
-  }
-  // handle: --db <url>
-  const i = argv.indexOf('--db');
-  if (i !== -1 && argv[i + 1] && !argv[i + 1].startsWith('--')) args.db = argv[i + 1];
-  return args;
+// ─── parsing flags ───
+let target = null, dry = false, dbApply = false, restore = false, colsOverride = null;
+let descLimit = 2000, relatedTtlMin = 360, keepDesc = false;
+
+function help() {
+  console.log(`
+F#105 EGRESS KIT ${VERSION} — node apply-f105.js server.js [flags]
+  --db-apply          + تنفيذ R4 (قص description) فالـ DB
+  --dry-run           فحص فقط بلا كتابة
+  --restore           رجوع لآخر backup
+  --cols=a,b,c        قائمة أعمدة يدوي (بدون DB)
+  --desc-limit=N      حد القص (default 2000)
+  --related-ttl-min=N مدة الكاش بالدقائق (default 360)
+  --keep-desc         خلّي description فقوائم LIST`);
 }
 
-function maskUrl(u) {
-  try {
-    const x = new URL(u);
-    return `${x.protocol}//${x.hostname}${x.port ? ':' + x.port : ''}${x.pathname}`;
-  } catch { return '(unparsable-host-masked)'; }
+for (const a of process.argv.slice(2)) {
+  if (a === '--dry-run') dry = true;
+  else if (a === '--db-apply') dbApply = true;
+  else if (a === '--restore') restore = true;
+  else if (a === '--keep-desc') keepDesc = true;
+  else if (a.startsWith('--desc-limit=')) descLimit = parseInt(a.slice(13), 10) || 2000;
+  else if (a.startsWith('--related-ttl-min=')) relatedTtlMin = parseInt(a.slice(18), 10) || 360;
+  else if (a.startsWith('--cols=')) colsOverride = a.slice(7).split(',').map(s => s.trim()).filter(Boolean);
+  else if (a === '--help' || a === '-h') { help(); process.exit(0); }
+  else target = a;
 }
 
-function lineOf(content, idx) { return content.slice(0, idx).split('\n').length; }
-
-/* ── DB access (lazy — used only by R1 verification + R4 count) ──────────── */
-async function resolveDbUrl(args, targetDir) {
-  if (args.db) return args.db;
-  if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
-  const envPath = path.join(targetDir, '.env');
-  try {
-    if (fs.existsSync(envPath)) {
-      const txt = fs.readFileSync(envPath, 'utf8');
-      const m = txt.match(/^DATABASE_URL\s*=\s*["']?([^"'\n\r]+)["']?\s*$/m);
-      if (m) return m[1].trim();
-    }
-  } catch { /* ignore */ }
-  return null;
+if (!target && !restore) {
+  help();
+  console.log('\n[X] ناقص الملف: node apply-f105.js server.js');
+  process.exit(2);
 }
 
-class DB {
-  constructor(url) { this.url = url; this.pool = null; }
-  async connect() {
-    const { Pool } = require('pg');
-    this.pool = new Pool({
-      connectionString: this.url,
-      ssl: { rejectUnauthorized: false },
-      max: 2,
-      idleTimeoutMillis: 5000,
-      connectionTimeoutMillis: 15000,
-      statement_timeout: 45000,
-      application_name: 'f105-kit',
-    });
-    await this.pool.query('SELECT 1');
-  }
-  async columns() {
-    const { rows } = await this.pool.query(
-      `SELECT column_name, data_type FROM information_schema.columns
-       WHERE table_name = 'products' ORDER BY ordinal_position`);
-    return rows;
-  }
-  async avgSize(colName) {
-    const q = `SELECT COALESCE(avg(pg_column_size("${colName}")), 0)::int AS avg
-               FROM (SELECT "${colName}" FROM products TABLESAMPLE SYSTEM (10)) s`;
-    const { rows } = await this.pool.query(q);
-    return Number(rows[0] && rows[0].avg) || 0;
-  }
-  async descOversizedCount() {
-    const { rows } = await this.pool.query(
-      `SELECT count(*)::int AS n FROM products WHERE length(description) > ${DESC_CAP}`);
-    return Number(rows[0] && rows[0].n);
-  }
-  async end() { try { if (this.pool) await this.pool.end(); } catch { /* noop */ } }
+const cwd = process.cwd();
+const stamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+
+function writeReport(lines) {
+  try { fs.writeFileSync(path.join(cwd, REPORT_NAME), lines.join('\n') + '\n', 'utf8'); } catch (e) {}
 }
 
-/* ── R1 scan: كل مكان فيه SELECT * FROM products ─────────────────────────── */
-function scanRouteRegistrations(content) {
-  const re = /\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete|use|all)\s*\(\s*(['"])([^'"]*)\1/g;
-  const out = [];
-  let m;
-  while ((m = re.exec(content)) !== null) out.push({ idx: m.index, path: m[2] });
-  return out;
+function syntaxCheck(file) {
+  const r = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
+  return r.status === 0 ? null : (r.stderr || 'syntax error');
 }
 
-function scanSelectStar(content, routes) {
-  const re = /SELECT\s+\*\s+FROM\s+(?:public\.)?products\b/gi;
-  const occs = [];
-  let m;
-  while ((m = re.exec(content)) !== null) {
-    const idx = m.index;
-    const window = content.slice(idx, idx + 500);            // ما بعد التطابق
-
-    // أقرب تسجيل مسار قبل الاستعلام — هو اللي كيحدد واش الاستعلام فـ handler ديال admin
-    let nearest = null;
-    for (const r of routes) { if (r.idx < idx) nearest = r; else break; }
-    const gapLines = nearest
-      ? content.slice(nearest.idx, idx).split('\n').length
-      : Infinity;
-
-    // ═══ حدود الاستعلام: من التطابق حتى أول ';' (نهاية query('…');) — يمنع تلوث الاستعلام التالي ═══
-    const stmt = window.split(';')[0] || '';
-    const isIdWhere = /WHERE[\s\S]{0,160}?\bid\s*=\s*\$\d+/i.test(stmt);
-    // فحص JOIN محصور بالـ SQL ديال هاد الاستعلام — ما كيديرش النافذة الطويلة
-    const stmtHead = stmt.split(/WHERE/i)[0];
-    const hasJoin = /JOIN\b/i.test(stmtHead);
-
-    let cls;
-    if (!nearest) cls = 'UNKNOWN-SKIP';                 // بلا route مرئي — أمان
-    else if (/admin/i.test(nearest.path)) cls = 'ADMIN-SKIP';
-    else if (gapLines > 30) cls = 'HELPER-SKIP';        // بعيد على أي مسار — helper مشترك، أمان
-    else if (hasJoin) cls = 'JOIN-SKIP';
-    else if (isIdWhere) cls = 'PDP';
-    else cls = 'LIST';
-
-    const snipStart = Math.max(0, idx - 80);
-    const snippet = content.slice(snipStart, idx + 160).replace(/\s+/g, ' ').trim();
-    occs.push({
-      idx, matchLen: m[0].length, line: lineOf(content, idx),
-      cls, near: nearest ? `${nearest.path} (-${gapLines}l)` : '-',
-      snippet: snippet.slice(0, 200),
-    });
-  }
-  return occs;
-}
-
-function buildProjection(cols) {
-  const parts = [], excluded = [], truncated = [];
-  for (const c of cols) {
-    const name = c.column_name || c.name;
-    const type = c.data_type || c.type || '';
-    if (!name) continue;
-    if (name === 'description') {
-      parts.push(`LEFT("description", ${DESC_CAP}) AS "description"`);
-      truncated.push(`description → LEFT(…,${DESC_CAP})`);
-      continue;
-    }
-    if (SAMPLE_TYPES.includes(type) && !FORCE_COLUMNS.has(name)) {
-      const sz = c._avg;
-      if (typeof sz === 'number' && sz > FAT_EXCLUDE_BYTES) {
-        excluded.push(`${name} (avg ${sz}B)`);
-        continue;
-      }
-    }
-    parts.push(`"${name}"`);
-  }
-  // ⚠️ سطر واحد — الحقن كيوقع داخل JS string literals، والسطر الجديد الحقيقي كيكسر الـ syntax
-  return { sql: parts.join(', '), excluded, truncated, count: parts.length };
-}
-
-/* ── R2 scan: تسجيلات مسارات /related ────────────────────────────────────── */
-function scanRelatedRoutes(content) {
-  const re = /\b(app|router)\s*\.\s*(get|use|all)\s*\(\s*(['"])([^'"]*related[^'"]*)\3/gi;
-  const out = [];
-  let m;
-  while ((m = re.exec(content)) !== null) {
-    out.push({
-      idx: m.index, line: lineOf(content, m.index),
-      varName: m[1], method: m[2].toLowerCase(), routePath: m[4],
-      snippet: content.slice(m.index, m.index + 120).replace(/\s+/g, ' '),
-    });
+function loadDotEnv(dir) {
+  const p = path.join(dir, '.env');
+  const out = {};
+  if (!fs.existsSync(p)) return out;
+  for (let line of fs.readFileSync(p, 'utf8').split(/\r?\n/)) {
+    line = line.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = /^([A-Za-z_][\w.]*)\s*=\s*(.*)$/.exec(line);
+    if (!m) continue;
+    let v = m[2].trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
   }
   return out;
 }
 
-function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
-function buildR2Middleware(varName, routePath) {
-  let urlReLine;
-  const stripped = routePath.replace(/:[^/]*/g, '').replace(/\/{2,}/g, '/');
-  const base = stripped.length > 1 ? stripped.replace(/\/+$/, '') : stripped;
-  if (base.startsWith('/')) {
-    urlReLine = `const F105_RELATED_URL_RE = new RegExp('^' + ${JSON.stringify(escapeRe(base))} + '(\\\\/|$)');`;
-  } else {
-    // مسار نصب على router فرعي بلا "/" — اعتماد containment
-    urlReLine = `const F105_RELATED_URL_RE = new RegExp(${JSON.stringify(escapeRe(base))});`;
-  }
-  return [
-    `// ═══ ${MARK_R2} /related in-memory cache — egress fix ═══`,
-    `// كانت 600k استدعاء/شهر على DB بلا أي تخزين مؤقت — هاد الـ middleware`,
-    `// كيخدم GET المكرر من ذاكرة LRU (TTL ساعة، caps 2000 مدخل ≈ 40MB)`,
-    `// وكيتخزن غير HTTP 200. التحقق: curl -D - مرتين → X-F105-Cache: HIT`,
-    `const F105_RELATED_TTL_MS = Number(process.env.RELATED_CACHE_TTL_MS || 3600000);`,
-    `const F105_RELATED_MAX = 2000;`,
-    `const f105RelatedCache = new Map();`,
-    `${varName}.use((req, res, next) => {`,
-    `  if (req.method !== 'GET') return next();`,
-    `  const url = req.originalUrl || req.url || '';`,
-    `  if (!F105_RELATED_URL_RE.test(url)) return next();`,
-    `  const hit = f105RelatedCache.get(url);`,
-    `  if (hit && (Date.now() - hit.t) < F105_RELATED_TTL_MS) {`,
-    `    f105RelatedCache.delete(url); f105RelatedCache.set(url, hit);`,
-    `    res.set('X-F105-Cache', 'HIT');`,
-    `    return res.status(200).json(hit.body);`,
-    `  }`,
-    `  const f105OrigJson = res.json.bind(res);`,
-    `  res.json = (body) => {`,
-    `    try {`,
-    `      if (res.statusCode === 200 && body && typeof body === 'object') {`,
-    `        if (f105RelatedCache.size >= F105_RELATED_MAX) f105RelatedCache.delete(f105RelatedCache.keys().next().value);`,
-    `        f105RelatedCache.set(url, { t: Date.now(), body });`,
-    `      }`,
-    `    } catch (e) { /* cache must never break a response */ }`,
-    `    res.set('X-F105-Cache', 'MISS');`,
-    `    return f105OrigJson(body);`,
-    `  };`,
-    `  next();`,
-    `});`,
-    urlReLine,
-    `// ═══ نهاية F105:[R2] ═══`,
-  ].join('\n');
+function redactDbUrl(u) {
+  try {
+    const m = /^postgresql?:\/\/[^@]+@([^/?]+)(\/[^?]*)?/i.exec(u);
+    return m ? `postgresql://***@${m[1]}${m[2] || ''}` : '(redacted)';
+  } catch (e) { return '(redacted)'; }
 }
 
-/* ── R4 SQL ──────────────────────────────────────────────────────────────── */
-function buildTruncateSql(liveCount) {
-  const n = (typeof liveCount === 'number')
-    ? `${liveCount} (count حي من قاعدة البيانات)`
-    : '15,524 (تقدير التشخيص F#105 — >2000 حرف؛ حد >4000 غادي يكون أصغر)';
-  return [
-    `-- ═══ F105 R4 — قص ذيل الوصف الزائد (فواضل الاستيراد) ═══`,
-    `-- التشخيص: 15,524 منتج description > 2000 حرف، أقصى واحد 89,112 حرف.`,
-    `-- الحد هنا: > ${DESC_CAP} حرف ← كيتقص لـ ${DESC_CAP}. العرض آمن؛ SEO كيقرا من`,
-    `-- seo_title / seo_meta_description (أعمدة منفصلة). الاسترجاع: غير عبر massSync.`,
-    `-- عدد السطور المتوقع: ${n}`,
-    ``,
-    `-- 1) معاينة (شغلها أولاً):`,
-    `SELECT count(*) AS oversized FROM products WHERE length(description) > ${DESC_CAP};`,
-    `SELECT id, name, length(description) AS len`,
-    `FROM products WHERE length(description) > ${DESC_CAP}`,
-    `ORDER BY len DESC LIMIT 10;`,
-    ``,
-    `-- 2) الإصلاح (شغله ملي تكون واجد — Supabase SQL Editor):`,
-    `BEGIN;`,
-    `UPDATE products SET description = LEFT(description, ${DESC_CAP}) WHERE length(description) > ${DESC_CAP};`,
-    `COMMIT;`,
-    ``,
-    `-- من بعد: TOAST كيتخف (كان 117MB) وكل القراءات المستقبلية كيصغر egress ديالها.`,
-  ].join('\n');
+// ─── restore mode ───
+if (restore) {
+  const abs = path.resolve(cwd, target || 'server.js');
+  const dir = path.dirname(abs);
+  const base = path.basename(abs);
+  const files = fs.readdirSync(dir).filter(f => f.startsWith(base + '.f105-backup-')).sort();
+  if (!files.length) { console.log('[X] ما كاين حتى backup فـ ' + dir); process.exit(1); }
+  const src = path.join(dir, files[files.length - 1]);
+  fs.copyFileSync(src, abs);
+  console.log(`[OK] رجّعنا: ${files[files.length - 1]}  =>  ${base}`);
+  process.exit(0);
 }
 
-/* ── report helpers ──────────────────────────────────────────────────────── */
-function ctxAround(content, idx, span = 220) {
-  const s = Math.max(0, idx - 60);
-  return content.slice(s, idx + span).replace(/\s+/g, ' ').trim().slice(0, 240);
-}
-
-/* ═══ MAIN ═════════════════════════════════════════════════════════════════ */
 (async () => {
-  const args = parseArgs(process.argv.slice(2));
-  const targetPath = path.resolve(process.cwd(), args.target);
-  const targetDir = path.dirname(targetPath);
-  const reportPath = path.join(targetDir, 'f105-scan-report.txt');
-  const sqlPath = path.join(targetDir, 'f105-truncate-descriptions.sql');
-  const mode = args.apply ? 'APPLY' : 'DRY-RUN';
+  const t0 = Date.now();
+  const abs = path.resolve(cwd, target);
+  const report = [];
+  const L = (s = '') => { report.push(s); console.log(s); };
 
-  const L = [];
-  const log = (s) => { console.log(s); L.push(s); };
-  const rep = (s) => L.push(s);
+  L('');
+  L('═══ F#105 EGRESS KIT ' + VERSION + ' ' + (dry ? '— DRY-RUN (فحص فقط)' : '— APPLY') + ' ═══');
+  L('dir: ' + cwd);
+  L('target: ' + abs + (fs.existsSync(abs) ? '' : '  [X] ما موجود!'));
+  L('flags: ' + JSON.stringify({ dbApply, descLimit, relatedTtlMin, keepDesc, colsOverride: colsOverride ? colsOverride.length + ' cols' : null }));
+  L('');
 
-  log(`F#105 EGRESS KIT v${KIT_VERSION} — mode: ${mode}`);
-  log(`target: ${targetPath}`);
+  if (!fs.existsSync(abs)) { writeReport(report); process.exit(2); }
 
-  if (!fs.existsSync(targetPath)) {
-    log(`[FAIL] الملف ماكاينش: ${targetPath}`);
-    fs.writeFileSync(reportPath, L.join('\n') + '\n');
-    process.exit(1);
+  const original = fs.readFileSync(abs, 'utf8');
+  const lines0 = original.split('\n').length;
+  L(`[i] ${path.basename(abs)}: ${lines0} سطر، ${(original.length / 1024).toFixed(0)} KB`);
+
+  // ─── baseline syntax check ───
+  const baselineErr = syntaxCheck(abs);
+  if (baselineErr) {
+    L('[X] server.js ماشي سليم قبل أي تعديل (node --check) — وقفنا.');
+    L('    ' + String(baselineErr).split('\n')[0]);
+    writeReport(report); process.exit(2);
   }
-  const original = fs.readFileSync(targetPath, 'utf8');
-  const sha = crypto.createHash('sha1').update(original).digest('hex').slice(0, 10);
-  log(`size: ${original.length} bytes | sha1: ${sha}`);
-  if (!/express|listen\(|router\./i.test(original)) {
-    log('[WARN] الملف ما كيبانش server.js ديال Express — كمّل بحذر.');
-  }
-  const alreadyApplied = original.includes(MARK_TOP);
-  if (alreadyApplied) rep(`[NOTE] هاد الملف تطبق عليه الكيت من قبل — العملية غادي تكون idempotent (اللي طبق ما كيتعاودش).`);
+  L('[OK] node --check (قبل التعديل): سليم');
 
-  let content = original;
-  const edits = []; // {idx, matchLen, replacement}
-  const results = { R1: '', R2: '', R4: '', R3: 'REPORT-ONLY (backlog)' };
+  // ─── .env + DB ───
+  const env = { ...loadDotEnv(cwd) };
+  if (!env.DATABASE_URL) Object.assign(env, loadDotEnv(path.dirname(abs)));
+  const dbUrl = process.env.DATABASE_URL || env.DATABASE_URL || '';
 
-  /* ── DB resolve ── */
-  let db = null, dbStatus = 'NOT AVAILABLE';
-  const dbUrl = await resolveDbUrl(args, targetDir);
+  const db = { ok: false, cols: null, err: null, url: redactDbUrl(dbUrl) };
+  const r4 = { count: null, maxLen: null, applied: false, rows: 0, batches: 0, note: '' };
+
   if (dbUrl) {
     try {
-      db = new DB(dbUrl);
-      await db.connect();
-      dbStatus = `connected (${maskUrl(dbUrl)})`;
-      log(`[OK] DB متصلة: ${maskUrl(dbUrl)}`);
+      const pg = require('pg');
+      const client = new pg.Client({
+        connectionString: dbUrl,
+        ssl: { rejectUnauthorized: false },
+        connectionTimeoutMillis: 15000,
+      });
+      await client.connect();
+      db.ok = true;
+      const c = await client.query(
+        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='products' AND table_schema=current_schema() ORDER BY ordinal_position"
+      );
+      db.cols = c.rows.map(r => ({ n: r.column_name, t: r.data_type }));
+      L(`[OK] DB متصلة: ${db.url}`);
+      L(`[OK] أعمدة products: ${db.cols.length}`);
+      if (db.cols.some(x => x.n === 'description')) {
+        const q = await client.query(
+          'SELECT COUNT(*)::int AS n, COALESCE(MAX(LENGTH(description)),0)::int AS mx FROM products WHERE description IS NOT NULL AND LENGTH(description) > $1',
+          [descLimit]
+        );
+        r4.count = q.rows[0].n; r4.maxLen = q.rows[0].mx;
+      } else {
+        r4.note = 'عمود description ما كاينش — R4 تخطى';
+      }
+      if (dbApply) {
+        if (!db.cols.some(x => x.n === 'id')) { r4.note = 'عمود id ما كاينش — R4 apply تخطى'; }
+        else if (r4.count === 0) { r4.note = 'حتى منتج ماشي فوق الحد — حتى UPDATE'; }
+        else {
+          let total = 0, batches = 0;
+          for (;;) {
+            const u = await client.query(
+              'UPDATE products SET description = LEFT(description, $1) WHERE id IN (SELECT id FROM products WHERE description IS NOT NULL AND LENGTH(description) > $1 LIMIT 1000)',
+              [descLimit]
+            );
+            total += u.rowCount || 0; batches++;
+            if ((u.rowCount || 0) < 1000 || batches >= 200) break;
+          }
+          r4.applied = true; r4.rows = total; r4.batches = batches;
+          try { await client.query('VACUUM ANALYZE products'); r4.note = 'VACUUM ANALYZE: OK'; }
+          catch (e) { r4.note = 'VACUUM ANALYZE تخطى: ' + e.message; }
+        }
+      }
+      await client.end();
     } catch (e) {
-      db = null;
-      dbStatus = `FAILED: ${e.message}`;
-      log(`[WARN] DB ما قدراتش تتصل (${e.message}) — R1 غادي يتحول لـ NEEDS-DB`);
+      db.err = String(e.message || e).split('\n')[0];
+      L('[!] DB ما وصلناش: ' + db.err);
     }
   } else {
-    log('[INFO] ما كاينش DATABASE_URL (--db / env / .env) — R1 يتحول لـ NEEDS-DB');
+    db.err = 'DATABASE_URL ما كاينش (process.env ولا .env)';
+    L('[!] ' + db.err);
+  }
+  L('');
+
+  // ─── build whitelist ───
+  const allCols = colsOverride ? colsOverride.map(n => ({ n, t: '?' })) : (db.ok && db.cols ? db.cols : null);
+  const drops = keepDesc ? DROPLIST.filter(c => c !== 'description') : DROPLIST.slice();
+  let listCols = null;
+  if (allCols) {
+    listCols = allCols.map(c => c.n).filter(n => !drops.includes(String(n).toLowerCase()));
+    if (listCols.length < 8) { L('[!] قائمة الأعمدة صغيرة (' + listCols.length + ') — R1 تخطى للسلامة'); listCols = null; }
+  }
+  if (listCols) {
+    L(`[R1] القائمة البيضاء (${listCols.length} عمود، محذوف: ${drops.join(', ')}):`);
+    L('     ' + listCols.join(', '));
+    L('');
   }
 
-  /* ═══ R1 — PDP projection ═══ */
-  try {
-    const routes = scanRouteRegistrations(content);
-    const occs = scanSelectStar(content, routes);
-    rep('');
-    rep('═══ R1 — PDP column projection ═══');
-    rep(`SELECT * FROM products — التطابقات: ${occs.length} | المسارات المسجلة: ${routes.length}`);
-    for (const o of occs) {
-      rep(`  line ${o.line} [${o.cls}] (قريب من: ${o.near}) …${o.snippet}`);
-    }
+  // ─── route map + classification ───
+  const routes = [];
+  const routeRe = /\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete|all|use)\s*\(\s*['"`]([^'"`]+)['"`]/g;
+  let rm;
+  while ((rm = routeRe.exec(original))) routes.push({ i: rm.index, p: rm[1] });
+  L(`[i] routes مكتشفين: ${routes.length}`);
 
-    const pdps = occs.filter(o => o.cls === 'PDP');
-    if (occs.length === 0) {
-      results.R1 = 'SKIP (ماكاين حتى تطابق — يمكن طبق من قبل أو SQL مكتوب بطريقة أخرى)';
-    } else if (pdps.length === 0) {
-      results.R1 = 'REPORT-ONLY (كاين تطابقات ولكن والو مؤهل لـ PDP — شوف التقرير)';
-    } else if (!db) {
-      results.R1 = `NEEDS-DB (${pdps.length} مواقع مؤهلة — عاود شغّل بـ --db أو DATABASE_URL فـ .env)`;
-    } else {
-      const cols = await db.columns();
-      if (!cols.length) {
-        results.R1 = 'FAIL (جدول products ماكاينش فـ هاد الـ DB)';
-      } else {
-        for (const c of cols) {
-          if (SAMPLE_TYPES.includes(c.data_type) && c.column_name !== 'description') {
-            try { c._avg = await db.avgSize(c.column_name); } catch { c._avg = 0; }
-          }
-        }
-        const proj = buildProjection(cols);
-        rep(`  projection: ${proj.count} عمود | مقصوص: ${proj.truncated.join(', ') || 'والو'} | متقصى (كبار): ${proj.excluded.join(', ') || 'والو'}`);
-        for (const o of pdps) {
-          edits.push({
-            idx: o.idx, matchLen: o.matchLen,
-            replacement: `SELECT ${proj.sql} FROM products`,
-          });
-        }
-        results.R1 = `READY (${pdps.length} استعلام غادي يتبدل)`;
-        if (args.apply) results.R1 = `APPLIED (${pdps.length} استعلام تبدل)`;
-        rep(`  [${args.apply ? 'APPLY' : 'DRY-RUN'}] ${results.R1}`);
-      }
-    }
-    rep(`  الحالة: ${results.R1}`);
-  } catch (e) {
-    results.R1 = `FAIL: ${e.message}`;
-    log(`[FAIL] R1: ${e.message}`);
+  function regionOf(idx) {
+    let best = null;
+    for (const r of routes) { if (r.i <= idx) best = r; else break; }
+    return best;
+  }
+  function classifyRoute(p) {
+    const s = String(p).toLowerCase();
+    if (s.includes('admin')) return 'ADMIN';
+    if (s.includes('related') || s.includes('feed')) return 'LIST';
+    const segs = s.split('/').filter(Boolean);
+    const last = segs[segs.length - 1] || '';
+    if (last.startsWith(':')) return 'PDP';
+    if (/^(product|p|item|detail)s?$/.test(segs[0] || '')) return 'PDP';
+    return 'LIST';
+  }
+  function parseTrailingAlias(after) {
+    const m1 = /^\s+as\s+([a-z_][\w$]*)/i.exec(after);
+    if (m1) return m1[1];
+    const m2 = /^\s+([a-z_][\w$]*)/.exec(after);
+    if (m2 && !SQL_KEYWORDS.has(m2[1].toUpperCase())) return m2[1];
+    return null;
+  }
+  // window محدود بآخر الـ string literal تاع SQL — باش ما يعبرش للسطر/الاستعلام الجاي
+  function sqlWindow(after) {
+    const q = /['"`]/.exec(after);
+    const w = q ? after.slice(0, q.index) : after.slice(0, 500);
+    return w.length > 500 ? w.slice(0, 500) : w;
+  }
+  function isSingleRowLookup(after) {
+    const w = sqlWindow(after);
+    if (/\b(?:slug|sku)\s*=\s*\$?\w/i.test(w)) return true;
+    if (/\bid\s*=\s*\$?\d/i.test(w)) return true;
+    return false;
   }
 
-  /* ═══ R2 — /related cache ═══ */
-  try {
-    rep('');
-    rep('═══ R2 — /related response cache ═══');
-    if (content.includes(MARK_R2)) {
-      results.R2 = 'SKIP (طبق من قبل — marker موجود)';
-      rep(`  ${results.R2}`);
-    } else {
-      const routes = scanRelatedRoutes(content);
-      for (const r of routes) rep(`  line ${r.line}: ${r.varName}.${r.method}('${r.routePath}')`);
-      if (!routes.length) {
-        results.R2 = 'NEEDS-MANUAL (ما لقيتش تسجيل مسار فيه كلمة related — شوف التقرير وعرّفني بالمسار)';
-        rep(`  ${results.R2}`);
-      } else {
-        const first = routes[0];
-        const mw = buildR2Middleware(first.varName, first.routePath);
-        const lineStart = content.lastIndexOf('\n', first.idx) + 1;
-        edits.push({ idx: lineStart, matchLen: 0, replacement: mw + '\n' });
-        rep(`  الحقن قبل السطر ${lineOf(content, lineStart)} (${first.varName}.${first.method}('${first.routePath}'))`);
-        if (routes.length > 1) rep(`  [NOTE] كاين ${routes.length - 1} تسجيلات أخرى لـ related — الكاش غطى الأول فقط.`);
-        results.R2 = args.apply ? 'APPLIED (middleware محقون)' : `READY (غادي يتحقن قبل السطر ${lineOf(content, lineStart)})`;
-        rep(`  [${args.apply ? 'APPLY' : 'DRY-RUN'}] ${results.R2}`);
-      }
-    }
-    rep(`  الحالة: ${results.R2}`);
-  } catch (e) {
-    results.R2 = `FAIL: ${e.message}`;
-    log(`[FAIL] R2: ${e.message}`);
+  // ─── R1: column projection ───
+  L('═══ R1 — column projection ═══');
+  const edits = [];
+  let r1Total = 0, r1Rewritten = 0, skipPdp = 0, skipAdmin = 0, skipSingle = 0, skipNoCols = 0, skipNoRoute = 0;
+  const censusStar = (original.match(/select\s+(?:[a-z_][\w$]*\s*\.\s*\*|\*)/gi) || []).length;
+  const re = /select\s+(?:([a-z_][\w$]*)\s*\.\s*\*|\*)\s+from\s+(?:public\.)?products\b/gi;
+  let m;
+  while ((m = re.exec(original))) {
+    r1Total++;
+    const lineNo = original.slice(0, m.index).split('\n').length;
+    const starAlias = m[1] || null;
+    const after = original.slice(m.index + m[0].length);
+    const alias = parseTrailingAlias(after) || starAlias;
+    const reg = regionOf(m.index);
+    const routePath = reg ? reg.p : '(خارج route)';
+    const cls = reg ? classifyRoute(reg.p) : 'UNKNOWN';
+    if (!listCols) { skipNoCols++; L(`  [SKIP] سطر ${lineNo} — حتى قائمة أعمدة (--cols ولا DB)`); continue; }
+    if (!reg || cls === 'UNKNOWN') { skipNoRoute++; L(`  [SKIP] سطر ${lineNo} — خارج route ظاهر | ${m[0].slice(0, 50)}`); continue; }
+    if (cls === 'ADMIN') { skipAdmin++; L(`  [SKIP] سطر ${lineNo} — route admin كيبقى كامل | ${routePath}`); continue; }
+    if (cls === 'PDP') { skipPdp++; L(`  [SKIP] سطر ${lineNo} — PDP كيبقى كامل (description+variants محتاجين) | ${routePath}`); continue; }
+    if (isSingleRowLookup(after)) { skipSingle++; L(`  [SKIP] سطر ${lineNo} — single-row lookup كيبقى كامل | ${routePath}`); continue; }
+    const newHead = `SELECT ${listCols.map(c => alias ? alias + '.' + c : c).join(', ')} FROM products`;
+    edits.push({ i: m.index, len: m[0].length, to: newHead });
+    r1Rewritten++;
+    L(`  [REWRITE] سطر ${lineNo} | route ${routePath} | alias=${alias || '-'} | => ${listCols.length} أعمدة`);
+  }
+  L(`  ── R1: ${r1Rewritten} rewritten / ${r1Total} products-SELECT-* من أصل ${censusStar} SELECT-* فالملف` +
+    ` (PDP:${skipPdp} admin:${skipAdmin} single:${skipSingle} خارج-route:${skipNoRoute} بلا-cols:${skipNoCols})`);
+  L('');
+
+  let code = original;
+  for (const e of edits.sort((a, b) => b.i - a.i)) {
+    code = code.slice(0, e.i) + e.to + code.slice(e.i + e.len);
   }
 
-  /* ═══ R4 — truncate SQL (دوماً يتولد — التنفيذ يدوي) ═══ */
-  try {
-    rep('');
-    rep('═══ R4 — truncate oversized descriptions (يدوي) ═══');
-    let liveCount = null;
-    if (db) {
-      try { liveCount = await db.descOversizedCount(); }
-      catch (e) { rep(`  [WARN] count حي فشل (${e.message}) — نعتمدو تقدير التشخيص`); }
+  // ─── R2: /related cache ───
+  L('═══ R2 — cache /related ═══');
+  const ttlMs = relatedTtlMin * 60 * 1000;
+  let r2count = 0, r2already = 0;
+  const r2paths = [];
+  code = code.replace(
+    /((?:app|router)\s*\.\s*get\s*\(\s*)(['"`])([^'"`]*related[^'"`]*)\2(\s*,)/gi,
+    (full, head, q, p, comma, off, s) => {
+      const rest = s.slice(off + full.length, off + full.length + 60);
+      if (/^\s*f105Cached/.test(rest)) { r2already++; r2paths.push(p + ' (مطبق من قبل)'); return full; }
+      r2count++; r2paths.push(p);
+      return `${head}${q}${p}${q}${comma} f105Cached(${ttlMs}),`;
     }
-    fs.writeFileSync(sqlPath, buildTruncateSql(liveCount) + '\n');
-    results.R4 = `SQL-GENERATED (${sqlPath}${liveCount !== null ? ` | ${liveCount} سطر متأثر` : ''})`;
-    rep(`  ${results.R4}`);
-  } catch (e) {
-    results.R4 = `FAIL: ${e.message}`;
-    log(`[FAIL] R4: ${e.message}`);
+  );
+  if (r2count || r2already) {
+    L(`  [OK] middleware مركّب على: ${r2paths.join(' | ')} (جديد:${r2count} موجود:${r2already})`);
+    L(`  TTL: ${relatedTtlMin} دقيقة | مفتاح التحقق: X-F105-Cache: HIT/MISS`);
+  } else {
+    L('  [FAIL] ما لقيتش حتى route فيه /related — صيفط التقرير للمعايرة');
   }
+  L('');
 
-  /* ═══ apply ═══ */
-  let applied = false;
-  if (args.apply && edits.length) {
-    const sorted = edits.slice().sort((a, b) => b.idx - a.idx);
-    for (const ed of sorted) {
-      content = content.slice(0, ed.idx) + ed.replacement + content.slice(ed.idx + ed.matchLen);
-    }
-    if (!content.startsWith(`// ${MARK_TOP}`)) {
-      content = `// ${MARK_TOP} v${KIT_VERSION} — applied ${new Date().toISOString()}\n` + content;
-    }
-    const bak = targetPath + '.pre-f105.bak';
-    fs.copyFileSync(targetPath, bak);
-    fs.writeFileSync(targetPath, content);
-    applied = true;
-    log(`[OK] التطبيق تم — backup: ${bak}`);
-  } else if (args.apply && !edits.length) {
-    log('[INFO] --apply ولكن والو تعديل واجد (كلشي SKIP ولا ديجا مطبق) — الملف ما تبدلش.');
+  const HELPER = [
+    '',
+    '',
+    '// ═══ F#105 R2: in-memory cache middleware (auto-injected ' + stamp + ') ═══',
+    'function f105Cached(ttlMs) {',
+    '  const store = new Map();',
+    '  const MAX_ENTRIES = 3000;',
+    '  return function (req, res, next) {',
+    '    try {',
+    '      const key = req.originalUrl || req.url || String(Date.now());',
+    '      const hit = store.get(key);',
+    '      if (hit && (Date.now() - hit.t) < ttlMs) {',
+    "        res.setHeader('X-F105-Cache', 'HIT');",
+    '        return res.status(hit.status).json(hit.body);',
+    '      }',
+    '      if (store.size >= MAX_ENTRIES) {',
+    '        const oldest = store.keys().next().value;',
+    '        if (oldest !== undefined) store.delete(oldest);',
+    '      }',
+    '      const origJson = res.json.bind(res);',
+    '      res.json = function (body) {',
+    '        try {',
+    '          if (res.statusCode === 200) store.set(key, { t: Date.now(), status: 200, body: body });',
+    "          res.setHeader('X-F105-Cache', 'MISS');",
+    '        } catch (e) { /* noop */ }',
+    '        return origJson(body);',
+    '      };',
+    '    } catch (e) { /* noop */ }',
+    "    if (typeof next === 'function') next();",
+    '  };',
+    '}',
+  ].join('\n');
+
+  if ((r2count > 0 || r2already > 0) && !code.includes('function f105Cached')) code += HELPER;
+
+  // ─── R4 report ───
+  L('═══ R4 — truncate description (> ' + descLimit + ' حرف) ═══');
+  if (r4.count !== null) {
+    L(`  [i] منتجات فوق الحد: ${r4.count} | أقصى طول: ${r4.maxLen}`);
+    if (r4.applied) L(`  [OK] UPDATE تنفذ: ${r4.rows} صف فـ ${r4.batches} دفعة | ${r4.note}`);
+    else if (dbApply) L(`  [SKIP] ${r4.note || 'ما تنفذش'}`);
+    else L(`  [i] للتنفيذ: node apply-f105.js server.js --db-apply`);
+  } else {
+    L(`  [SKIP] ${r4.note || 'DB ما وصلش — العدّ ما تمش'}`);
   }
+  L('');
 
-  /* ═══ report ═══ */
-  rep('');
-  rep('═══ الملخص ═══');
-  rep(`mode: ${mode} | target: ${path.basename(targetPath)} | sha1: ${sha}`);
-  rep(`R1 (PDP projection):  ${results.R1}`);
-  rep(`R2 (/related cache):  ${results.R2}`);
-  rep(`R4 (truncate SQL):    ${results.R4}`);
-  rep(`R3 (feed md5 11.7s):  ${results.R3} — backlog يدوي`);
-  rep(`DB: ${dbStatus}`);
-  rep('');
-  rep('═══ الخطوات الجاية ═══');
-  rep('1) إلا كان mode=DRY-RUN و كلشي READY/READY: عاود شغّل بـ --apply');
-  rep('2) إلا كان R1=NEEDS-DB: شغّل بـ --db "postgres://…" ولا تأكد .env فيه DATABASE_URL');
-  rep('3) من بعد النشر: curl -D - -o /dev/null "https://<backend>/…/related/…"; مرتين — المرة الثانية خاصها X-F105-Cache: HIT');
-  rep('4) شغّل f105-truncate-descriptions.sql يدوياً فـ Supabase SQL Editor');
-  rep('5) راقب egress فـ Supabase Dashboard بعد 24-48 ساعة');
-  rep('6) إلا كان شي NEEDS-MANUAL: صيفط ليا f105-scan-report.txt كامل وناظبط المراسي');
-  fs.writeFileSync(reportPath, L.join('\n') + '\n');
-  log(`report: ${reportPath}`);
+  // ─── write + verify ───
+  const changed = code !== original;
+  L('═══ الكتابة ═══');
+  if (dry) {
+    L('[DRY-RUN] حتى كتابة ما تمت — هاد كان فحص فقط.');
+  } else if (!changed) {
+    L('[i] ما كاينش تعديل جديد (مطبق من قبل ولا حتى anchor ما لقاش) — الملف ما تبدلش.');
+  } else {
+    const backupName = `${path.basename(abs)}.f105-backup-${stamp}.js`;
+    const backupAbs = path.join(path.dirname(abs), backupName);
+    fs.writeFileSync(backupAbs, original);
+    fs.writeFileSync(abs, code);
+    const err = syntaxCheck(abs);
+    if (err) {
+      fs.writeFileSync(abs, original);
+      L('[X] node --check فشل من بعد التعديل — رجّعنا الأصلي أوتوماتيك. التفاصيل:');
+      L(String(err).split('\n').slice(0, 8).join('\n'));
+      writeReport(report); process.exit(1);
+    }
+    L(`[OK] كتبنا ${path.basename(abs)} + node --check: OK`);
+    L(`[OK] backup: ${backupName}`);
+  }
+  L('');
 
-  await (async () => { try { if (db) await db.end(); } catch { /* noop */ } })();
-  process.exit(applied ? 0 : 0);
-})();
+  // ─── summary + next ───
+  L('═══ ملخص ═══');
+  L(`  R1 projection : ${r1Rewritten} rewritten (${r1Total} products-SELECT-*)`);
+  L(`  R2 cache      : ${r2count} مركّب (${r2already} من قبل) على ${r2paths.length} route`);
+  L(`  R4 truncate   : ${r4.applied ? r4.rows + ' صف' : (r4.count !== null ? r4.count + ' فوق الحد — ينتظر --db-apply' : 'ما عرفناش (DB)')}`);
+  L(`  DB            : ${db.ok ? 'OK (' + (db.cols || []).length + ' أعمدة) ' + db.url : 'FAIL — ' + (db.err || '')}`);
+  L('');
+  L('NEXT:');
+  L('  1) راجع قائمة الأعمدة فوق + كل [REWRITE] — تأكد الـ routes صحيحين');
+  L('  2) جرّب محلياً: npm start — شوف /api/products و /related و صفحة منتج');
+  L('  3) تحقق من الكاش: curl -sD - "http://localhost:3000<مسار-related>" | grep -i x-f105-cache');
+  L('  4) git add server.js && git commit -m "F#105: R1 projection + R2 /related cache" && git push origin main');
+  L('  5) راقب egress فـ Supabase Dashboard بعد 24-48 ساعة');
+  L('');
+  const noFix = (r1Rewritten === 0 && r2count === 0);
+  if (noFix) L('  [!!] حتى إصلاح ما تطبق — صيفط ' + REPORT_NAME + ' كامل للمعايرة');
+  L('');
+  L(`التقرير: ${REPORT_NAME} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+  L('');
+
+  writeReport(report);
+  process.exit(noFix ? 2 : 0);
+})().catch(e => {
+  console.error('[X] خطأ كيتوقع الكيت: ' + (e && e.stack ? e.stack.split('\n').slice(0, 6).join('\n') : e));
+  writeReport(['[X] FATAL: ' + (e && e.message ? e.message : String(e))]);
+  process.exit(1);
+});

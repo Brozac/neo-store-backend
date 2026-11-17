@@ -169,6 +169,7 @@ app.use(cookieParser());
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { message: 'Too many attempts, please try again after 15 minutes.' } });
 const couponLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts, please try again later.' } });
 const scraperLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 15, message: { error: 'Scraper rate limit exceeded.' } });
+const uploadLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 30, message: { error: 'Too many uploads, please try again later.' } }); // F#105-P3 — 30 رفع/ساعة/IP
 const checkoutLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 25, // كافية للزبون الطبيعي وتمنع البوتات
@@ -517,6 +518,43 @@ const authenticateToken = (req, res, next) => {
     req.user = user;
     next();
   });
+};
+
+// ═══ F#105-P3 — رفع صور التقييم الموثق (دعوة review) بلا حساب ═══
+// صفحة /review/[orderId]?t=<token> — الزبون ما عندوش JWT. الرفع كان 401 بصمت
+// (authenticateToken يرفض بلا Authorization) → الصور ما كانتش تتصاور في التقييم — ثقب فالدائرة.
+// الحل: POST /api/upload يقبل زادة x-review-token + x-review-order بعد تحقق صارم:
+//   - token بصيغة UUID + orderId صحيح
+//   - موجودين في orders مع status='completed' و review_submitted_at IS NULL (نفس شرط invite)
+//   - rate-limit 30/ساعة/IP (uploadLimiter)
+// سلوك قديم محفوظ بالضبط: JWT صحيح → next · JWT حاضر غالط → 403 · ماكانش → 401.
+const f105ReviewUploadAuth = async (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (token) {
+    return jwt.verify(token, JWT_SECRET, (err, user) => {
+      if (err) return res.status(403).json({ message: 'Invalid or expired token' });
+      req.user = user;
+      next();
+    });
+  }
+  const revToken = String(req.headers['x-review-token'] || '');
+  const revOrder = parseInt(String(req.headers['x-review-order'] || ''), 10);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(revToken) || !Number.isInteger(revOrder) || revOrder <= 0) {
+    return res.status(401).json({ message: 'Access Denied: No token provided' });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM orders WHERE id = $1 AND review_token = $2 AND status = 'completed' AND review_submitted_at IS NULL`,
+      [revOrder, revToken]
+    );
+    if (!rows.length) return res.status(401).json({ message: 'Access Denied: Invalid review link' });
+    req.user = { reviewScope: 'order:' + revOrder }; // نطاق مقيد — ماشي حساب كامل
+    next();
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
+    logger.logError('Review Upload Auth', e);
+    res.status(500).json({ message: 'Server error' });
+  }
 };
 
 function getOptionalUser(req) {
@@ -1045,7 +1083,11 @@ app.use('/uploads', (req, res, next) => {
 });
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-app.post('/api/admin/upload', upload.array('images', 10), (req, res) => {
+// 🛡️ F#105-P3 — auth ظاهر في السطر تاع المسار نفسو (كان تنبيه مغالط في المراجعة:
+//   الحماية كانت كاينة بصح من الحاجز العام /api/admin/* (فوق) + app.use('/api/admin', requireAdmin)
+//   بصح ماكانتش ظاهرة هنا → أي قارئ/مراجع يقدر يغلط. أما دابا requireAdmin inline:
+//   JWT (cookie admin_token ولا Bearer) + role==='admin' إجباري، واضح مباشرة.
+app.post('/api/admin/upload', requireAdmin, upload.array('images', 10), (req, res) => {
   try {
     if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
     const urls = req.files.map(file => file.path);
@@ -1055,7 +1097,7 @@ app.post('/api/admin/upload', upload.array('images', 10), (req, res) => {
   }
 });
 
-app.post('/api/upload', authenticateToken, uploadMem.array('images', 10), async (req, res) => {
+app.post('/api/upload', uploadLimiter, f105ReviewUploadAuth, uploadMem.array('images', 10), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
     const urls = [];
