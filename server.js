@@ -1,3 +1,4 @@
+// F#105 egress kit v2.1 — applied 2026-11-17T13:34:26.293Z
 // server.js — Laclarc Enterprise Dropshipping Engine (hardened)
 // Full audit applied 2026-10-02 (findings #1–#28 across session)
 // 🩹 HOTFIX v2.0.1 — تهريب wildcards ديال LIKE/ILIKE (% _ \) — PostgreSQL كيستعمل \ كـ escape افتراضي
@@ -3001,6 +3002,38 @@ app.get('/api/products/:id', async (req, res) => {
 
 // 🩹 LACLARC::RELATED-UPGRADED v1 (Task 16) — LIMIT 4→8: ضعف الروابط
 //    الداخلية للـ SEO (8 × كل صفحة منتج). الحارس الثلاثي تأكد قبل التعديل.
+// ═══ F105:[R2] /related in-memory cache — egress fix ═══
+// كانت 600k استدعاء/شهر على DB بلا أي تخزين مؤقت — هاد الـ middleware
+// كيخدم GET المكرر من ذاكرة LRU (TTL ساعة، caps 2000 مدخل ≈ 40MB)
+// وكيتخزن غير HTTP 200. التحقق: curl -D - مرتين → X-F105-Cache: HIT
+const F105_RELATED_TTL_MS = Number(process.env.RELATED_CACHE_TTL_MS || 3600000);
+const F105_RELATED_MAX = 2000;
+const f105RelatedCache = new Map();
+app.use((req, res, next) => {
+  if (req.method !== 'GET') return next();
+  const url = req.originalUrl || req.url || '';
+  if (!F105_RELATED_URL_RE.test(url)) return next();
+  const hit = f105RelatedCache.get(url);
+  if (hit && (Date.now() - hit.t) < F105_RELATED_TTL_MS) {
+    f105RelatedCache.delete(url); f105RelatedCache.set(url, hit);
+    res.set('X-F105-Cache', 'HIT');
+    return res.status(200).json(hit.body);
+  }
+  const f105OrigJson = res.json.bind(res);
+  res.json = (body) => {
+    try {
+      if (res.statusCode === 200 && body && typeof body === 'object') {
+        if (f105RelatedCache.size >= F105_RELATED_MAX) f105RelatedCache.delete(f105RelatedCache.keys().next().value);
+        f105RelatedCache.set(url, { t: Date.now(), body });
+      }
+    } catch (e) { /* cache must never break a response */ }
+    res.set('X-F105-Cache', 'MISS');
+    return f105OrigJson(body);
+  };
+  next();
+});
+const F105_RELATED_URL_RE = new RegExp('^' + "/api/products/related" + '(\\/|$)');
+// ═══ نهاية F105:[R2] ═══
 app.get('/api/products/:id/related', async (req, res) => {
   try {
     const { id } = req.params;
