@@ -1252,13 +1252,21 @@ async function fetchProductProjected(pid) {
   }
 }
 
-function clearProductsCache() {
-  try { pdpCache.clear(); relCache.clear(); } catch (__f105e) {} // 🩹 F105-EGRESS R1 — نفس الزناد كينقّي كل الكاشات
+// 🩹 F#106 EGRESS-FINAL — المسح الانتقائي:
+//   · clearProductsCache()      → قائمة الهوم برك (الكرونات/sync الجماعي) — PDP/related كيتجددو بالـ TTL (10د / 6س)
+//   · clearProductsCache(true)  → مسح كامل (تعديل أدمن على منتج واحد: add/delete/update/toggle/category/videos)
+// قبل: كل كرون (02:30/03:00/05:00 ×2/أسبوعي) كان يفرّغ كاش PDP+related كامل = إعادة تحميل من الداتابيز
+function clearProductsCache(full) {
   productsCache = null;
   cacheTime = 0;
-  __pdpCache.clear();  // 🩹 F#69 — النقاء كيمشي مع كل 20 نقطة تعديل موجودة بلا استدعاء جديد
-  __relCache.clear();
-  console.log('🧹 Products cache cleared (pdp + related LRU incl.).');
+  if (full === true) {
+    try { pdpCache.clear(); relCache.clear(); } catch (__f105e) {}
+    __pdpCache.clear();
+    __relCache.clear();
+    console.log('🧹 Products cache cleared (FULL: list + pdp + related).');
+  } else {
+    console.log('🧹 Products list cache cleared (pdp/related kept — TTL يتكفل).');
+  }
 }
 
 app.post('/api/admin/add-product', async (req, res) => {
@@ -1294,7 +1302,7 @@ app.post('/api/admin/add-product', async (req, res) => {
       [title, safePrice, safeOldPrice, image_url, imagesArray, JSON.stringify([]), colorsArray, sizesArray, true, cjProductId, safeDescription, safeMaterial, category || 'other']
     );
 
-    clearProductsCache();
+    clearProductsCache(true);
     res.status(201).json({ message: 'Product added successfully with v3.1 pricing!', calculatedPrice: safePrice, originalPrice: safeOldPrice });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
@@ -1306,7 +1314,7 @@ app.delete('/api/admin/delete-product/:id', async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query('UPDATE products SET stock_status = false WHERE id = $1', [id]);
-    clearProductsCache();
+    clearProductsCache(true);
     res.json({ message: 'Product hidden successfully!' });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
@@ -1767,7 +1775,7 @@ app.post('/api/admin/backfill-categories', async (req, res) => {
         } catch (itemErr) { try { Sentry.captureException(itemErr); } catch (__laclarcGuard) {} console.warn('⚠️ [Recat] product ' + (p && p.id) + ' failed: ' + itemErr.message); }
       }
 
-      clearProductsCache();
+      clearProductsCache(true);
       console.log(`🎉 Backfill complete! Updated: ${updatedCount}`);
     } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Backfill Categories (Background)', err);
@@ -1972,7 +1980,7 @@ app.post('/api/admin/sync-single-product', async (req, res) => {
       [details.productNameEn, safePrice, safeOriginalPrice, details.bigImage, details.productImageSet, JSON.stringify(details.variants || []), parsedData.colors, parsedData.sizes, true, details.pid, decodeDoubleEntities(details.description), material, categorySlug]
     );
 
-    clearProductsCache();
+    clearProductsCache(true);
     res.status(200).json({ message: '✅ Sourced product synced and marked as Lightning Deal successfully!' });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     res.status(500).json({ error: 'Server error or CJ API error' });
@@ -2482,7 +2490,7 @@ app.post('/api/admin/auto-categorize', async (req, res) => {
           await pool.query('UPDATE products SET category = $1 WHERE id = $2', [c.to, c.id]);
         } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {} console.warn('⚠️ [BgRecat] product ' + (c && c.id) + ' failed: ' + e.message); }
       }
-      clearProductsCache();
+      clearProductsCache(true);
       console.log(`✅ Finished auto-categorizing ${changes.length} products.`);
     })();
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
@@ -2981,9 +2989,11 @@ app.get('/api/products', productsLimiter, async (req, res) => {
           `SELECT id, title, price, original_price, image_url, category, video_url${SW_SQL}, created_at FROM products WHERE stock_status = true ORDER BY sort_order ASC, id DESC LIMIT $1`,
           [Math.min(limitParam, 50)]  // 🆕 F#55 AntiClone — كان 200 (قرار المالك «أ»: سقف 50)
         );
+        res.set('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=3600'); // F#106
         return res.json(withSwatches(q.rows));
       }
-      if (productsCache && (Date.now() - cacheTime < CACHE_TTL)) {
+      res.set('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=3600'); // F#106
+      if (productsCache && (Date.now() - cacheTime < 10 * 60 * 1000)) { // F#106 — كان 60s (5000 صف ≈1.5MB كل دقيقة)
         return res.json(productsCache);
       }
       const FULL_CAP = 5000; // 🆕 سقف أمان — الذاكرة/الـ payload ما يطيروش مع نمو الكاتالوغ
@@ -3114,7 +3124,7 @@ app.get('/api/products/:id', async (req, res) => {
     // 60s طازج + 300s stale — نفس عقد طلاقة الفيد (massSync يصل ≤60s)
     // ⚠️ I18N-TRAP — كي تفعّل I18N_ENABLED: زيد res.set('Vary', 'cf-ipcountry') هنا
     //    وإلا الكاش يخدم لغة بلد لبلد أخرى
-    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+    res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400'); // F#106 — كان 60s: الـ CDN كيخدم الـ crawl المتكرر بلا ما يوصل للداتابيز
 
     const visitorCountry = (req.headers['cf-ipcountry'] || '').toUpperCase();
     const targetLang = getLangFromCountry(visitorCountry);
@@ -3185,7 +3195,7 @@ app.get('/api/products/:id/related', f105Cached(21600000), async (req, res) => {
     // 🩹 F105-EGRESS R3 — كاش المرتبطين (كان 600k استعلام/شهر = أكبر مستهلك: CPU ~9.3h + ~750MB egress)
     const __relHit = relCacheGet(pid);
     if (__relHit) {
-      res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+      res.set('Cache-Control', 'public, s-maxage=21600, stale-while-revalidate=86400'); // F#106
       return res.json(__relHit);
     }
 
@@ -3233,7 +3243,7 @@ app.get('/api/products/:id/related', f105Cached(21600000), async (req, res) => {
     if (relatedRows === null) return res.status(404).json({ error: 'Product not found' });
 
     // 🩹 FIX-RELCACHE — المرتبطون ثابتون نسبياً → كاش CDN
-    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+    res.set('Cache-Control', 'public, s-maxage=21600, stale-while-revalidate=86400'); // F#106
     res.json(relatedRows);
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     console.error('❌ /api/products/:id/related:', err);
@@ -3253,7 +3263,7 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
     const newStatus = !result.rows[0].is_sourced;
     await pool.query('UPDATE products SET is_sourced = $1 WHERE id = $2', [newStatus, id]);
 
-    clearProductsCache();
+    clearProductsCache(true);
     res.json({ message: 'Deal status updated', is_sourced: newStatus });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
@@ -3710,7 +3720,7 @@ app.put('/api/admin/update-category/:id', async (req, res) => {
     const { category } = req.body;
     if (!category) return res.status(400).json({ error: 'Category is required' });
     await pool.query('UPDATE products SET category = $1 WHERE id = $2', [category, id]);
-    clearProductsCache();
+    clearProductsCache(true);
     res.json({ message: 'Category updated successfully' });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
@@ -3783,7 +3793,7 @@ app.delete('/api/admin/videos/:productId', async (req, res) => {
   try {
     const { productId } = req.params;
     await pool.query('UPDATE products SET video_url = NULL WHERE id = $1', [productId]);
-    clearProductsCache();
+    clearProductsCache(true);
     res.json({ success: true, message: 'Video deleted successfully. Product remains in store.' });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
@@ -3816,7 +3826,7 @@ app.put('/api/admin/update-product/:id', async (req, res) => {
       `UPDATE products SET title = $1, price = $2, original_price = $3, image_url = $4, images = $5, description = $6, material = $7, colors = $8, sizes = $9, category = $10 WHERE id = $11`,
       [String(title).trim(), parsedPrice, safeOriginal, image_url || null, images || null, decodeDoubleEntities(description || null), material || null, colors || null, sizes || null, category || 'other', id]
     );
-    clearProductsCache();
+    clearProductsCache(true);
     res.json({ message: 'Product updated successfully' });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
