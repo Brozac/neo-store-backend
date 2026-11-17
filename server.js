@@ -589,6 +589,62 @@ const storage = new CloudinaryStorage({
 });
 const upload = multer({ storage: storage, limits: { fileSize: 5 * 1024 * 1024 } });
 
+// ═══ F#105-R2UPLOAD — الرفع الداخلي (reviews/avatars) → Cloudflare R2 · fallback Cloudinary ═══
+// العقد تاع الواجهة ما تبدلش: FormData حقل images + Bearer JWT + رد { urls: [...] }
+const F105_IMG_TYPES = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif', 'image/avif': '.avif' };
+const f105R2Pub = () => String(process.env.R2_PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+// فلتر موحد لروابط الصور المقبولة (القديمة Cloudinary في DB تخدم + الجديدة من R2 تتقبل)
+const F105_IMG_URL_OK = (u) => typeof u === 'string' && (
+  u.startsWith('https://res.cloudinary.com/') ||
+  (f105R2Pub() !== '' && u.startsWith(f105R2Pub() + '/'))
+);
+const uploadMem = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+function f105R2Config() {
+  const accountId = process.env.R2_ACCOUNT_ID || '';
+  const bucket = process.env.R2_BUCKET || '';
+  const pub = f105R2Pub();
+  if (!accountId || !bucket || !process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY || !pub) return null;
+  return { host: accountId + '.r2.cloudflarestorage.com', bucket, pub, keyId: process.env.R2_ACCESS_KEY_ID, secret: process.env.R2_SECRET_ACCESS_KEY };
+}
+
+async function f105R2PutObject(key, body, contentType) {
+  const cfg = f105R2Config();
+  if (!cfg) throw new Error('R2 config ناقصة فالـ env');
+  const crypto = require('crypto');
+  const payloadHash = crypto.createHash('sha256').update(body).digest('hex');
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const canonicalUri = '/' + cfg.bucket + '/' + key.split('/').map(encodeURIComponent).join('/');
+  const canonicalHeaders = 'content-type:' + contentType + '\nhost:' + cfg.host + '\nx-amz-content-sha256:' + payloadHash + '\nx-amz-date:' + amzDate + '\n';
+  const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date';
+  const canonicalRequest = ['PUT', canonicalUri, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+  const scope = dateStamp + '/auto/s3/aws4_request';
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, crypto.createHash('sha256').update(canonicalRequest).digest('hex')].join('\n');
+  const kDate = crypto.createHmac('sha256', 'AWS4' + cfg.secret).update(dateStamp).digest();
+  const kRegion = crypto.createHmac('sha256', kDate).update('auto').digest();
+  const kService = crypto.createHmac('sha256', kRegion).update('s3').digest();
+  const kSigning = crypto.createHmac('sha256', kService).update('aws4_request').digest();
+  const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex');
+  const r = await fetch('https://' + cfg.host + canonicalUri, {
+    method: 'PUT',
+    headers: { 'content-type': contentType, 'x-amz-date': amzDate, 'x-amz-content-sha256': payloadHash,
+      Authorization: 'AWS4-HMAC-SHA256 Credential=' + cfg.keyId + '/' + scope + ', SignedHeaders=' + signedHeaders + ', Signature=' + signature },
+    body,
+  });
+  if (!r.ok) throw new Error('R2 PUT ' + r.status + ': ' + (await r.text()).slice(0, 300));
+  return cfg.pub + '/' + key;
+}
+
+// fallback: نفس سلوك CloudinaryStorage القديم إلا R2 ما محيتش فالـ env
+function f105CldUpload(buffer) {
+  return new Promise((resolve, reject) => {
+    const s = cloudinary.uploader.upload_stream({ folder: 'neo_store_uploads', resource_type: 'image' }, (err, out) => err ? reject(err) : resolve(out && out.secure_url));
+    s.end(buffer);
+  });
+}
+// ═══ نهاية F#105-R2UPLOAD helpers ═══
+
 // ==========================================
 // مسارات الأدمن غير المحمية (Login / Logout فقط)
 // ==========================================
@@ -949,9 +1005,9 @@ app.post('/api/reviews/add', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Product ID and content are required' });
     }
 
-    // 🩹 FIX#8 — صور Cloudinary فقط (كان startsWith('http') — أي domain يُقبل)
+    // 🩹 FIX#8 + F#105-R2 — صور Cloudinary ولا R2 (القديمة في DB تخدم، الجديدة من R2 تتقبل)
     const safeImages = Array.isArray(images)
-      ? images.filter(url => typeof url === 'string' && url.startsWith('https://res.cloudinary.com/'))
+      ? images.filter(F105_IMG_URL_OK)
       : [];
 
     // 🩹 FIX#9 — rating clamp
@@ -999,14 +1055,42 @@ app.post('/api/admin/upload', upload.array('images', 10), (req, res) => {
   }
 });
 
-app.post('/api/upload', authenticateToken, upload.array('images', 10), (req, res) => {
+app.post('/api/upload', authenticateToken, uploadMem.array('images', 10), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
-    const urls = req.files.map(file => file.path);
+    const urls = [];
+    for (const file of req.files.slice(0, 10)) {
+      const ct = String(file.mimetype || '').split(';')[0].trim().toLowerCase();
+      const ext = F105_IMG_TYPES[ct];
+      if (!ext || !file.buffer || !file.buffer.length || file.size > 10 * 1024 * 1024) continue;
+      const d = new Date();
+      const key = 'uploads/' + d.getFullYear() + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + Date.now() + '-' + require('crypto').randomBytes(5).toString('hex') + ext;
+      urls.push(f105R2Config() ? await f105R2PutObject(key, file.buffer, ct) : await f105CldUpload(file.buffer));
+    }
+    if (!urls.length) return res.status(415).json({ error: 'نوع غير مدعوم — الصور فقط (jpg/png/webp/gif/avif) وأقل من 10MB' });
     res.status(200).json({ urls });
   } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     res.status(500).json({ error: 'Failed to upload files' });
   }
+});
+
+// حالة التخزين + selftest (تتطلب ADMIN_PASSWORD فالترويسة x-admin-password)
+app.get('/api/upload', async (req, res) => {
+  const crypto = require('crypto');
+  const expected = String(process.env.ADMIN_PASSWORD || '');
+  const got = String(req.get('x-admin-password') || '');
+  const ok = expected && got && got.length === expected.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected));
+  if (!ok) return res.status(401).json({ ok: false, error: 'unauthorized — صيفط x-admin-password' });
+  const cfg = f105R2Config();
+  if (!cfg) return res.status(500).json({ ok: false, error: 'R2 env ناقصة — الرفع راح يمشي لـ Cloudinary', need: ['R2_ACCOUNT_ID', 'R2_BUCKET', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_PUBLIC_BASE_URL'] });
+  if (req.query.selftest === '1') {
+    try {
+      const key = 'test/selftest-' + Date.now() + '.txt';
+      const url = await f105R2PutObject(key, Buffer.from('F105 selftest ' + new Date().toISOString()), 'text/plain');
+      return res.json({ ok: true, selftest: url, bucket: cfg.bucket, publicBase: cfg.pub });
+    } catch (e) { return res.status(500).json({ ok: false, error: String(e.message || e).slice(0, 300) }); }
+  }
+  return res.json({ ok: true, storage: 'R2', bucket: cfg.bucket, publicBase: cfg.pub });
 });
 // ==========================================
 // مسارات المنتجات وإدارتها
@@ -5658,8 +5742,8 @@ app.post('/api/review/invite/:orderId', async (req, res) => {
     const productId = itemsRes.rows[0]?.product_id;
     if (!productId) return res.status(400).json({ success: false, error: 'No product in order' });
 
-    // 🩹 Images — Cloudinary only
-    const safeImages = images.filter((u) => typeof u === 'string' && u.startsWith('https://res.cloudinary.com/'));
+    // 🩹 Images — Cloudinary ولا R2 (F#105-R2UPLOAD)
+    const safeImages = images.filter(F105_IMG_URL_OK);
     // 💾 Insert — user_id من الـ order owner → تصير "حقيقية" بالفلتر تاعنا!
     await pool.query(
       `INSERT INTO reviews (product_id, author, user_id, rating, content, country, images, verified_purchase)
