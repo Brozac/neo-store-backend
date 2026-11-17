@@ -3034,7 +3034,7 @@ app.use((req, res, next) => {
 });
 const F105_RELATED_URL_RE = new RegExp('^' + "/api/products/related" + '(\\/|$)');
 // ═══ نهاية F105:[R2] ═══
-app.get('/api/products/:id/related', async (req, res) => {
+app.get('/api/products/:id/related', f105Cached(21600000), async (req, res) => {
   try {
     const { id } = req.params;
     // 🩹 FIX-ID-404 — نفس الحارس (نفس فئة الـ 500)
@@ -5923,3 +5923,32 @@ if (typeof Sentry.setupExpressErrorHandler === 'function') {
   app.use(Sentry.Handlers.errorHandler());       // v7 fallback
 }
 // ──── [/LACLARC::SENTRY-ERR] ────
+
+// ═══ F#105 R2: in-memory cache middleware (auto-injected 20261117142758) ═══
+function f105Cached(ttlMs) {
+  const store = new Map();
+  const MAX_ENTRIES = 3000;
+  return function (req, res, next) {
+    try {
+      const key = req.originalUrl || req.url || String(Date.now());
+      const hit = store.get(key);
+      if (hit && (Date.now() - hit.t) < ttlMs) {
+        res.setHeader('X-F105-Cache', 'HIT');
+        return res.status(hit.status).json(hit.body);
+      }
+      if (store.size >= MAX_ENTRIES) {
+        const oldest = store.keys().next().value;
+        if (oldest !== undefined) store.delete(oldest);
+      }
+      const origJson = res.json.bind(res);
+      res.json = function (body) {
+        try {
+          if (res.statusCode === 200) store.set(key, { t: Date.now(), status: 200, body: body });
+          res.setHeader('X-F105-Cache', 'MISS');
+        } catch (e) { /* noop */ }
+        return origJson(body);
+      };
+    } catch (e) { /* noop */ }
+    if (typeof next === 'function') next();
+  };
+}
