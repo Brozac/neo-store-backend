@@ -171,7 +171,7 @@ if (restore) {
       const pg = require('pg');
       const client = new pg.Client({
         connectionString: dbUrl,
-        ssl: { rejectUnauthorized: false },
+        ssl: { rejectUnauthorized: false }, // B-M4: مشفر — للتحقق الصارم زيد CA (انظر db.js resolvePgSsl)
         connectionTimeoutMillis: 15000,
       });
       await client.connect();

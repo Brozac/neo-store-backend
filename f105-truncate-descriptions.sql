@@ -6,7 +6,7 @@
 
 -- 1) معاينة (شغلها أولاً):
 SELECT count(*) AS oversized FROM products WHERE length(description) > 4000;
-SELECT id, name, length(description) AS len
+SELECT id, title, length(description) AS len
 FROM products WHERE length(description) > 4000
 ORDER BY len DESC LIMIT 10;
 

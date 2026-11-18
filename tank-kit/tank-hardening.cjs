@@ -249,7 +249,12 @@ module.exports = function installTank(app, opts = {}) {
       ttl = IDEM_HEADER_TTL;
     } else if (req.body && typeof req.body === 'object') {
       try {
-        key = 'B:' + crypto.createHash('sha1').update(JSON.stringify(req.body)).digest('hex');
+        // 🩹 SECURITY-FIX (audit 2026-11-18 B-H3): المفتاح الأوتوماتيكي كان بصمة الجسم فقط
+        //   → زبونان مختلفان بنفس محتوى السلة خلال 15ث يحصلون على نفس رابط جلسة الدفع
+        //   (زبون 2 يدفع لطلب زبون 1). الإصلاح: دمج IP + User-Agent في البصمة.
+        key = 'B:' + crypto.createHash('sha1')
+          .update(String(req.ip || '') + '|' + String(req.get('user-agent') || '') + '|' + JSON.stringify(req.body))
+          .digest('hex');
         ttl = IDEM_AUTO_TTL;
       } catch (e) { return next(); }
     }

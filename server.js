@@ -347,6 +347,16 @@ app.use((req, res, next) => {
     if (parts.length === 2 && parts[0] === 'Bearer') token = parts[1];
   }
 
+  // 🩹 SECURITY-FIX (audit 2026-11-18 F-M3): دفاع CSRF للطلبات الإدارية المغيّرة
+  //   المصادقة عبر الكوكي (SameSite=None cross-origin) → طلب POST/PUT/DELETE
+  //   بلا Origin ولا من Origin أجنبي = مرفوض. الطلبات من الفرونت الحقيقي
+  //   كيجيبو Origin من antiCloneOrigins، والسيرفر-لسيرفر بلا Origin كيتعدى.
+  const viaCookieAdmin = !req.headers['authorization'] && !!token;
+  if (viaCookieAdmin && MUTATING.has(req.method) && !originAllowedForCsrf(req)) {
+    logAdminViolation(req, 'csrf origin');
+    return res.status(403).json({ error: 'Access Denied: Forbidden origin' });
+  }
+
   if (!token) {
     logAdminViolation(req, 'no token');
     return res.status(401).json({ error: 'Access Denied: Administrative authentication required' });
@@ -383,7 +393,9 @@ app.post('/api/supplier-webhook', express.raw({ type: 'application/json' }), asy
     event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
     logger.logError('Stripe Webhook Signature', err);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    // 🩹 SECURITY-FIX (audit 2026-11-18 B-L13): err.message كان كيتسرب للعميل
+    //   (تفاصيل التوقيع/البيلد) — رسالة عامة فقط، التفاصيل في اللوج وSentry.
+    return res.status(400).send('Webhook Error: Invalid signature');
   }
 
   res.status(200).json({ received: true });
@@ -508,15 +520,40 @@ function getStatusLabel(status) {
 }
 
 // دوال التحقق من هوية الزبائن
+// 🩹 SECURITY-FIX (audit 2026-11-18 F-H1 — الجزء الخادمي): دعم كوكي جلسة httpOnly
+//   بالإضافة إلى Authorization: Bearer. المصدر: كوكي session_token (نضبطو عند
+//   login/social). المصادقة عبر الكوكي + طلب مغيّر (POST/PUT/DELETE/PATCH)
+//   → فحص Origin إجباري (دفاع CSRF — الكوكي SameSite=None يُرسل في أي طلب).
+const SESSION_COOKIE = 'session_token';
+const MUTATING = new Set(['POST', 'PUT', 'DELETE', 'PATCH']);
+const originAllowedForCsrf = (req) => {
+  const origin = String(req.headers.origin || '');
+  if (!origin) return true; // SSR/سيرفر-لسيرفر — بلا كوكي حقيقي من متصفح
+  return antiCloneOrigins.has(origin);
+};
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.status(401).json({ message: 'Access Denied: No token provided' });
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
+  const headerToken = authHeader && authHeader.split(' ')[1];
+  const cookieToken = req.cookies?.[SESSION_COOKIE];
+  if (!headerToken && !cookieToken) return res.status(401).json({ message: 'Access Denied: No token provided' });
+  const viaCookie = !headerToken && !!cookieToken;
+  if (viaCookie && MUTATING.has(req.method) && !originAllowedForCsrf(req)) {
+    return res.status(403).json({ message: 'Forbidden origin' });
+  }
+  jwt.verify(headerToken || cookieToken, JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ message: 'Invalid or expired token' });
     req.user = user;
     next();
+  });
+};
+
+// ✨ F-H1 — كوكي جلسة httpOnly (ما يوصلش للـ JS → XSS ما كيسرقش الجلسة)
+const setSessionCookie = (res, token) => {
+  res.cookie(SESSION_COOKIE, token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000
   });
 };
 
@@ -559,7 +596,7 @@ const f105ReviewUploadAuth = async (req, res, next) => {
 
 function getOptionalUser(req) {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  const token = (authHeader && authHeader.split(' ')[1]) || req.cookies?.[SESSION_COOKIE];
   if (!token) return null;
   try {
     return jwt.verify(token, JWT_SECRET);
@@ -739,6 +776,8 @@ app.post('/api/auth/social', authLimiter, async (req, res) => {
 
     // JWT نفس النظام — session bridging مكتمال
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    // 🩹 SECURITY-FIX (F-H1): كوكي جلسة httpOnly للدخول الاجتماعي كذلك
+    setSessionCookie(res, token);
     res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
   } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
     logger.logError('Social Auth', e);
@@ -748,7 +787,18 @@ app.post('/api/auth/social', authLimiter, async (req, res) => {
 
 app.post('/api/admin/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
-  if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
+  // 🩹 SECURITY-FIX (audit 2026-11-18 B-M5b): مقارنة timing-safe للإيميل والباسورد
+  //   (مقارنة === كانت كتسرّب طول الإيميل/الباسورد عبر تفاوت زمن الاستجابة).
+  //   دائماً كنقارن بنفس العمل حتى مع env ناقص — ما كنعطيو حتى معلومة من التوقيت.
+  const crypto = require('crypto');
+  const safeEqual = (a, b) => {
+    const ba = Buffer.from(String(a || ''));
+    const bb = Buffer.from(String(b || ''));
+    return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+  };
+  const adminEmailOk = safeEqual(normalizeEmail(email), normalizeEmail(process.env.ADMIN_EMAIL || ''));
+  const adminPassOk = safeEqual(password, process.env.ADMIN_PASSWORD || '');
+  if (adminEmailOk && adminPassOk && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
     const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '4h' });
 
     res.cookie('admin_token', token, {
@@ -895,9 +945,31 @@ app.post('/api/validate-coupon', couponLimiter, async (req, res) => {
 
 app.post('/api/admin/add-coupon', async (req, res) => {
   try {
-    const { code, discount_type, discount_value } = req.body;
+    const { code, discount_type, discount_value, expires_at, max_uses } = req.body;
     if (!code || !discount_value) return res.status(400).json({ error: 'Code and value are required' });
-    await pool.query('INSERT INTO coupons (code, discount_type, discount_value) VALUES ($1, $2, $3) ON CONFLICT (code) DO NOTHING', [code.toUpperCase(), discount_type || 'percentage', discount_value]);
+    // 🩹 SECURITY-FIX (audit 2026-11-18 B-M5): قبول صلاحية وسقف استعمال (اختياريان).
+    //   expires_at: ISO date صالح · max_uses: عدد صحيح موجب.
+    let safeExpires = null;
+    if (expires_at) {
+      const d = new Date(expires_at);
+      if (isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid expires_at date' });
+      safeExpires = d.toISOString();
+    }
+    let safeMaxUses = null;
+    if (max_uses !== undefined && max_uses !== null && max_uses !== '') {
+      safeMaxUses = Math.floor(Number(max_uses));
+      if (!Number.isFinite(safeMaxUses) || safeMaxUses < 1) return res.status(400).json({ error: 'max_uses must be a positive integer' });
+    }
+    await pool.query(
+      `INSERT INTO coupons (code, discount_type, discount_value, expires_at, max_uses)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (code) DO UPDATE SET
+         discount_type = EXCLUDED.discount_type,
+         discount_value = EXCLUDED.discount_value,
+         expires_at = EXCLUDED.expires_at,
+         max_uses = EXCLUDED.max_uses`,
+      [code.toUpperCase(), discount_type || 'percentage', discount_value, safeExpires, safeMaxUses]
+    );
     res.status(201).json({ message: 'Coupon added successfully!' });
   } catch (err) { try { Sentry.captureException(err); } catch (__laclarcGuard) {}
       logger.logError('Route Handler', err);
@@ -2189,10 +2261,39 @@ app.post('/api/login', authLimiter, async (req, res) => {
     if (!user.rows[0].is_verified) return res.status(403).json({ message: 'Please verify your email first. Check your inbox.' });
 
     const token = jwt.sign({ id: user.rows[0].id, name: user.rows[0].name }, JWT_SECRET, { expiresIn: '7d' });
+    // 🩹 SECURITY-FIX (F-H1): كوكي جلسة httpOnly — الفرونت يعتمدو بدل localStorage
+    setSessionCookie(res, token);
     res.json({ message: 'Logged in successfully', token, user: { id: user.rows[0].id, name: user.rows[0].name, email: user.rows[0].email } });
   } catch (error) { try { Sentry.captureException(error); } catch (__laclarcGuard) {}
     logger.logError('Login Error', error);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// 🩹 F-H1 — خروج موحد: كيمسح كوكي الجلسة httpOnly (الكلاينت كيمسح الـ user_data)
+app.post('/api/logout', (req, res) => {
+  res.clearCookie(SESSION_COOKIE, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
+  });
+  res.json({ message: 'Logged out successfully' });
+});
+
+// 🩹 F-H1 — تحويل JWT صالح إلى كوكي جلسة httpOnly (Google OAuth bridge):
+//   SessionBridge كييجيب التوكن من جلسة NextAuth ثم كينادي هاد المسار — الكوكي
+//   كيتضبط من الخادم والتوكن ما كيتخزنش في localStorage أبداً.
+app.post('/api/auth/cookie-session', (req, res) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Token required' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded || !decoded.id) return res.status(403).json({ error: 'Invalid token' });
+    setSessionCookie(res, token);
+    return res.json({ ok: true });
+  } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}
+    return res.status(403).json({ error: 'Invalid token' });
   }
 });
 // ==========================================
@@ -3275,8 +3376,11 @@ app.put('/api/admin/toggle-deal/:id', async (req, res) => {
 // ═══ 🎡 WHEEL_V1 — Spin Wheel claim → JWT-signed token (server = only truth) ═══
 app.post('/api/wheel/claim', wheelLimiter, async (req, res) => {
   try {
-    const pct = Math.min(15, Math.max(1, Math.round(Number(req.body?.pct) || 0)));
-    if (!pct) return res.status(400).json({ error: 'Invalid wheel result' });
+    // 🩹 SECURITY-FIX (audit 2026-11-18 B-M4b/F-M4): النسبة كانت كتقرر من الكلاينت
+    //   (pct في body) — سكريبت يصنع خصم 15% دايماً. الإصلاح: النسبة تتولد
+    //   سيرفر-سايد بتوزيع مرجّح (الأغلبية خصومات صغيرة) — قيمة الكلاينت تتجاهل تماماً.
+    const WEIGHTED = [1,1,1,1,2,2,2,3,3,3,5,5,7,10,15];
+    const pct = WEIGHTED[Math.floor(Math.random() * WEIGHTED.length)];
     const wheelToken = jwt.sign({ type: 'wheel', pct }, JWT_SECRET, { expiresIn: '24h' });
     res.json({ pct, wheelToken });
   } catch (e) { try { Sentry.captureException(e); } catch (__laclarcGuard) {}

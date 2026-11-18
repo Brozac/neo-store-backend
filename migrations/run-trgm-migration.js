@@ -40,7 +40,7 @@ console.log(`🎯 الهدف: ${u.hostname}${u.port ? ':' + u.port : ''}/${u.pat
 const pool = new Pool({
   connectionString: connString,
   application_name: 'laclarc-trgm-migration',
-  ssl: /localhost|127\.0\.0\.1/.test(u.hostname) ? false : { rejectUnauthorized: false },
+  ssl: /localhost|127\.0\.0\.1/.test(u.hostname) ? false : { rejectUnauthorized: false }, // B-M4: مشفر — للتحقق الصارم زيد CA (انظر db.js resolvePgSsl)
   max: 1,
   connectionTimeoutMillis: 30000, // وقت كافٍ باش تفيق Neon من الـ suspend
 });

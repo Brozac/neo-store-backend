@@ -58,12 +58,21 @@ const verifyLimiter = rateLimit({
   message: { message: 'Too many attempts, please try again after 15 minutes.' },
 });
 
-// ─── نفس middleware تاع server.js (Bearer JWT) — مكتفية ذاتيا ─────────────
+// ─── نفس middleware تاع server.js (Bearer JWT + كوكي الجلسة F-H1) ─────────────
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.status(401).json({ message: 'Access Denied: No token provided' });
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+  const headerToken = authHeader && authHeader.split(' ')[1];
+  const cookieToken = req.cookies?.['session_token'];
+  if (!headerToken && !cookieToken) return res.status(401).json({ message: 'Access Denied: No token provided' });
+  // 🩹 F-H1: طلب مغيّر مصادق بالكوكي فقط → فحص Origin (نفس درع server.js)
+  if (!headerToken && cookieToken && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    const origin = String(req.headers.origin || '');
+    if (origin && process.env.CORS_ORIGINS && !process.env.CORS_ORIGINS.split(',').map(s => s.trim()).includes(origin)
+        && origin !== 'https://laclarc.com' && origin !== 'https://www.laclarc.com') {
+      return res.status(403).json({ message: 'Forbidden origin' });
+    }
+  }
+  jwt.verify(headerToken || cookieToken, process.env.JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ message: 'Invalid or expired token' });
     req.user = user;
     next();
@@ -95,6 +104,22 @@ async function consumeChallenge(challenge, type) {
     [challenge, type]
   );
   return r.rows[0] || null;
+}
+
+// 🩹 SECURITY-FIX (audit 2026-11-18 B-L12): الchallenge كان كيتستهلك (DELETE) قبل التحقق
+//   → فشل تحقق واحد يُجبر المستخدم على إعادة options. الإصلاح: نعاود نُدرج السجل
+//   عند فشل التحقق (الاستهلاك الذري عند النجاح يمنع الـ replay).
+//   ملاحظة: id لازم يُولد يدوياً — TEXT PK (gen_random_uuid متاح عبر pgcrypto).
+async function restoreChallenge(challenge, type, row) {
+  if (!row) return;
+  try {
+    await pool.query(
+      `INSERT INTO webauthn_challenges (id, challenge, type, user_id, uv, conditional, expires_at)
+       VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, now() + interval '5 minutes')
+       ON CONFLICT (challenge) DO NOTHING`,
+      [challenge, type, row.user_id, row.uv, row.conditional]
+    );
+  } catch (e) { logger && logger.logError && logger.logError('webauthn restoreChallenge', e); }
 }
 
 // تنظيف الchallenges الفاسدة (خفيف — كيتشغل مع كل options request)
@@ -247,6 +272,7 @@ router.post('/api/auth/passkey/register/verify', authenticateToken, verifyLimite
       });
     } catch (verifyErr) {
       logger.logError('Passkey Register Verify', verifyErr);
+      await restoreChallenge(challenge, 'registration', row); // B-L12: فشل التحقق ما يهدمش الchallenge
       return res.status(400).json({ error: 'Registration verification failed.' });
     }
 
@@ -364,6 +390,7 @@ router.post('/api/auth/passkey/login/verify', verifyLimiter, async (req, res) =>
     } catch (verifyErr) {
       // counter تراجع = clone suspicion → نفس الرد العام (بلا كشف السبب)
       logger.logError('Passkey Login Verify', verifyErr);
+      await restoreChallenge(challenge, 'authentication', row); // B-L12: فشل التحقق ما يهدمش الchallenge
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
@@ -388,6 +415,14 @@ router.post('/api/auth/passkey/login/verify', verifyLimiter, async (req, res) =>
       credentialId: String(cred.id).slice(0, 8) + '…',
       backedUp: info.credentialBackedUp === true,
     }, 'info').catch(() => {});
+
+    // 🩹 SECURITY-FIX (F-H1): كوكي جلسة httpOnly للدخول بالـ passkey كذلك
+    res.cookie('session_token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
 
     return res.json({
       message: 'Logged in successfully',

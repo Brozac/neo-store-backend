@@ -11,7 +11,7 @@ const pool = require('./db');
       status_raw VARCHAR(100),         -- الحالة الخام من CJ
       location VARCHAR(200),           -- المدينة/المستودع
       country_code VARCHAR(5),
-      description TEXT,                — الوصف من CJ (مترجم لاحقًا)
+      description TEXT,                -- الوصف من CJ (مترجم لاحقاً)
       carrier VARCHAR(100),
       tracking_number VARCHAR(100),
       event_time TIMESTAMPTZ,

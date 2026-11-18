@@ -106,6 +106,13 @@ async function testWebhookSignature() {
 }
 
 (async () => {
+  // 🩹 SECURITY-FIX (audit 2026-11-18 B-L11): حارس إنتاج — النسخ المزوّرة (webhook spoof)
+  //   ما تتبعثش أبداً لسيرفر حقيقي (onrender.com / laclarc.com). اختبار الحمل = local فقط.
+  if (/onrender\.com|laclarc\.com/i.test(BASE)) {
+    console.error('🚨 FORBIDDEN: load tests / spoof webhooks ضد سيرفر إنتاجي ممنوعة.');
+    console.error('   شغّل السكريبت ضد سيرفر محلي: BASE=http://localhost:10000 node load_test.js');
+    process.exit(1);
+  }
   console.log(`\n🔥 ═══════ LOAD TEST — ${CONC} concurrent / ${BASE} ═══════\n`);
 
   const t1 = await testPoolExhaustion();

@@ -233,7 +233,7 @@ class DB {
     const { Pool } = require('pg');
     this.pool = new Pool({
       connectionString: this.url,
-      ssl: { rejectUnauthorized: false },
+      ssl: { rejectUnauthorized: false }, // B-M4: مشفر — للتحقق الصارم زيد CA (انظر db.js resolvePgSsl)
       max: 2,
       idleTimeoutMillis: 5000,
       connectionTimeoutMillis: 15000,

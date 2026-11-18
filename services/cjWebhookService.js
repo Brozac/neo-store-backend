@@ -990,16 +990,20 @@ async function cjWebhookHandler(req, res) {
   })();
   if (catalogTopic) {
     const secret = process.env.CJ_WEBHOOK_SECRET || '';
-    if (secret) {
-      const provided = String(req.query.k || req.headers['x-cj-secret'] || '');
-      const ok = provided.length === secret.length
-        && crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(secret));
-      if (!ok) {
-        logger.logError('CJ Webhook: catalog event rejected (bad/missing secret)', new Error(`IP: ${req.ip}`));
-        return res.status(403).json({ code: 403, message: 'Forbidden' });
-      }
-    } else {
-      console.warn('⚠️ [CJ Webhook P0-26] CJ_WEBHOOK_SECRET ما مُعدّش — أحداث الكاتالوغ بلا توثيق! زيد السرّ فالـ env وعاود register.');
+    // 🩹 SECURITY-FIX (audit 2026-11-18 B-H2): كان fail-open — إذا CJ_WEBHOOK_SECRET
+    //   ما مُعدّش أحداث الكاتالوغ (VARIANT=الأسعار · STOCK=الظهور · PRODUCT DELETE)
+    //   كتقبل بلا حتى مصادقة → مهاجم يبني POST ويبدل الأسعار/يخفي الكاتالوغ.
+    //   الإصلاح: fail-closed صارم — بلا سرّ مُعدّ = رفض 403 دايماً.
+    if (!secret) {
+      logger.logError('CJ Webhook: catalog topic + CJ_WEBHOOK_SECRET NOT configured → request rejected (fail-closed)', new Error(`IP: ${req.ip}`));
+      return res.status(403).json({ code: 403, message: 'Forbidden' });
+    }
+    const provided = String(req.query.k || req.headers['x-cj-secret'] || '');
+    const ok = provided.length === secret.length
+      && crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(secret));
+    if (!ok) {
+      logger.logError('CJ Webhook: catalog event rejected (bad/missing secret)', new Error(`IP: ${req.ip}`));
+      return res.status(403).json({ code: 403, message: 'Forbidden' });
     }
   }
 

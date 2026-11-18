@@ -23,7 +23,10 @@ const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const pool = require('../db');
-const { fulfillCJOrder, auditEvent } = require('../services/cjService');
+// 🩹 SECURITY-FIX (audit 2026-11-18 B-H1): sendAdminAlert كان غير مستورد → ReferenceError
+//   في مسارين ماليين حرجين (crypto مدفوع بلا عنوان — IPN وJIT) → التنبيه للأدمن عمرو ما كيتصيفط
+//   + 500 بعد 200 (ERR_HTTP_HEADERS_SENT). الإصلاح: استيراد الدالة.
+const { fulfillCJOrder, auditEvent, sendAdminAlert } = require('../services/cjService');
 const { prepareSecureItems } = require('../utils/secureCheckout');
 const { applyCouponToTotal } = require('../utils/couponHelper');
 const logger = require('../logger');
@@ -47,6 +50,12 @@ const upload = multer({ storage: storage, limits: { fileSize: 5 * 1024 * 1024 } 
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const JWT_SECRET = process.env.JWT_SECRET;
+
+// 🩹 SECURITY-FIX (audit 2026-11-18 B-L3): هروب HTML لكل قيم قادمة من البيانات/الزبون
+//   قبل دمجها في قوالب الإيميلات اليدوية (HTML injection في إيميل الأدمن/الزبون).
+const escapeHtml = (s) => String(s ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 // 🩹 FIX — checkoutLimiter على كل مسارات الدفع (كانت الخمسة مفتوحة بلا حدود)
 const checkoutLimiter = rateLimit({
@@ -140,8 +149,8 @@ async function sendOrderConfirmationEmail(email, orderId, total, items = []) {
     const itemsHtml = items.map(item => `
       <tr>
         <td style="padding: 15px 0; border-bottom: 1px solid #eee; display: flex; align-items: center;">
-          <img src="${item.image_url || 'https://via.placeholder.com/50'}" alt="${item.title || 'Product'}" style="width: 50px; height: 50px; object-fit: cover; border-radius: 8px; margin-right: 15px;">
-          <span style="color: #1D1E3C; font-weight: bold; font-size: 14px;">${item.title || 'Product'} (Qty: ${item.quantity})</span>
+          <img src="${escapeHtml(item.image_url || 'https://via.placeholder.com/50')}" alt="${escapeHtml(item.title || 'Product')}" style="width: 50px; height: 50px; object-fit: cover; border-radius: 8px; margin-right: 15px;">
+          <span style="color: #1D1E3C; font-weight: bold; font-size: 14px;">${escapeHtml(item.title || 'Product')} (Qty: ${escapeHtml(item.quantity)})</span>
         </td>
         <td style="padding: 15px 0; border-bottom: 1px solid #eee; text-align: right; color: #FF6B9D; font-weight: bold; font-size: 14px;">
           $${Number(item.price_at_purchase || item.price || 0).toFixed(2)}
@@ -467,10 +476,12 @@ router.post('/crypto/verify', checkoutLimiter, async (req, res) => {
 
     const paymentData = npRes.data?.data?.[0];
 
+    // 🩹 SECURITY-FIX (audit 2026-11-18 B-M1): 'sending' كانت كتعدّ مدفوع — الإعلان المبكر
+    //   يسبق تأكيد البلوكتشين النهائي. الشحن محمي بـfinancialGate، والإعلان للزبون
+    //   يبقى على الحالات المؤكدة فقط (finished/confirmed).
     const isPaid = paymentData && (
       paymentData.payment_status === 'finished' ||
-      paymentData.payment_status === 'confirmed' ||
-      paymentData.payment_status === 'sending'
+      paymentData.payment_status === 'confirmed'
     );
 
     if (isPaid) {
@@ -609,9 +620,9 @@ router.post('/manual', checkoutLimiter, upload.single('receipt'), async (req, re
       subject: `🚨 New BaridiMob Order #${orderId} - Action Required`,
       html: `<h2>New Manual Payment Received</h2>
              <p>A new order has been placed via BaridiMob and requires verification.</p>
-             <p><strong>Customer:</strong> ${customerName}</p>
-             <p><strong>Phone:</strong> ${customerPhone}</p>
-             <p><strong>Source / Campaign:</strong> ${utm.source} / ${utm.campaign || 'direct'}</p>
+             <p><strong>Customer:</strong> ${escapeHtml(customerName)}</p>
+             <p><strong>Phone:</strong> ${escapeHtml(customerPhone)}</p>
+             <p><strong>Source / Campaign:</strong> ${escapeHtml(utm.source)} / ${escapeHtml(utm.campaign || 'direct')}</p>
              <p><strong>Expected (Server):</strong> ${authoritativeDZD} DZD ${couponApplied ? `(Coupon −$${couponDiscount.toFixed(2)})` : ''}</p>
              <p><strong>Declared (Client):</strong> ${declaredDZD} DZD</p>
              <p><strong>DB Calculated (USD):</strong> $${chargeTotal}</p>

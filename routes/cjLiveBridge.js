@@ -211,7 +211,13 @@ const BRIDGE_LIMITS = {
   reviews: { max: 40, windowMs: 10 * 60 * 1000 }, // productComments (كاش 6h)
 };
 function bridgeIp(req) {
-  return String(req.headers['cf-connecting-ip'] || req.ip || (req.socket && req.socket.remoteAddress) || 'unknown');
+  // 🩹 SECURITY-FIX (audit 2026-11-18 B-M3): cf-connecting-ip كان يتقبل خاماً بلا فحص
+  //   صيغة IP → نداء مباشر على Render برأس مزيّف = IP جديد كل طلب = تجاوز كامل للحدود.
+  //   نفس نمط antiCloneIp (server.js F#96): الصيغة لازم تكون IPv4 صحيح ولا فيها ':' (IPv6)،
+  //   وإلا نرجع لـ req.ip الحقيقي.
+  const cf = String(req.headers['cf-connecting-ip'] || '');
+  const validCf = /^\d{1,3}(\.\d{1,3}){3}$/.test(cf) || cf.includes(':');
+  return validCf ? cf : String(req.ip || (req.socket && req.socket.remoteAddress) || 'unknown');
 }
 function allowHit(req, kind) {
   const { max, windowMs } = BRIDGE_LIMITS[kind];
